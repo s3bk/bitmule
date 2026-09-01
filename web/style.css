@@ -207,6 +207,20 @@ header h1 {
   min-width: 0;
 }
 
+.session-qr {
+  align-self: center;
+  background: #ffffff;
+  padding: 12px;
+  border-radius: 12px;
+  line-height: 0;
+}
+
+.session-qr svg {
+  display: block;
+  width: 220px;
+  height: 220px;
+}
+
 .session-state {
   color: var(--muted);
   font-size: 14px;

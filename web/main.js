@@ -90,10 +90,31 @@ function serverHttpBase(url) {
   return url.replace(/\/$/, "");
 }
 
+const qrEl = document.getElementById("session-qr");
+
+function renderQr(text) {
+  if (typeof window.qrcode !== "function") {
+    qrEl.textContent = "";
+    return;
+  }
+  try {
+    // Type 0 = auto-fit smallest QR that holds the text at ECC level L.
+    const qr = window.qrcode(0, "L");
+    qr.addData(text);
+    qr.make();
+    // cellSize 5, margin 2 → 220×220 area once styled.
+    qrEl.innerHTML = qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true });
+  } catch (err) {
+    qrEl.textContent = "";
+    console.warn("qr render failed:", err);
+  }
+}
+
 function showSessionPanel(link) {
   els.dropzone.hidden = true;
   els.session.hidden = false;
   els.sessionLink.value = link;
+  renderQr(link);
   els.sessionState.textContent = "waiting for receiver…";
   els.sessionState.classList.remove("transferring");
 }
@@ -103,6 +124,7 @@ function hideSessionPanel() {
   els.dropzone.hidden = false;
   clearQueue();
   els.sessionLink.value = "";
+  qrEl.innerHTML = "";
 }
 
 async function startSendSession(files) {
@@ -116,7 +138,9 @@ async function startSendSession(files) {
   renderQueue(files);
 
   const sessionHex = newSessionIdHex();
-  const link = `${serverHttpBase(CONFIG.server)}/r/${sessionHex}`;
+  // Fragment-based receiver URL: works with any static host (no rewrite
+  // needed), and the session hex never hits server access logs.
+  const link = `${serverHttpBase(CONFIG.server)}/receive.html#${sessionHex}`;
 
   const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHex}`;
   let ws;
