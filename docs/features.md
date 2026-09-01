@@ -51,6 +51,25 @@ Every path segment is hex-parsed via `SessionId::from_hex` / `ReceiverId::from_h
 
 Auth is deferred to the identity-key layer (contacts, pubkey routing) — every session id is accepted for now.
 
+## Smoke-test CLI (2026-09-01)
+
+`bitmule send <path>` uploads the whole file as chunk 0 under a fresh random SessionId and prints:
+```
+session: <64-hex>
+recv with: bitmule --server http://... recv <64-hex>
+```
+`bitmule recv <session_hex> --out <path>` downloads chunk 0 of that session and writes it.
+
+Smoke path only — no manifest, no chunking, no encryption, no WebRTC yet. Exists to prove the streaming HTTP relay end-to-end. Uses reqwest for the client; upload body is `ReaderStream` from a `tokio::fs::File`, download body is a streamed `resp.bytes_stream()` piped to disk.
+
+Verified 2026-09-01:
+- 1 MiB roundtrip: sha256 match
+- 100 MiB roundtrip: sha256 match, server RSS 1988 → 3448 KiB across the whole upload+download (no whole-body buffering)
+- PUT without Content-Length → 411 Length Required
+- Recv with malformed hex → client rejects locally
+- Recv with unknown session → 404 → clean error
+- PUT with non-hex session id in path → 400
+
 ## Naming concern (unresolved)
 
 - Pete flagged 2026-09-01: an eMule spinoff already exists under the "bitmule" name. Rename gets cheaper the sooner it happens.

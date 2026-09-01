@@ -14,7 +14,11 @@ path = "src/main.rs"
 [dependencies]
 bitmule-core = { path = "../bitmule-core" }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+bytes = { workspace = true }

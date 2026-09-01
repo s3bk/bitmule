@@ -2,14 +2,26 @@
 //!
 //! `cargo install bitmule` gets a user the CLI. Same wire protocol as the browser
 //! SPA client (which is `bitmule-client-wasm` compiled from bitmule-core).
+//!
+//! **Current state:** the send/recv subcommands run a minimal smoke-test
+//! path against `bitmule-server` — one file goes up as `chunk 0` under a
+//! random SessionId, and comes back down by SessionId. No manifest,
+//! chunking, encryption, or WebRTC yet — those layers land in follow-up
+//! commits. This exists to prove the streaming HTTP relay end-to-end.
 
+use anyhow::{anyhow, Context, Result};
+use bitmule_core::SessionId;
 use clap::{Parser, Subcommand};
+use futures_util::TryStreamExt;
+use std::path::PathBuf;
+use tokio::{fs, io::AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 
 #[derive(Parser)]
 #[command(name = "bitmule", version, about, long_about = None)]
 struct Cli {
-    /// Signaling+relay server URL (wss://... or configured default).
-    #[arg(long, default_value = "wss://bitmule.net")]
+    /// Signaling+relay server URL. HTTP(S) for smoke-test upload/download.
+    #[arg(long, default_value = "http://localhost:8443")]
     server: String,
 
     #[command(subcommand)]
@@ -18,54 +30,132 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a file or folder. Emits a link the receiver can paste into their browser or CLI.
+    /// Smoke test: upload a single file as chunk 0 of a fresh session,
+    /// print the session id the receiver needs.
     Send {
-        /// Path to file or folder to send.
-        path: std::path::PathBuf,
+        /// Path to the file to send.
+        path: PathBuf,
 
-        /// Optional password. Receiver must supply this to decrypt the payload,
-        /// even if they have the link. Wraps content-key with Argon2id-derived KEK.
+        /// Optional password (not wired in smoke-test path).
         #[arg(long)]
         password: Option<String>,
     },
-    /// Receive by pasting the link the sender gave you.
+    /// Smoke test: download chunk 0 of the given session id and write it out.
     Recv {
-        /// The bitmule:// link (or https-shortened equivalent).
-        link: String,
+        /// Session id (64 hex chars) printed by `bitmule send`.
+        session: String,
 
-        /// Password if the sender set one.
+        /// Where to write the received file.
+        #[arg(long, default_value = "received.bin")]
+        out: PathBuf,
+
+        /// Password if the sender set one (not wired in smoke-test path).
         #[arg(long)]
         password: Option<String>,
-
-        /// Where to write. Default: cwd.
-        #[arg(long, default_value = ".")]
-        out: std::path::PathBuf,
     },
     /// Print version + build info.
     Version,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "bitmule=info".into()),
+        )
         .init();
 
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Send { path, password } => {
-            tracing::info!(?path, has_password = password.is_some(), server = cli.server, "send: TODO");
-            unimplemented!("send flow: manifest, key-exchange, chunk-stream, resume");
-        }
-        Command::Recv { link, password, out } => {
-            tracing::info!(link, has_password = password.is_some(), ?out, server = cli.server, "recv: TODO");
-            unimplemented!("recv flow: parse link, key-exchange, request-missing, decrypt-verify");
-        }
+        Command::Send { path, password: _ } => send_smoke(&cli.server, path).await,
+        Command::Recv {
+            session,
+            out,
+            password: _,
+        } => recv_smoke(&cli.server, session, out).await,
         Command::Version => {
             println!("bitmule {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
         }
     }
+}
 
+async fn send_smoke(server: &str, path: PathBuf) -> Result<()> {
+    let meta = fs::metadata(&path)
+        .await
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !meta.is_file() {
+        return Err(anyhow!(
+            "smoke path {} must be a regular file",
+            path.display()
+        ));
+    }
+    let len = meta.len();
+
+    let session = SessionId::random();
+    let url = format!("{}/session/{}/chunk/0", server.trim_end_matches('/'), session.as_hex());
+
+    let file = fs::File::open(&path).await?;
+    let stream = ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(&url)
+        .header(reqwest::header::CONTENT_LENGTH, len)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("PUT {url}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("server rejected upload: {status} {text}"));
+    }
+
+    println!("session: {}", session.as_hex());
+    println!(
+        "recv with: bitmule --server {} recv {}",
+        server,
+        session.as_hex()
+    );
+    Ok(())
+}
+
+async fn recv_smoke(server: &str, session_hex: String, out: PathBuf) -> Result<()> {
+    // Validate the session hex up front so a typo doesn't reach the server.
+    let session = SessionId::from_hex(&session_hex)
+        .map_err(|e| anyhow!("invalid session id {session_hex:?}: {e}"))?;
+    let url = format!("{}/session/{}/chunk/0", server.trim_end_matches('/'), session.as_hex());
+
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow!("no chunk on server for session {}", session.as_hex()));
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("server error: {status} {text}"));
+    }
+
+    let mut f = fs::File::create(&out)
+        .await
+        .with_context(|| format!("create {}", out.display()))?;
+    let mut stream = resp
+        .bytes_stream()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    while let Some(bytes) = futures_util::StreamExt::next(&mut stream).await {
+        let bytes = bytes?;
+        f.write_all(&bytes).await?;
+    }
+    f.sync_all().await?;
+
+    println!("wrote {}", out.display());
     Ok(())
 }
