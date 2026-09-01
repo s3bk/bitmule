@@ -20,6 +20,13 @@ const CONFIG = {
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
   ],
+  // 16 KiB is the SCTP-safe universal message size (Firefox cap). Chrome
+  // allows larger but 16 KiB gives us portable behaviour with no
+  // fragmentation risk.
+  chunkBytes: 16 * 1024,
+  // Backpressure watermarks on RTCDataChannel.bufferedAmount.
+  bufferedHighWater: 4 * 1024 * 1024,
+  bufferedLowWater: 1 * 1024 * 1024,
 };
 
 // ---- shared helpers -----------------------------------------------------
@@ -83,6 +90,7 @@ const els = {
   recvSessionId: document.getElementById("recv-session-id"),
   recvServerStatus: document.getElementById("recv-server-status"),
   recvCancel: document.getElementById("recv-cancel"),
+  recvDownload: document.getElementById("recv-download"),
 
   // global status
   wasmStatus: document.getElementById("wasm-status"),
@@ -201,6 +209,116 @@ function createPeer({ role, ws, onOpen, onMessage, onState }) {
   return { pc, get dc() { return dc; }, startOffer, handleFrame, close };
 }
 
+// ---- chunk transfer over the data channel ------------------------------
+//
+// Wire framing:
+//   text frame:   JSON control message
+//       {type:"meta", name, size, chunkBytes, totalChunks}
+//       {type:"done"}
+//   binary frame: raw ciphertext-equivalent bytes (no encryption in this
+//                 cut — step 1 is transfer correctness; K_session wrap
+//                 lands with the identity-key layer)
+//
+// Sender streams the file via File.stream() and writes each chunkBytes
+// slice with dc.send(). Backpressure: when bufferedAmount rises above
+// CONFIG.bufferedHighWater, pause and await 'bufferedamountlow' with a
+// low-watermark threshold of CONFIG.bufferedLowWater.
+
+async function sendFileOverDC(dc, file, { onProgress } = {}) {
+  const meta = {
+    type: "meta",
+    name: file.webkitRelativePath || file.name || "file.bin",
+    size: file.size,
+    chunkBytes: CONFIG.chunkBytes,
+    totalChunks: Math.ceil(file.size / CONFIG.chunkBytes),
+  };
+  dc.send(JSON.stringify(meta));
+
+  dc.bufferedAmountLowThreshold = CONFIG.bufferedLowWater;
+
+  const reader = file.stream().getReader();
+  let carry = new Uint8Array(0);
+  let sent = 0;
+
+  const flushChunk = async (chunk) => {
+    if (dc.bufferedAmount > CONFIG.bufferedHighWater) {
+      await new Promise((resolve) => {
+        const handler = () => {
+          dc.removeEventListener("bufferedamountlow", handler);
+          resolve();
+        };
+        dc.addEventListener("bufferedamountlow", handler);
+      });
+    }
+    dc.send(chunk);
+    sent += chunk.byteLength;
+    onProgress && onProgress(sent, file.size);
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    // Merge with any carry-over, then slice into chunkBytes segments.
+    let buf;
+    if (carry.length === 0) {
+      buf = value;
+    } else {
+      buf = new Uint8Array(carry.length + value.length);
+      buf.set(carry, 0);
+      buf.set(value, carry.length);
+    }
+    let offset = 0;
+    while (offset + CONFIG.chunkBytes <= buf.length) {
+      await flushChunk(buf.subarray(offset, offset + CONFIG.chunkBytes));
+      offset += CONFIG.chunkBytes;
+    }
+    carry = buf.subarray(offset);
+  }
+  // Tail
+  if (carry.length > 0) {
+    await flushChunk(carry);
+  }
+
+  dc.send(JSON.stringify({ type: "done" }));
+}
+
+// Receiver-side accumulator. One outbound Blob per file.
+function makeReceiver({ onProgress, onFile }) {
+  let meta = null;
+  let chunks = [];
+  let received = 0;
+
+  return function onMessage(data) {
+    if (typeof data === "string") {
+      let frame;
+      try {
+        frame = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (frame.type === "meta") {
+        meta = frame;
+        chunks = [];
+        received = 0;
+      } else if (frame.type === "done") {
+        if (!meta) return;
+        const blob = new Blob(chunks, { type: "application/octet-stream" });
+        onFile && onFile(meta.name, blob, meta.size);
+        meta = null;
+        chunks = [];
+        received = 0;
+      }
+      return;
+    }
+    // Binary frame — ArrayBuffer per DC.binaryType = "arraybuffer".
+    if (data instanceof ArrayBuffer) {
+      chunks.push(data);
+      received += data.byteLength;
+      if (meta) onProgress && onProgress(received, meta.size, meta.name);
+    }
+  };
+}
+
 // ---- send mode ---------------------------------------------------------
 
 let sendSession = null;
@@ -297,9 +415,26 @@ function startSendSession(files) {
         session.peer = createPeer({
           role: "sender",
           ws,
-          onOpen: () => {
-            els.sessionState.textContent =
-              "direct channel open — ready to transfer";
+          onOpen: async (dc) => {
+            const file = session.files && session.files[0];
+            if (!file) {
+              els.sessionState.textContent = "direct channel open (no file queued)";
+              return;
+            }
+            els.sessionState.textContent = `sending ${file.name}: 0%`;
+            try {
+              await sendFileOverDC(dc, file, {
+                onProgress: (sent, total) => {
+                  if (sendSession !== session) return;
+                  const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
+                  els.sessionState.textContent =
+                    `sending ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
+                },
+              });
+              els.sessionState.textContent = `sent ${file.name} (${fmtSize(file.size)})`;
+            } catch (err) {
+              els.sessionState.textContent = `send failed: ${err.message}`;
+            }
           },
           onMessage: (data) => {
             console.info("dc message from receiver:", data);
@@ -432,6 +567,31 @@ function startRecvSession(sessionHex) {
   // be answered as soon as it arrives.
   const session = { sessionHex, receiverId, ws, peer: null };
   recvSession = session;
+  const recvOnMessage = makeReceiver({
+    onProgress: (received, total, name) => {
+      if (recvSession !== session) return;
+      const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+      els.recvState.textContent =
+        `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
+    },
+    onFile: (name, blob, size) => {
+      if (recvSession !== session) return;
+      els.recvState.textContent = `received ${name} (${fmtSize(size)})`;
+      const url = URL.createObjectURL(blob);
+      els.recvDownload.hidden = false;
+      els.recvDownload.innerHTML = "";
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      a.textContent = `Download ${name}`;
+      a.className = "pick-btn download-link";
+      els.recvDownload.appendChild(a);
+      // Try to auto-trigger the download (browsers may block if no
+      // user-gesture recency; the visible button always works).
+      a.click();
+    },
+  });
+
   session.peer = createPeer({
     role: "receiver",
     ws,
@@ -440,9 +600,7 @@ function startRecvSession(sessionHex) {
         "direct channel open — ready to receive";
       els.recvState.classList.add("transferring");
     },
-    onMessage: (data) => {
-      console.info("dc message from sender:", data);
-    },
+    onMessage: recvOnMessage,
     onState: (s) => {
       console.info("receiver pc state:", s);
     },
