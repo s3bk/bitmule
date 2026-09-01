@@ -1,6 +1,12 @@
 use crate::{ChunkBitmap, ReceiverId, Result, SessionId};
 use async_trait::async_trait;
-use std::time::Duration;
+use bytes::Bytes;
+use std::{pin::Pin, time::Duration};
+
+/// Byte stream flowing in or out of a [`ChunkStore`]. Boxed so the trait
+/// stays object-safe; erased to `std::io::Error` so any I/O source can feed it.
+pub type ChunkByteStream =
+    Pin<Box<dyn futures_util::Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// Signaling transport for WebRTC SDP + session key exchange between peers.
 ///
@@ -22,11 +28,24 @@ pub trait SignalTransport: Send + Sync {
 /// SaaS deployments.
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
-    /// Store an encrypted chunk (ciphertext under K_session).
-    async fn put(&self, session: &SessionId, chunk_idx: u32, ciphertext: &[u8]) -> Result<()>;
+    /// Store an encrypted chunk (ciphertext under K_session), consuming a
+    /// byte stream so the caller doesn't buffer the whole chunk in memory.
+    /// Implementations should write atomically (e.g. tmp file + rename).
+    async fn put_stream(
+        &self,
+        session: &SessionId,
+        chunk_idx: u32,
+        stream: ChunkByteStream,
+    ) -> Result<()>;
 
-    /// Retrieve a stored chunk.
-    async fn get(&self, session: &SessionId, chunk_idx: u32) -> Result<Option<Vec<u8>>>;
+    /// Retrieve a stored chunk as a stream, or `None` if not present.
+    /// The returned stream reads lazily from storage; the caller should
+    /// pipe it through to their response body directly.
+    async fn get_stream(
+        &self,
+        session: &SessionId,
+        chunk_idx: u32,
+    ) -> Result<Option<ChunkByteStream>>;
 
     /// Which chunks does the server currently have for this session?
     async fn have(&self, session: &SessionId) -> Result<ChunkBitmap>;

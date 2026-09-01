@@ -15,14 +15,16 @@
 
 use crate::state::AppState;
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
 use bitmule_core::{ReceiverId, SessionId};
+use futures_util::StreamExt;
 use serde::Serialize;
+use std::io;
 
 fn parse_session(hex: &str) -> Result<SessionId, StatusCode> {
     SessionId::from_hex(hex).map_err(|_| StatusCode::BAD_REQUEST)
@@ -39,21 +41,42 @@ fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
 pub async fn put_chunk(
     Path((session_hex, idx)): Path<(String, u32)>,
     State(state): State<AppState>,
-    body: Bytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let session = parse_session(&session_hex).map_err(|s| (s, "bad session".into()))?;
-    // Enforce quota before writing so a runaway sender can't blow past it.
+
+    // Quota check against Content-Length so a runaway sender can't blow
+    // past the session cap. We require Content-Length rather than trusting
+    // an unbounded stream; the client always knows its own chunk size.
+    let declared_len = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or((
+            StatusCode::LENGTH_REQUIRED,
+            "content-length required".into(),
+        ))?;
+
     let cap = state
         .store
         .capacity_available(&session)
         .await
         .map_err(internal)?;
-    if (body.len() as u64) > cap {
+    if declared_len > cap {
         return Err((StatusCode::INSUFFICIENT_STORAGE, "session quota".into()));
     }
+
+    // Adapt axum's Body → data stream → io::Error stream → boxed pin.
+    let stream = body.into_data_stream().map(|res| {
+        res.map(|b: Bytes| b)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    });
+    let boxed: bitmule_core::traits::ChunkByteStream = Box::pin(stream);
+
     state
         .store
-        .put(&session, idx, &body)
+        .put_stream(&session, idx, boxed)
         .await
         .map_err(internal)?;
     Ok(StatusCode::CREATED)
@@ -62,13 +85,18 @@ pub async fn put_chunk(
 pub async fn get_chunk(
     Path((session_hex, idx)): Path<(String, u32)>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let session = parse_session(&session_hex).map_err(|s| (s, "bad session".into()))?;
-    match state.store.get(&session, idx).await.map_err(internal)? {
-        Some(bytes) => Ok((
+    match state
+        .store
+        .get_stream(&session, idx)
+        .await
+        .map_err(internal)?
+    {
+        Some(stream) => Ok((
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
+            Body::from_stream(stream),
         )
             .into_response()),
         None => Ok((StatusCode::NOT_FOUND, "no chunk").into_response()),

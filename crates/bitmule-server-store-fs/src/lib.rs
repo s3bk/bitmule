@@ -18,8 +18,12 @@
 //! - `gc_delivered` deletes chunks whose delivered-set covers ALL configured receivers.
 //! - `evict_older_than` deletes chunks whose mtime is older than the threshold.
 
-use bitmule_core::{traits::ChunkStore, ChunkBitmap, Error, ReceiverId, Result, SessionId};
+use bitmule_core::{
+    traits::{ChunkByteStream, ChunkStore},
+    ChunkBitmap, Error, ReceiverId, Result, SessionId,
+};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +36,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
 };
+use tokio_util::io::ReaderStream;
 
 /// Default per-session quota if not specified in config.json.
 pub const DEFAULT_SESSION_QUOTA_BYTES: u64 = 100 * 1024 * 1024 * 1024; // 100 GB
@@ -149,25 +154,39 @@ impl FsChunkStore {
 
 #[async_trait]
 impl ChunkStore for FsChunkStore {
-    async fn put(&self, session: &SessionId, chunk_idx: u32, ciphertext: &[u8]) -> Result<()> {
+    async fn put_stream(
+        &self,
+        session: &SessionId,
+        chunk_idx: u32,
+        mut stream: ChunkByteStream,
+    ) -> Result<()> {
         self.ensure_session_dirs(session).await?;
         let cdir = self.chunks_dir(session).await;
         let final_path = self.chunk_path(&cdir, chunk_idx);
         let tmp_path = final_path.with_extension("chunk.tmp");
-        {
-            let mut f = fs::File::create(&tmp_path).await.map_err(io_err)?;
-            f.write_all(ciphertext).await.map_err(io_err)?;
-            f.sync_all().await.map_err(io_err)?;
+        let mut f = fs::File::create(&tmp_path).await.map_err(io_err)?;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(io_err)?;
+            f.write_all(&bytes).await.map_err(io_err)?;
         }
+        f.sync_all().await.map_err(io_err)?;
+        drop(f);
         fs::rename(&tmp_path, &final_path).await.map_err(io_err)?;
         Ok(())
     }
 
-    async fn get(&self, session: &SessionId, chunk_idx: u32) -> Result<Option<Vec<u8>>> {
+    async fn get_stream(
+        &self,
+        session: &SessionId,
+        chunk_idx: u32,
+    ) -> Result<Option<ChunkByteStream>> {
         let cdir = self.chunks_dir(session).await;
         let path = self.chunk_path(&cdir, chunk_idx);
-        match fs::read(&path).await {
-            Ok(b) => Ok(Some(b)),
+        match fs::File::open(&path).await {
+            Ok(f) => {
+                let stream = ReaderStream::new(f);
+                Ok(Some(Box::pin(stream)))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io_err(e)),
         }

@@ -14,3 +14,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 walkdir = "2"
+futures-util = "0.3"
+bytes = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
