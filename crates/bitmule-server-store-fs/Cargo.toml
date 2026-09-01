@@ -1,0 +1,9 @@
+[package]
+name = "bitmule-server-store-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bitmule-core = { path = "../bitmule-core" }

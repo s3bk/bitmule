@@ -1,0 +1,22 @@
+[package]
+name = "bitmule-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+roaring = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }

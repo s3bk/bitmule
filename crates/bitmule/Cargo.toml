@@ -1,0 +1,20 @@
+[package]
+name = "bitmule"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Resumable, E2E-encrypted, WebRTC-first file transfer — CLI"
+repository.workspace = true
+
+[[bin]]
+name = "bitmule"
+path = "src/main.rs"
+
+[dependencies]
+bitmule-core = { path = "../bitmule-core" }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
