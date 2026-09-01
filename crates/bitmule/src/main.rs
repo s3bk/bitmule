@@ -88,12 +88,15 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         hold_seconds: u64,
     },
-    /// WebRTC connect (receiver). Given a session hex printed by
-    /// `webrtc-send`, opens a signaling WS, exchanges SDP + ICE against
-    /// the sender, and holds the DC open.
+    /// WebRTC connect (receiver). With SESSION, connects to an existing
+    /// session initiated by a sender. Without SESSION, generates a fresh
+    /// session id, prints a `<server>/send#<hex>` link the sender can
+    /// open in their browser, and holds the WS + DC open waiting for
+    /// them to arrive.
     WebrtcRecv {
-        /// Session id (64 hex chars).
-        session: String,
+        /// Session id (64 hex chars). Omit to have the CLI generate one
+        /// and print a share link for the sender to open.
+        session: Option<String>,
         #[arg(long)]
         signal_url: Option<String>,
         #[arg(long, default_value_t = 30)]
@@ -321,16 +324,53 @@ async fn webrtc_send(server: &str, signal_url: Option<String>, hold_seconds: u64
     Ok(())
 }
 
+fn extract_session_hex(input: &str) -> Option<String> {
+    let s = input.trim();
+    // If it looks like a URL, take everything after the last `#`. Fragments
+    // are always the session hex per bitmule's share-link format.
+    let candidate = if s.starts_with("http://") || s.starts_with("https://") {
+        s.rsplit('#').next().unwrap_or(s).to_string()
+    } else {
+        s.to_string()
+    };
+    let trimmed = candidate.trim().to_string();
+    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 async fn webrtc_recv(
     server: &str,
     signal_url: Option<String>,
-    session_hex: String,
+    session_hex: Option<String>,
     hold_seconds: u64,
 ) -> Result<()> {
     let signal = derive_signal_url(server, signal_url);
-    let session_id = SessionId::from_hex(session_hex.trim())
-        .map_err(|e| anyhow!("bad session id: {e}"))?;
-    println!("opening receiver WebSocket at {signal}");
+    let session_id = match session_hex.as_ref() {
+        Some(raw) => {
+            let hex = extract_session_hex(raw)
+                .ok_or_else(|| anyhow!("couldn't extract 64-hex session id from {raw:?}"))?;
+            SessionId::from_hex(&hex)
+                .map_err(|e| anyhow!("bad session id: {e}"))?
+        }
+        None => SessionId::random(),
+    };
+    if session_hex.is_none() {
+        let share = format!(
+            "{}/send#{}",
+            server.trim_end_matches('/'),
+            session_id.as_hex()
+        );
+        println!("share this link with the sender:");
+        println!("  {share}");
+        println!();
+    }
+    println!("session: {}", session_id.as_hex());
+    println!("opening receiver WebSocket at {signal} — waiting for sender…");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
     let session = bitmule_client_native::recv_connect(&signal, session_id).await?;
     println!("connected to session {}", session.session_id.as_hex());
     println!("data channel open (label={:?}) — holding {}s", session.dc.label(), hold_seconds);

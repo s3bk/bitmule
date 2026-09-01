@@ -123,6 +123,12 @@ header h1 {
   margin-top: 8px;
 }
 
+.mode-flip {
+  margin-top: 12px;
+  display: flex;
+  justify-content: center;
+}
+
 .recv-download {
   margin-top: 12px;
   display: flex;

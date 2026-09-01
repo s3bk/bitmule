@@ -17,7 +17,7 @@ use bitmule_server::{relay, state::AppState, ws::ws_handler};
 use bitmule_server_store_fs::FsChunkStore;
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -88,9 +88,14 @@ async fn main() -> anyhow::Result<()> {
 
     // If --web-dir is set, mount a static-file fallback for everything
     // else. ServeDir serves index.html for `/` automatically and 404s
-    // for missing paths.
+    // for missing paths. Missing-path fallback then routes to
+    // index.html so client-side routes like `/send` resolve to the SPA.
     if let Some(dir) = &args.web_dir {
-        let serve = ServeDir::new(dir).append_index_html_on_directories(true);
+        let index_path = dir.join("index.html");
+        let index_fallback = ServeFile::new(&index_path);
+        let serve = ServeDir::new(dir)
+            .append_index_html_on_directories(true)
+            .not_found_service(index_fallback);
         app = app.fallback_service(serve);
         info!(web_dir = %dir.display(), "serving static SPA from web-dir");
     }

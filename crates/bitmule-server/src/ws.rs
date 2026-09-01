@@ -69,7 +69,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
     let room = state.room(session).await;
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Register into the room.
+    // Register into the room. After registering, notify the OTHER role
+    // that a new peer joined — the incumbent uses this to re-emit its
+    // peer_hello (or otherwise re-kick handshake) so a peer_hello that
+    // was sent before the counterpart existed isn't lost forever.
+    let notify_frame: Option<(Role, String)>;
     {
         let mut r = room.lock().await;
         match role {
@@ -79,6 +83,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                     return;
                 }
                 r.sender = Some(tx.clone());
+                notify_frame = if r.receivers.is_empty() {
+                    None
+                } else {
+                    Some((
+                        Role::Receiver,
+                        r#"{"type":"peer_joined","role":"sender"}"#.to_string(),
+                    ))
+                };
             }
             Role::Receiver => {
                 let rid = match receiver_id {
@@ -89,6 +101,26 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                     }
                 };
                 r.receivers.insert(rid, tx.clone());
+                notify_frame = if r.sender.is_some() {
+                    Some((
+                        Role::Sender,
+                        r#"{"type":"peer_joined","role":"receiver"}"#.to_string(),
+                    ))
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    if let Some((target, frame)) = notify_frame {
+        let r = room.lock().await;
+        match target {
+            Role::Sender => r.route_to_sender(&frame),
+            Role::Receiver => {
+                // fan_to_receivers is &mut; take a fresh mut lock
+                drop(r);
+                let mut r2 = room.lock().await;
+                r2.fan_to_receivers(&frame);
             }
         }
     }

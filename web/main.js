@@ -72,6 +72,8 @@ const els = {
   tagline: document.getElementById("tagline"),
   sendMode: document.getElementById("send-mode"),
   recvMode: document.getElementById("receive-mode"),
+  requestMode: document.getElementById("request-mode"),
+  invitedSendMode: document.getElementById("invited-send-mode"),
 
   // send
   dropzone: document.getElementById("dropzone"),
@@ -84,6 +86,7 @@ const els = {
   sessionState: document.getElementById("session-state"),
   copyBtn: document.getElementById("copy-link"),
   cancelBtn: document.getElementById("cancel-session"),
+  requestFilesBtn: document.getElementById("request-files-btn"),
 
   // receive
   recvState: document.getElementById("recv-state"),
@@ -92,6 +95,23 @@ const els = {
   recvCancel: document.getElementById("recv-cancel"),
   recvDownload: document.getElementById("recv-download"),
 
+  // request (I'm receiver, waiting for sender at /send#<hex>)
+  requestLink: document.getElementById("request-link"),
+  requestQr: document.getElementById("request-qr"),
+  requestState: document.getElementById("request-state"),
+  requestDownload: document.getElementById("request-download"),
+  copyRequestLink: document.getElementById("copy-request-link"),
+  requestCancel: document.getElementById("request-cancel"),
+
+  // invited send (path=/send + hash — someone is waiting for my files)
+  invitedDropzone: document.getElementById("invited-dropzone"),
+  invitedPickBtn: document.getElementById("invited-pick-btn"),
+  invitedFileInput: document.getElementById("invited-file-input"),
+  invitedQueue: document.getElementById("invited-queue"),
+  invitedSession: document.getElementById("invited-session"),
+  invitedSessionState: document.getElementById("invited-session-state"),
+  invitedCancel: document.getElementById("invited-cancel"),
+
   // global status
   wasmStatus: document.getElementById("wasm-status"),
   serverStatus: document.getElementById("server-status"),
@@ -99,25 +119,27 @@ const els = {
 
 // ---- QR ----------------------------------------------------------------
 
-function renderQr(text) {
+function renderQrInto(el, text) {
   if (typeof window.qrcode !== "function") {
-    els.sessionQr.textContent = "";
+    el.textContent = "";
     return;
   }
   try {
     const qr = window.qrcode(0, "L");
     qr.addData(text);
     qr.make();
-    els.sessionQr.innerHTML = qr.createSvgTag({
+    el.innerHTML = qr.createSvgTag({
       cellSize: 5,
       margin: 2,
       scalable: true,
     });
   } catch (err) {
-    els.sessionQr.textContent = "";
+    el.textContent = "";
     console.warn("qr render failed:", err);
   }
 }
+
+function renderQr(text) { renderQrInto(els.sessionQr, text); }
 
 // ---- WebRTC signaling adapter ------------------------------------------
 //
@@ -688,8 +710,302 @@ function startRecvSession(sessionHex) {
 function wireRecvMode() {
   els.recvCancel.addEventListener("click", () => {
     closeRecvSession();
-    history.replaceState(null, "", location.pathname + location.search);
+    history.replaceState(null, "", "/");
     applyRoute();
+  });
+}
+
+// ---- request-files mode (in-page, no URL nav) ---------------------------
+//
+// User clicks "Request files instead" on the landing page. We generate a
+// fresh session id and act as the RECEIVER (same WS role, same DC ondatachannel
+// wiring). We render a link `<origin>/send#<hex>` for them to send to the
+// person supposed to send files; that person opens the link, lands in
+// invited-send mode, and pushes files to us.
+
+let requestSession = null;
+
+function closeRequestSession() {
+  if (requestSession) {
+    try { requestSession.peer && requestSession.peer.close(); } catch {}
+    try { requestSession.ws.close(); } catch {}
+    requestSession = null;
+  }
+}
+
+function startRequestSession() {
+  closeRequestSession();
+  const sessionHex = randomHex32();
+  const link = `${serverHttpBase(CONFIG.server)}/send#${sessionHex}`;
+
+  els.requestLink.value = link;
+  renderQrInto(els.requestQr, link);
+  els.requestState.textContent = "waiting for sender to open the link…";
+  els.requestState.classList.remove("transferring");
+  els.requestDownload.hidden = true;
+  els.requestDownload.innerHTML = "";
+
+  const receiverId = randomHex32();
+  const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHex}`;
+  let ws;
+  try { ws = new WebSocket(wsUrl); }
+  catch (err) { els.requestState.textContent = `couldn't open socket: ${err.message}`; return; }
+
+  const session = { sessionHex, receiverId, ws, peer: null };
+  requestSession = session;
+
+  const recvOnMessage = makeReceiver({
+    onProgress: (received, total, name) => {
+      if (requestSession !== session) return;
+      const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+      els.requestState.textContent =
+        `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
+    },
+    onFile: (name, blob, size) => {
+      if (requestSession !== session) return;
+      els.requestState.textContent = `received ${name} (${fmtSize(size)})`;
+      const url = URL.createObjectURL(blob);
+      els.requestDownload.hidden = false;
+      els.requestDownload.innerHTML = "";
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      a.textContent = `Download ${name}`;
+      a.className = "pick-btn download-link";
+      els.requestDownload.appendChild(a);
+      a.click();
+    },
+  });
+
+  session.peer = createPeer({
+    role: "receiver",
+    ws,
+    onOpen: () => {
+      els.requestState.textContent = "direct channel open — ready to receive";
+      els.requestState.classList.add("transferring");
+    },
+    onMessage: recvOnMessage,
+    onState: (s) => { console.info("request pc state:", s); },
+  });
+
+  ws.addEventListener("open", () => {
+    ws.send(JSON.stringify({ type: "hello", role: "receiver", receiver_id: receiverId }));
+    ws.send(JSON.stringify({ type: "peer_hello", receiver_id: receiverId }));
+  });
+
+  ws.addEventListener("message", async (ev) => {
+    if (requestSession !== session) return;
+    let frame;
+    try { frame = JSON.parse(ev.data); } catch { return; }
+    if (frame.type === "peer_joined" && frame.role === "sender") {
+      // The invited sender just connected. Re-emit peer_hello so they
+      // pick up on the offer trigger (our earlier peer_hello was sent
+      // before they existed and got dropped by the relay).
+      try {
+        ws.send(JSON.stringify({ type: "peer_hello", receiver_id: receiverId }));
+      } catch {}
+      return;
+    }
+    if ((frame.type === "sdp" || frame.type === "ice") && session.peer) {
+      try { await session.peer.handleFrame(frame); }
+      catch (e) { console.warn("request handleFrame:", e); }
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    if (requestSession !== session) return;
+    if (!els.requestState.classList.contains("transferring")) {
+      els.requestState.textContent = "socket closed";
+    }
+  });
+  ws.addEventListener("error", () => {
+    if (requestSession !== session) return;
+    els.requestState.textContent = "server unreachable";
+  });
+}
+
+function wireRequestMode() {
+  els.requestFilesBtn.addEventListener("click", () => {
+    // Flip in-page from send-mode to request-mode. Doesn't change URL —
+    // the shareable URL is embedded in the request panel.
+    els.sendMode.hidden = true;
+    els.requestMode.hidden = false;
+    els.tagline.textContent = "requesting files";
+    startRequestSession();
+  });
+  els.copyRequestLink.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(els.requestLink.value);
+      const prev = els.copyRequestLink.textContent;
+      els.copyRequestLink.textContent = "Copied";
+      setTimeout(() => (els.copyRequestLink.textContent = prev), 1200);
+    } catch { els.requestLink.select(); }
+  });
+  els.requestCancel.addEventListener("click", () => {
+    closeRequestSession();
+    els.requestMode.hidden = true;
+    els.sendMode.hidden = false;
+    els.tagline.textContent = "drop files to send";
+  });
+}
+
+// ---- invited-send mode (URL /send#<hex>) --------------------------------
+//
+// Someone opened this page via a request-files link. We act as the sender,
+// but the session hex is pre-set from the URL (not generated). File pick
+// triggers the offer.
+
+let invitedSession = null;
+
+function closeInvitedSession() {
+  if (invitedSession) {
+    try { invitedSession.peer && invitedSession.peer.close(); } catch {}
+    try { invitedSession.ws.close(); } catch {}
+    invitedSession = null;
+  }
+}
+
+function startInvitedSendSession(sessionHex, files) {
+  closeInvitedSession();
+
+  els.invitedDropzone.hidden = true;
+  els.invitedSession.hidden = false;
+  els.invitedSessionState.textContent = "connecting to receiver…";
+  els.invitedSessionState.classList.remove("transferring");
+  renderQueueInto(els.invitedQueue, files);
+
+  const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHex}`;
+  let ws;
+  try { ws = new WebSocket(wsUrl); }
+  catch (err) { els.invitedSessionState.textContent = `couldn't open socket: ${err.message}`; return; }
+
+  const session = { sessionHex, ws, files, peer: null };
+  invitedSession = session;
+
+  ws.addEventListener("open", () => {
+    ws.send(JSON.stringify({ type: "hello", role: "sender" }));
+  });
+
+  ws.addEventListener("message", async (ev) => {
+    if (invitedSession !== session) return;
+    let frame;
+    try { frame = JSON.parse(ev.data); } catch { return; }
+    if (frame.type === "peer_hello") {
+      els.invitedSessionState.textContent = "receiver joined — negotiating direct connection…";
+      els.invitedSessionState.classList.add("transferring");
+      if (!session.peer) {
+        session.peer = createPeer({
+          role: "sender",
+          ws,
+          onOpen: async (dc) => {
+            const file = session.files && session.files[0];
+            if (!file) return;
+            els.invitedSessionState.textContent = `sending ${file.name}: 0%`;
+            try {
+              await sendFileOverDC(dc, file, {
+                onProgress: (sent, total) => {
+                  if (invitedSession !== session) return;
+                  const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
+                  els.invitedSessionState.textContent =
+                    `sending ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
+                },
+              });
+              els.invitedSessionState.textContent = `sent ${file.name} (${fmtSize(file.size)})`;
+              els.invitedCancel.textContent = "Send another";
+              els.invitedCancel.classList.add("done");
+            } catch (err) {
+              els.invitedSessionState.textContent = `send failed: ${err.message}`;
+            }
+          },
+          onMessage: (data) => { console.info("invited dc msg:", data); },
+          onState: (s) => { console.info("invited sender pc state:", s); },
+        });
+        try { await session.peer.startOffer(); }
+        catch (e) { els.invitedSessionState.textContent = `offer failed: ${e.message}`; }
+      }
+      return;
+    }
+    if (session.peer && (frame.type === "sdp" || frame.type === "ice")) {
+      try { await session.peer.handleFrame(frame); }
+      catch (e) { console.warn("invited handleFrame:", e); }
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    if (invitedSession !== session) return;
+    if (!els.invitedSessionState.classList.contains("transferring")) {
+      els.invitedSessionState.textContent = "socket closed";
+    }
+  });
+  ws.addEventListener("error", () => {
+    if (invitedSession !== session) return;
+    els.invitedSessionState.textContent = "server unreachable";
+  });
+}
+
+function renderQueueInto(el, files) {
+  el.textContent = "";
+  for (const f of files) {
+    const row = document.createElement("div");
+    row.className = "queue-item";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = f.webkitRelativePath || f.name;
+    const size = document.createElement("span");
+    size.className = "size";
+    size.textContent = fmtSize(f.size);
+    row.append(name, size);
+    el.appendChild(row);
+  }
+}
+
+function wireInvitedSendMode() {
+  els.invitedPickBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    els.invitedFileInput.click();
+  });
+  els.invitedDropzone.addEventListener("click", () => els.invitedFileInput.click());
+  els.invitedDropzone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      els.invitedFileInput.click();
+    }
+  });
+  els.invitedFileInput.addEventListener("change", (e) => {
+    if (e.target.files && e.target.files.length) {
+      const hex = currentSessionHex();
+      if (!hex) return;
+      startInvitedSendSession(hex, Array.from(e.target.files));
+      e.target.value = "";
+    }
+  });
+  ["dragenter", "dragover"].forEach((ev) => {
+    els.invitedDropzone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      els.invitedDropzone.classList.add("dragover");
+    });
+  });
+  ["dragleave", "drop"].forEach((ev) => {
+    els.invitedDropzone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      els.invitedDropzone.classList.remove("dragover");
+    });
+  });
+  els.invitedDropzone.addEventListener("drop", (e) => {
+    const files = e.dataTransfer?.files;
+    if (files && files.length) {
+      const hex = currentSessionHex();
+      if (!hex) return;
+      startInvitedSendSession(hex, Array.from(files));
+    }
+  });
+  els.invitedCancel.addEventListener("click", () => {
+    closeInvitedSession();
+    els.invitedSession.hidden = true;
+    els.invitedDropzone.hidden = false;
+    els.invitedQueue.textContent = "";
   });
 }
 
@@ -702,16 +1018,32 @@ function currentSessionHex() {
 
 function applyRoute() {
   const hex = currentSessionHex();
-  if (hex) {
-    closeSendSession();
-    hideSessionPanel();
-    els.sendMode.hidden = true;
+  const isSendPath = location.pathname === "/send" || location.pathname === "/send/";
+
+  // Reset everything
+  closeSendSession();
+  closeRecvSession();
+  closeInvitedSession();
+  closeRequestSession();
+  hideSessionPanel();
+  els.sendMode.hidden = true;
+  els.recvMode.hidden = true;
+  els.requestMode.hidden = true;
+  els.invitedSendMode.hidden = true;
+  els.invitedSession.hidden = true;
+  els.invitedDropzone.hidden = false;
+
+  if (isSendPath && hex) {
+    // Invited-sender mode
+    els.invitedSendMode.hidden = false;
+    els.tagline.textContent = "someone is waiting for files";
+  } else if (hex) {
+    // Receive mode
     els.recvMode.hidden = false;
     els.tagline.textContent = "receiving";
     startRecvSession(hex);
   } else {
-    closeRecvSession();
-    els.recvMode.hidden = true;
+    // Landing / send mode
     els.sendMode.hidden = false;
     els.tagline.textContent = "drop files to send";
   }
@@ -767,5 +1099,8 @@ function applyRoute() {
 
 wireSendMode();
 wireRecvMode();
+wireRequestMode();
+wireInvitedSendMode();
 window.addEventListener("hashchange", applyRoute);
+window.addEventListener("popstate", applyRoute);
 applyRoute();

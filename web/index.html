@@ -15,7 +15,7 @@
         <p id="tagline" class="tagline">drop files to send</p>
       </header>
 
-      <!-- SEND MODE — shown when the URL has no hash -->
+      <!-- SEND MODE — shown when the URL has no hash and path is / -->
       <div id="send-mode" hidden>
         <section
           id="dropzone"
@@ -39,6 +39,12 @@
             />
           </div>
         </section>
+
+        <div class="mode-flip">
+          <button id="request-files-btn" type="button" class="cancel-btn">
+            Request files instead
+          </button>
+        </div>
 
         <section id="queue" class="queue" aria-live="polite"></section>
 
@@ -64,6 +70,31 @@
         </section>
       </div>
 
+      <!-- REQUEST-FILES MODE — I'm the receiver, waiting for a sender to arrive at /send#<my-hex> -->
+      <div id="request-mode" hidden>
+        <section id="request-session" class="session" aria-live="polite">
+          <h2 class="session-title">Send this link to whoever should send you files</h2>
+          <div class="session-link-row">
+            <input
+              id="request-link"
+              class="session-link"
+              type="text"
+              readonly
+              aria-label="request link"
+            />
+            <button id="copy-request-link" class="pick-btn" type="button">Copy</button>
+          </div>
+          <div id="request-qr" class="session-qr" aria-hidden="true"></div>
+          <div id="request-state" class="session-state">
+            waiting for sender to open the link…
+          </div>
+          <div id="request-download" class="recv-download" hidden></div>
+          <button id="request-cancel" class="cancel-btn" type="button">
+            Cancel
+          </button>
+        </section>
+      </div>
+
       <!-- RECEIVE MODE — shown when the URL hash is a valid 64-hex session -->
       <div id="receive-mode" hidden>
         <section id="recv-session" class="session" aria-live="polite">
@@ -84,6 +115,46 @@
           </div>
           <button id="recv-cancel" class="cancel-btn" type="button">
             Close
+          </button>
+        </section>
+      </div>
+
+      <!-- INVITED-SENDER MODE — I'm the sender, receiver waits with pre-generated hex, path is /send + hex hash -->
+      <div id="invited-send-mode" hidden>
+        <section
+          id="invited-dropzone"
+          class="dropzone"
+          role="button"
+          tabindex="0"
+          aria-label="Drop files to send to the requester"
+        >
+          <div class="dropzone-inner">
+            <div class="dropzone-icon" aria-hidden="true">↑</div>
+            <p class="dropzone-msg">
+              Someone is waiting for files.<br />Drop files here to send them.
+            </p>
+            <button id="invited-pick-btn" type="button" class="pick-btn">
+              Choose files
+            </button>
+            <input
+              id="invited-file-input"
+              type="file"
+              multiple
+              hidden
+              aria-hidden="true"
+            />
+          </div>
+        </section>
+
+        <section id="invited-queue" class="queue" aria-live="polite"></section>
+
+        <section id="invited-session" class="session" hidden aria-live="polite">
+          <h2 class="session-title">Sending to the requester</h2>
+          <div id="invited-session-state" class="session-state">
+            connecting to receiver…
+          </div>
+          <button id="invited-cancel" class="cancel-btn" type="button">
+            Cancel
           </button>
         </section>
       </div>
