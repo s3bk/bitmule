@@ -431,25 +431,29 @@ function startSendSession(files) {
               els.sessionState.textContent = "direct channel open (no file queued)";
               return;
             }
-            // ?debug=interrupt in the URL forces a synthetic mid-transfer
-            // abort at a random byte offset in [0, file.size). Off by
-            // default — real transfers are never interrupted by this hook.
-            const params = new URLSearchParams(location.search);
+            // Debug interrupt: one-shot per session. The URL flag
+            // ?debug=interrupt is consumed at boot (URL cleaned +
+            // localStorage armed); here the sender consumes the arm
+            // exactly once per file, so a subsequent send/resume never
+            // re-interrupts.
             const opts = { onProgress: (sent, total) => {
               if (sendSession !== session) return;
               const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
               els.sessionState.textContent =
                 `sending ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
             }};
-            if (params.get("debug") === "interrupt") {
-              opts.interruptAt = Math.random() * file.size;
-              console.info(
-                "debug=interrupt enabled; will abort at byte offset ~",
-                Math.floor(opts.interruptAt),
-                "of",
-                file.size
-              );
-            }
+            try {
+              if (localStorage.getItem("bitmule.debug.interrupt") === "1") {
+                localStorage.removeItem("bitmule.debug.interrupt");
+                opts.interruptAt = Math.random() * file.size;
+                console.info(
+                  "debug=interrupt armed; will abort at byte offset ~",
+                  Math.floor(opts.interruptAt),
+                  "of",
+                  file.size
+                );
+              }
+            } catch {}
             els.sessionState.textContent = `sending ${file.name}: 0%`;
             try {
               await sendFileOverDC(dc, file, opts);
@@ -744,6 +748,22 @@ function applyRoute() {
 })();
 
 // ---- boot --------------------------------------------------------------
+
+// Consume ?debug=interrupt at boot: strip it from the URL and set a
+// localStorage flag. The sender reads + clears the flag on next send, so
+// the interrupt fires exactly once per URL visit and never on the resume
+// that follows.
+(function armDebugInterrupt() {
+  const params = new URLSearchParams(location.search);
+  if (params.get("debug") === "interrupt") {
+    try { localStorage.setItem("bitmule.debug.interrupt", "1"); } catch {}
+    params.delete("debug");
+    const q = params.toString();
+    const cleaned = location.pathname + (q ? "?" + q : "") + location.hash;
+    history.replaceState(null, "", cleaned);
+    console.info("debug=interrupt armed via localStorage; URL cleaned");
+  }
+})();
 
 wireSendMode();
 wireRecvMode();
