@@ -17,6 +17,7 @@ use bitmule_server::{relay, state::AppState, ws::ws_handler};
 use bitmule_server_store_fs::FsChunkStore;
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -39,6 +40,13 @@ struct Args {
     /// storage drops back at or below this value. Default 500 GiB.
     #[arg(long, default_value_t = 500u64 * 1024 * 1024 * 1024)]
     max_disk_bytes: u64,
+
+    /// If set, serve static files from this directory on any GET that
+    /// isn't matched by /ws/... or /session/... — typically points at
+    /// the repo's web/ directory so the SPA is available on the same host
+    /// as the signaling + relay endpoints.
+    #[arg(long)]
+    web_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -64,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         args.max_disk_bytes,
     ));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/ws/:session", get(ws_handler))
         .route(
             "/session/:sess/chunk/:idx",
@@ -77,6 +85,15 @@ async fn main() -> anyhow::Result<()> {
             post(relay::mark_delivered),
         )
         .with_state(state);
+
+    // If --web-dir is set, mount a static-file fallback for everything
+    // else. ServeDir serves index.html for `/` automatically and 404s
+    // for missing paths.
+    if let Some(dir) = &args.web_dir {
+        let serve = ServeDir::new(dir).append_index_html_on_directories(true);
+        app = app.fallback_service(serve);
+        info!(web_dir = %dir.display(), "serving static SPA from web-dir");
+    }
 
     info!(bind = %args.bind, data_dir = %args.data_dir.display(), "bitmule-server up");
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
