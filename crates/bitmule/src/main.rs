@@ -13,9 +13,12 @@ use anyhow::{anyhow, Context, Result};
 use bitmule_core::SessionId;
 use clap::{Parser, Subcommand};
 use futures_util::TryStreamExt;
+use qrcode::{render::unicode, QrCode};
 use std::path::PathBuf;
 use tokio::{fs, io::AsyncWriteExt};
 use tokio_util::io::ReaderStream;
+
+mod identity;
 
 #[derive(Parser)]
 #[command(name = "bitmule", version, about, long_about = None)]
@@ -53,8 +56,40 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
     },
+    /// Manage local identities (keypairs). Each identity is a
+    /// (name, Ed25519 sign key, X25519 KEX key) triple stored under
+    /// $XDG_CONFIG_HOME/bitmule/identities/<name>.json.
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+    /// Add a peer to the local contacts store. Accepts either:
+    ///   bitmule add <name> <pubkey_b64url>
+    ///   bitmule add <https://…/c/<name>/<pubkey>>
+    Add {
+        /// A share URL (https://…/c/name/pubkey) OR a bare NAME. If NAME,
+        /// PUBKEY must be given as the second positional arg.
+        first: String,
+        /// Public-key blob (64-byte concat, base64url no-pad). Required when
+        /// FIRST is a name; ignored when FIRST is a share URL.
+        pubkey: Option<String>,
+    },
     /// Print version + build info.
     Version,
+}
+
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Generate a new keypair, store under NAME, print a share link + QR.
+    Add {
+        /// Identity name. Advertised to peers as your handle.
+        name: String,
+        /// Contact-URL host used in the printed share link. Users can point
+        /// this at a self-hosted bitmule server that serves the `/c/*`
+        /// landing page.
+        #[arg(long, default_value = identity::DEFAULT_CONTACT_BASE)]
+        contact_base: String,
+    },
 }
 
 #[tokio::main]
@@ -75,11 +110,68 @@ async fn main() -> Result<()> {
             out,
             password: _,
         } => recv_smoke(&cli.server, session, out).await,
+        Command::Identity { action } => match action {
+            IdentityAction::Add { name, contact_base } => identity_add(name, contact_base).await,
+        },
+        Command::Add { first, pubkey } => contact_add(first, pubkey).await,
         Command::Version => {
             println!("bitmule {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
+}
+
+async fn identity_add(name: String, contact_base: String) -> Result<()> {
+    let id = identity::create(&name).await?;
+    let link = id.share_link(&contact_base)?;
+
+    let qr = QrCode::new(link.as_bytes()).context("build qr")?;
+    let rendered = qr
+        .render::<unicode::Dense1x2>()
+        .dark_color(unicode::Dense1x2::Light)
+        .light_color(unicode::Dense1x2::Dark)
+        .build();
+
+    println!("identity: {}", id.name);
+    println!(
+        "stored:   {}",
+        identity::identities_dir()?
+            .join(format!("{}.json", id.name))
+            .display()
+    );
+    println!();
+    println!("share link:");
+    println!("  {link}");
+    println!();
+    println!("{rendered}");
+    Ok(())
+}
+
+async fn contact_add(first: String, pubkey: Option<String>) -> Result<()> {
+    // Decide which form we're in: URL or (name, pubkey).
+    let looks_like_url = first.starts_with("https://") || first.starts_with("http://");
+
+    let (name, pk_b64, source) = if looks_like_url {
+        if pubkey.is_some() {
+            return Err(anyhow!(
+                "when adding by URL, do not pass a second positional arg"
+            ));
+        }
+        let (n, pk) = identity::parse_contact_url(&first)?;
+        (n, pk, first.clone())
+    } else {
+        let pk = pubkey.ok_or_else(|| {
+            anyhow!("adding by name requires a second arg: bitmule add <name> <pubkey>")
+        })?;
+        (first, pk, "raw".to_string())
+    };
+
+    let saved = identity::save_contact(&name, &pk_b64, &source).await?;
+    let path = identity::contacts_dir()?.join(format!("{}.json", saved.name));
+    println!("contact: {}", saved.name);
+    println!("stored:  {}", path.display());
+    println!("pubkey:  {}", saved.public_blob_b64);
+    Ok(())
 }
 
 async fn send_smoke(server: &str, path: PathBuf) -> Result<()> {
