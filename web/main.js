@@ -27,6 +27,9 @@ const CONFIG = {
   // Backpressure watermarks on RTCDataChannel.bufferedAmount.
   bufferedHighWater: 4 * 1024 * 1024,
   bufferedLowWater: 1 * 1024 * 1024,
+  // How long the sender waits for a WebRTC data channel to open before
+  // falling back to the server-relay upload path.
+  webrtcTimeoutMs: 3000,
 };
 
 // ---- shared helpers -----------------------------------------------------
@@ -310,6 +313,147 @@ async function sendFileOverDC(dc, file, { onProgress, interruptAt } = {}) {
   dc.send(JSON.stringify({ type: "done" }));
 }
 
+// ---- server-relay send path (fallback when WebRTC doesn't come up) ------
+//
+// Sender uploads each chunk via HTTP PUT to /session/:sess/chunk/:idx and
+// notifies the receiver over the signaling WS with a {type:"chunk_relay",
+// idx} frame per uploaded chunk. Finally sends {type:"relay_done"} so the
+// receiver knows to finalize. Meta ships as a {type:"meta_relay", ...}
+// WS frame before the first chunk_relay so the receiver knows shape +
+// name.
+
+async function sendFileOverRelay(session, ws, file, { onProgress, progressState } = {}) {
+  const chunkBytes = CONFIG.chunkBytes;
+  const totalChunks = Math.ceil(file.size / chunkBytes);
+  const meta = {
+    type: "meta_relay",
+    name: file.webkitRelativePath || file.name || "file.bin",
+    size: file.size,
+    chunkBytes,
+    totalChunks,
+  };
+  try { ws.send(JSON.stringify(meta)); } catch {}
+  if (progressState) {
+    progressState.meta = meta;
+    progressState.sentIdxs = [];
+    progressState.done = false;
+  }
+
+  const sessionHex = session;
+  const httpBase = serverHttpBase(CONFIG.server);
+  let sent = 0;
+  for (let idx = 0; idx < totalChunks; idx++) {
+    const start = idx * chunkBytes;
+    const end = Math.min(start + chunkBytes, file.size);
+    const slice = file.slice(start, end);
+    const url = `${httpBase}/session/${sessionHex}/chunk/${idx}`;
+    const resp = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(end - start),
+      },
+      body: slice,
+    });
+    if (!resp.ok) {
+      throw new Error(`relay PUT ${idx} → ${resp.status}`);
+    }
+    try {
+      ws.send(JSON.stringify({ type: "chunk_relay", idx }));
+    } catch {}
+    if (progressState) progressState.sentIdxs.push(idx);
+    sent += end - start;
+    onProgress && onProgress(sent, file.size);
+  }
+  try { ws.send(JSON.stringify({ type: "relay_done" })); } catch {}
+  if (progressState) progressState.done = true;
+}
+
+// Re-emit the meta/chunk/done frames a sender already sent during a
+// prior relay run. Called when the server notifies of a fresh receiver
+// join so the newcomer catches up on what was already uploaded.
+function resendRelayProgress(ws, progressState) {
+  if (!progressState || !progressState.meta) return;
+  try { ws.send(JSON.stringify(progressState.meta)); } catch {}
+  for (const idx of progressState.sentIdxs) {
+    try { ws.send(JSON.stringify({ type: "chunk_relay", idx })); } catch {}
+  }
+  if (progressState.done) {
+    try { ws.send(JSON.stringify({ type: "relay_done" })); } catch {}
+  }
+}
+
+// Receiver side for the relay path. Fetches chunks GET
+// /session/:sess/chunk/:idx as `chunk_relay` frames arrive over WS, and
+// on `relay_done` assembles the Blob (order guaranteed by the
+// sender-side sequential PUT + monotonic idx).
+function makeRelayReceiver(session, { onProgress, onFile }) {
+  let meta = null;
+  // Dense array of ArrayBuffers keyed by chunk index. Initialized to a
+  // fixed-length array of nulls once meta arrives, so completeness is a
+  // simple `.every(x !== null)` and Blob assembly is order-preserving.
+  let chunks = null;
+  let filled = 0;
+  let received = 0;
+  let done = false;
+  const httpBase = serverHttpBase(CONFIG.server);
+  const sessionHex = session;
+  const inflight = new Set();
+
+  async function fetchAndPlace(idx) {
+    if (!chunks) return;
+    if (chunks[idx] !== null) return;
+    if (inflight.has(idx)) return;
+    inflight.add(idx);
+    try {
+      const resp = await fetch(`${httpBase}/session/${sessionHex}/chunk/${idx}`);
+      if (!resp.ok) throw new Error(`GET chunk ${idx} → ${resp.status}`);
+      const buf = await resp.arrayBuffer();
+      if (chunks[idx] === null) {
+        chunks[idx] = buf;
+        filled += 1;
+        received += buf.byteLength;
+        if (meta) onProgress && onProgress(received, meta.size, meta.name);
+      }
+      maybeFinalize();
+    } catch (e) {
+      console.warn("relay fetch:", e);
+    } finally {
+      inflight.delete(idx);
+    }
+  }
+
+  function maybeFinalize() {
+    if (!meta || done || !chunks) return;
+    if (filled !== meta.totalChunks) return;
+    done = true;
+    const blob = new Blob(chunks, { type: "application/octet-stream" });
+    onFile && onFile(meta.name, blob, meta.size);
+  }
+
+  return {
+    onWsFrame(frame) {
+      if (!frame || typeof frame !== "object") return;
+      if (frame.type === "meta_relay") {
+        meta = frame;
+        chunks = new Array(frame.totalChunks).fill(null);
+        filled = 0;
+        received = 0;
+      } else if (frame.type === "chunk_relay") {
+        if (typeof frame.idx === "number") fetchAndPlace(frame.idx);
+      } else if (frame.type === "relay_done") {
+        (async () => {
+          if (!meta || !chunks) return;
+          for (let i = 0; i < meta.totalChunks; i++) {
+            if (chunks[i] === null) await fetchAndPlace(i);
+          }
+          maybeFinalize();
+        })();
+      }
+    },
+  };
+}
+
 // Receiver-side accumulator. One outbound Blob per file.
 function makeReceiver({ onProgress, onFile }) {
   let meta = null;
@@ -424,8 +568,47 @@ function startSendSession(files) {
   sendSession = session;
   showSessionPanel(link);
 
+  // WebRTC-vs-relay fallback. If the DC hasn't opened within
+  // CONFIG.webrtcTimeoutMs of the WS opening, the sender starts
+  // uploading chunks via server relay. Tracked on the session so the
+  // DC-open handler can cancel the timer if it wins the race.
+  session.relayStarted = false;
+  session.fallbackTimer = null;
+  session.relayProgress = { meta: null, sentIdxs: [], done: false };
+
+  const armFallbackTimer = () => {
+    session.fallbackTimer = setTimeout(async () => {
+      if (sendSession !== session) return;
+      if (session.dcOpen) return;
+      if (session.relayStarted) return;
+      const file = session.files && session.files[0];
+      if (!file) return;
+      session.relayStarted = true;
+      els.sessionState.textContent =
+        `WebRTC not open after ${CONFIG.webrtcTimeoutMs}ms — falling back to server relay…`;
+      els.sessionState.classList.add("transferring");
+      try {
+        await sendFileOverRelay(session.sessionHex, ws, file, {
+          onProgress: (sent, total) => {
+            if (sendSession !== session) return;
+            const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
+            els.sessionState.textContent =
+              `sending via relay ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
+          },
+          progressState: session.relayProgress,
+        });
+        els.sessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
+        els.cancelBtn.textContent = "Send another";
+        els.cancelBtn.classList.add("done");
+      } catch (err) {
+        els.sessionState.textContent = `relay send failed: ${err.message}`;
+      }
+    }, CONFIG.webrtcTimeoutMs);
+  };
+
   ws.addEventListener("open", () => {
     ws.send(JSON.stringify({ type: "hello", role: "sender" }));
+    armFallbackTimer();
   });
 
   ws.addEventListener("message", async (ev) => {
@@ -434,6 +617,16 @@ function startSendSession(files) {
     try {
       frame = JSON.parse(ev.data);
     } catch {
+      return;
+    }
+
+    // Server-side notification that a new receiver joined mid-session.
+    // If we've already started a relay upload, catch the newcomer up by
+    // re-emitting the meta + all chunk indices already uploaded.
+    if (frame.type === "peer_joined" && frame.role === "receiver") {
+      if (session.relayStarted) {
+        resendRelayProgress(ws, session.relayProgress);
+      }
       return;
     }
 
@@ -448,6 +641,19 @@ function startSendSession(files) {
           role: "sender",
           ws,
           onOpen: async (dc) => {
+            session.dcOpen = true;
+            // Cancel the fallback timer — WebRTC won the race.
+            if (session.fallbackTimer) {
+              clearTimeout(session.fallbackTimer);
+              session.fallbackTimer = null;
+            }
+            // If the relay-upload path had already started, don't also
+            // stream via DC — the receiver's already picking up chunks
+            // from the relay and would end up with duplicates.
+            if (session.relayStarted) {
+              console.info("DC opened after relay-upload started; skipping DC file stream");
+              return;
+            }
             const file = session.files && session.files[0];
             if (!file) {
               els.sessionState.textContent = "direct channel open (no file queued)";
@@ -620,29 +826,39 @@ function startRecvSession(sessionHex) {
   // be answered as soon as it arrives.
   const session = { sessionHex, receiverId, ws, peer: null };
   recvSession = session;
+
+  const commonProgress = (received, total, name) => {
+    if (recvSession !== session) return;
+    const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+    els.recvState.textContent =
+      `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
+  };
+  const commonOnFile = (name, blob, size, via) => {
+    if (recvSession !== session) return;
+    const suffix = via ? ` (via ${via})` : "";
+    els.recvState.textContent = `received ${name} (${fmtSize(size)})${suffix}`;
+    const url = URL.createObjectURL(blob);
+    els.recvDownload.hidden = false;
+    els.recvDownload.innerHTML = "";
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.textContent = `Download ${name}`;
+    a.className = "pick-btn download-link";
+    els.recvDownload.appendChild(a);
+    a.click();
+  };
+
   const recvOnMessage = makeReceiver({
-    onProgress: (received, total, name) => {
-      if (recvSession !== session) return;
-      const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
-      els.recvState.textContent =
-        `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
-    },
-    onFile: (name, blob, size) => {
-      if (recvSession !== session) return;
-      els.recvState.textContent = `received ${name} (${fmtSize(size)})`;
-      const url = URL.createObjectURL(blob);
-      els.recvDownload.hidden = false;
-      els.recvDownload.innerHTML = "";
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = name;
-      a.textContent = `Download ${name}`;
-      a.className = "pick-btn download-link";
-      els.recvDownload.appendChild(a);
-      // Try to auto-trigger the download (browsers may block if no
-      // user-gesture recency; the visible button always works).
-      a.click();
-    },
+    onProgress: commonProgress,
+    onFile: (n, b, s) => commonOnFile(n, b, s, "WebRTC"),
+  });
+
+  // Relay-path receiver runs alongside the DC receiver. Whichever path
+  // delivers the file first wins; onFile fires exactly once.
+  const relayRecv = makeRelayReceiver(sessionHex, {
+    onProgress: commonProgress,
+    onFile: (n, b, s) => commonOnFile(n, b, s, "relay"),
   });
 
   session.peer = createPeer({
@@ -690,6 +906,11 @@ function startRecvSession(sessionHex) {
       } catch (e) {
         console.warn("recv handleFrame:", e);
       }
+      return;
+    }
+    // Relay-path fallback frames from the sender.
+    if (frame.type === "meta_relay" || frame.type === "chunk_relay" || frame.type === "relay_done") {
+      relayRecv.onWsFrame(frame);
     }
   });
 
@@ -754,27 +975,34 @@ function startRequestSession() {
   const session = { sessionHex, receiverId, ws, peer: null };
   requestSession = session;
 
+  const commonReqProgress = (received, total, name) => {
+    if (requestSession !== session) return;
+    const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+    els.requestState.textContent =
+      `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
+  };
+  const commonReqOnFile = (name, blob, size, via) => {
+    if (requestSession !== session) return;
+    const suffix = via ? ` (via ${via})` : "";
+    els.requestState.textContent = `received ${name} (${fmtSize(size)})${suffix}`;
+    const url = URL.createObjectURL(blob);
+    els.requestDownload.hidden = false;
+    els.requestDownload.innerHTML = "";
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.textContent = `Download ${name}`;
+    a.className = "pick-btn download-link";
+    els.requestDownload.appendChild(a);
+    a.click();
+  };
   const recvOnMessage = makeReceiver({
-    onProgress: (received, total, name) => {
-      if (requestSession !== session) return;
-      const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
-      els.requestState.textContent =
-        `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
-    },
-    onFile: (name, blob, size) => {
-      if (requestSession !== session) return;
-      els.requestState.textContent = `received ${name} (${fmtSize(size)})`;
-      const url = URL.createObjectURL(blob);
-      els.requestDownload.hidden = false;
-      els.requestDownload.innerHTML = "";
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = name;
-      a.textContent = `Download ${name}`;
-      a.className = "pick-btn download-link";
-      els.requestDownload.appendChild(a);
-      a.click();
-    },
+    onProgress: commonReqProgress,
+    onFile: (n, b, s) => commonReqOnFile(n, b, s, "WebRTC"),
+  });
+  const relayRecv = makeRelayReceiver(sessionHex, {
+    onProgress: commonReqProgress,
+    onFile: (n, b, s) => commonReqOnFile(n, b, s, "relay"),
   });
 
   session.peer = createPeer({
@@ -809,6 +1037,10 @@ function startRequestSession() {
     if ((frame.type === "sdp" || frame.type === "ice") && session.peer) {
       try { await session.peer.handleFrame(frame); }
       catch (e) { console.warn("request handleFrame:", e); }
+      return;
+    }
+    if (frame.type === "meta_relay" || frame.type === "chunk_relay" || frame.type === "relay_done") {
+      relayRecv.onWsFrame(frame);
     }
   });
 
@@ -879,17 +1111,55 @@ function startInvitedSendSession(sessionHex, files) {
   try { ws = new WebSocket(wsUrl); }
   catch (err) { els.invitedSessionState.textContent = `couldn't open socket: ${err.message}`; return; }
 
-  const session = { sessionHex, ws, files, peer: null };
+  const session = {
+    sessionHex, ws, files, peer: null,
+    relayStarted: false, dcOpen: false, fallbackTimer: null,
+    relayProgress: { meta: null, sentIdxs: [], done: false },
+  };
   invitedSession = session;
 
   ws.addEventListener("open", () => {
     ws.send(JSON.stringify({ type: "hello", role: "sender" }));
+    // Fallback: if the receiver's DC doesn't open within the timeout,
+    // upload the file via server relay so the request-mode receiver on
+    // the other end can pick it up. Same timer + progressState + resend
+    // pattern as the primary send-mode flow.
+    session.fallbackTimer = setTimeout(async () => {
+      if (invitedSession !== session) return;
+      if (session.dcOpen || session.relayStarted) return;
+      const file = session.files && session.files[0];
+      if (!file) return;
+      session.relayStarted = true;
+      els.invitedSessionState.textContent =
+        `WebRTC not open after ${CONFIG.webrtcTimeoutMs}ms — falling back to server relay…`;
+      els.invitedSessionState.classList.add("transferring");
+      try {
+        await sendFileOverRelay(session.sessionHex, ws, file, {
+          onProgress: (sent, total) => {
+            if (invitedSession !== session) return;
+            const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
+            els.invitedSessionState.textContent =
+              `sending via relay ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
+          },
+          progressState: session.relayProgress,
+        });
+        els.invitedSessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
+        els.invitedCancel.textContent = "Send another";
+        els.invitedCancel.classList.add("done");
+      } catch (err) {
+        els.invitedSessionState.textContent = `relay send failed: ${err.message}`;
+      }
+    }, CONFIG.webrtcTimeoutMs);
   });
 
   ws.addEventListener("message", async (ev) => {
     if (invitedSession !== session) return;
     let frame;
     try { frame = JSON.parse(ev.data); } catch { return; }
+    if (frame.type === "peer_joined" && frame.role === "receiver") {
+      if (session.relayStarted) resendRelayProgress(ws, session.relayProgress);
+      return;
+    }
     if (frame.type === "peer_hello") {
       els.invitedSessionState.textContent = "receiver joined — negotiating direct connection…";
       els.invitedSessionState.classList.add("transferring");
@@ -898,6 +1168,15 @@ function startInvitedSendSession(sessionHex, files) {
           role: "sender",
           ws,
           onOpen: async (dc) => {
+            session.dcOpen = true;
+            if (session.fallbackTimer) {
+              clearTimeout(session.fallbackTimer);
+              session.fallbackTimer = null;
+            }
+            if (session.relayStarted) {
+              console.info("invited DC opened after relay-upload started; skipping DC stream");
+              return;
+            }
             const file = session.files && session.files[0];
             if (!file) return;
             els.invitedSessionState.textContent = `sending ${file.name}: 0%`;
