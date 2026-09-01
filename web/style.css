@@ -1,5 +1,6 @@
 :root {
-  --bg: #0f1115;
+  --page-bg: #0a0c10;
+  --content-bg: #0f1115;
   --fg: #e6e8ec;
   --muted: #8b93a3;
   --accent: #6ea8fe;
@@ -19,7 +20,7 @@
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  background: var(--bg);
+  background: var(--page-bg);
   color: var(--fg);
   min-height: 100vh;
 }
@@ -28,6 +29,8 @@ main {
   max-width: 720px;
   margin: 0 auto;
   padding: 48px 24px;
+  background: var(--content-bg);
+  min-height: 100vh;
 }
 
 header h1 {
