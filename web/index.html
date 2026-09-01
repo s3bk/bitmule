@@ -12,32 +12,82 @@
       <header>
         <img src="./bitmule.svg" alt="" class="logo" aria-hidden="true" />
         <h1>bitmule</h1>
-        <p class="tagline">drop files to send</p>
+        <p id="tagline" class="tagline">drop files to send</p>
       </header>
 
-      <section
-        id="dropzone"
-        class="dropzone"
-        role="button"
-        tabindex="0"
-        aria-label="Drop files here or click to choose"
-      >
-        <div class="dropzone-inner">
-          <div class="dropzone-icon" aria-hidden="true">↓</div>
-          <p class="dropzone-msg">Drop files here</p>
-          <button id="pick-btn" type="button" class="pick-btn">
-            Choose files
-          </button>
-          <input
-            id="file-input"
-            type="file"
-            multiple
-            hidden
-            aria-hidden="true"
-          />
-        </div>
-      </section>
+      <!-- SEND MODE — shown when the URL has no hash -->
+      <div id="send-mode" hidden>
+        <section
+          id="dropzone"
+          class="dropzone"
+          role="button"
+          tabindex="0"
+          aria-label="Drop files here or click to choose"
+        >
+          <div class="dropzone-inner">
+            <div class="dropzone-icon" aria-hidden="true">↓</div>
+            <p class="dropzone-msg">Drop files here</p>
+            <button id="pick-btn" type="button" class="pick-btn">
+              Choose files
+            </button>
+            <input
+              id="file-input"
+              type="file"
+              multiple
+              hidden
+              aria-hidden="true"
+            />
+          </div>
+        </section>
 
+        <section id="queue" class="queue" aria-live="polite"></section>
+
+        <section id="session" class="session" hidden aria-live="polite">
+          <h2 class="session-title">Share this link with the receiver</h2>
+          <div class="session-link-row">
+            <input
+              id="session-link"
+              class="session-link"
+              type="text"
+              readonly
+              aria-label="share link"
+            />
+            <button id="copy-link" class="pick-btn" type="button">Copy</button>
+          </div>
+          <div id="session-qr" class="session-qr" aria-hidden="true"></div>
+          <div id="session-state" class="session-state">
+            waiting for receiver…
+          </div>
+          <button id="cancel-session" class="cancel-btn" type="button">
+            Cancel
+          </button>
+        </section>
+      </div>
+
+      <!-- RECEIVE MODE — shown when the URL hash is a valid 64-hex session -->
+      <div id="receive-mode" hidden>
+        <section id="recv-session" class="session" aria-live="polite">
+          <h2 class="session-title">Connected to sender</h2>
+          <div class="session-state" id="recv-state">connecting…</div>
+          <div class="status recv-status">
+            <div class="status-row">
+              <span class="status-label">session</span>
+              <span id="recv-session-id" class="status-value pending">–</span>
+            </div>
+            <div class="status-row">
+              <span class="status-label">server</span>
+              <span id="recv-server-status" class="status-value pending">
+                connecting…
+              </span>
+            </div>
+          </div>
+          <button id="recv-cancel" class="cancel-btn" type="button">
+            Close
+          </button>
+        </section>
+      </div>
+
+      <!-- Global status row (visible in both modes) -->
       <section id="status" class="status" aria-live="polite">
         <div class="status-row">
           <span class="status-label">wasm</span>
@@ -47,29 +97,6 @@
           <span class="status-label">server</span>
           <span id="server-status" class="status-value pending">connecting…</span>
         </div>
-      </section>
-
-      <section id="queue" class="queue" aria-live="polite"></section>
-
-      <section id="session" class="session" hidden aria-live="polite">
-        <h2 class="session-title">Share this link with the receiver</h2>
-        <div class="session-link-row">
-          <input
-            id="session-link"
-            class="session-link"
-            type="text"
-            readonly
-            aria-label="share link"
-          />
-          <button id="copy-link" class="pick-btn" type="button">Copy</button>
-        </div>
-        <div id="session-qr" class="session-qr" aria-hidden="true"></div>
-        <div id="session-state" class="session-state">
-          waiting for receiver…
-        </div>
-        <button id="cancel-session" class="cancel-btn" type="button">
-          Cancel
-        </button>
       </section>
     </main>
     <script src="./vendor/qrcode.js"></script>

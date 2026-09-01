@@ -45,7 +45,9 @@ Refresh the SPA. Status row should read `wasm: v<version>`.
 
 ## Layout
 
-- `index.html`     — drop-zone + button + status readouts.
+- `index.html`     — single page that hosts both send-mode UI and receive-mode UI.
 - `style.css`      — dark theme.
-- `main.js`        — drop/pick handlers, wasm import, signaling WS probe.
+- `main.js`        — routes on `location.hash`: no hash → send mode, valid 64-hex hash → receive mode.
+- `vendor/qrcode.js` — vendored QR generator (MIT, K. Arase).
+- `bitmule.svg`    — logo + favicon.
 - `wasm/pkg/*`     — populated by `wasm-pack build` (gitignored).

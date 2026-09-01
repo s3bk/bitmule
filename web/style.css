@@ -119,6 +119,10 @@ header h1 {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
+.recv-status {
+  margin-top: 8px;
+}
+
 .status-row {
   display: inline-flex;
   gap: 6px;
