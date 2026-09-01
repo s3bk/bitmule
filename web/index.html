@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>bitmule</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>bitmule</h1>
+        <p class="tagline">drop files to send</p>
+      </header>
+
+      <section
+        id="dropzone"
+        class="dropzone"
+        role="button"
+        tabindex="0"
+        aria-label="Drop files here or click to choose"
+      >
+        <div class="dropzone-inner">
+          <div class="dropzone-icon" aria-hidden="true">↓</div>
+          <p class="dropzone-msg">Drop files here</p>
+          <button id="pick-btn" type="button" class="pick-btn">
+            Choose files
+          </button>
+          <input
+            id="file-input"
+            type="file"
+            multiple
+            hidden
+            aria-hidden="true"
+          />
+        </div>
+      </section>
+
+      <section id="status" class="status" aria-live="polite">
+        <div class="status-row">
+          <span class="status-label">wasm</span>
+          <span id="wasm-status" class="status-value pending">loading…</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">server</span>
+          <span id="server-status" class="status-value pending">connecting…</span>
+        </div>
+      </section>
+
+      <section id="queue" class="queue" aria-live="polite"></section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
