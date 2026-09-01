@@ -262,3 +262,15 @@ header h1 {
   color: var(--err);
   border-color: var(--err);
 }
+
+.cancel-btn.done {
+  background: var(--accent);
+  color: #0a0d14;
+  border-color: var(--accent);
+}
+
+.cancel-btn.done:hover {
+  background: var(--accent-2);
+  color: #0a0d14;
+  border-color: var(--accent-2);
+}

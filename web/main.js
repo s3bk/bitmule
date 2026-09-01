@@ -350,6 +350,10 @@ function showSessionPanel(link) {
   renderQr(link);
   els.sessionState.textContent = "waiting for receiver…";
   els.sessionState.classList.remove("transferring");
+  // Reset the cancel button back to "Cancel" — it becomes "Send another"
+  // when a transfer completes successfully.
+  els.cancelBtn.textContent = "Cancel";
+  els.cancelBtn.classList.remove("done");
 }
 
 function hideSessionPanel() {
@@ -432,6 +436,11 @@ function startSendSession(files) {
                 },
               });
               els.sessionState.textContent = `sent ${file.name} (${fmtSize(file.size)})`;
+              // Flip the cancel button into a "Send another" affordance —
+              // same click handler tears the session down and returns
+              // the drop-zone.
+              els.cancelBtn.textContent = "Send another";
+              els.cancelBtn.classList.add("done");
             } catch (err) {
               els.sessionState.textContent = `send failed: ${err.message}`;
             }
