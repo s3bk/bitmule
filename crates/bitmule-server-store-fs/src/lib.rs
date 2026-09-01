@@ -43,7 +43,7 @@ fn io_err(e: io::Error) -> Error {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub quota_bytes: u64,
-    pub receivers: Vec<String>,
+    pub receivers: Vec<ReceiverId>,
     pub created_unix: u64,
 }
 
@@ -64,7 +64,8 @@ impl Default for SessionConfig {
 pub struct FsChunkStore {
     root: PathBuf,
     /// Per-session delivery-ledger write mutex to serialize appenders.
-    session_locks: Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>,
+    /// Keyed on the raw 32-byte id so we never round-trip through untrusted strings.
+    session_locks: Mutex<HashMap<[u8; 32], std::sync::Arc<Mutex<()>>>>,
 }
 
 impl FsChunkStore {
@@ -76,7 +77,10 @@ impl FsChunkStore {
     }
 
     async fn session_dir(&self, session: &SessionId) -> PathBuf {
-        self.root.join(&session.0)
+        // Hex encoding of a fixed 32-byte id: no `..`, no `/`, no NUL, no
+        // unicode surprises. The type system makes path traversal
+        // unrepresentable at this boundary.
+        self.root.join(session.as_hex())
     }
 
     async fn chunks_dir(&self, session: &SessionId) -> PathBuf {
@@ -115,7 +119,7 @@ impl FsChunkStore {
     /// Get or create the per-session write lock.
     async fn lock_for(&self, session: &SessionId) -> std::sync::Arc<Mutex<()>> {
         let mut map = self.session_locks.lock().await;
-        map.entry(session.0.clone())
+        map.entry(session.0)
             .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
             .clone()
     }
@@ -210,7 +214,7 @@ impl ChunkStore for FsChunkStore {
             .open(&path)
             .await
             .map_err(io_err)?;
-        let line = format!("{}\t{}\n", chunk_idx, receiver.0);
+        let line = format!("{}\t{}\n", chunk_idx, receiver.as_hex());
         f.write_all(line.as_bytes()).await.map_err(io_err)?;
         f.sync_all().await.map_err(io_err)?;
         Ok(())
@@ -231,15 +235,26 @@ impl ChunkStore for FsChunkStore {
             {
                 continue;
             }
-            let session_id = SessionId(sess_entry.file_name().to_string_lossy().into_owned());
+            // Directory names must be valid hex session ids. Anything else is
+            // either stray fs debris or an active traversal attempt; either
+            // way, silently skip it.
+            let dir_name = sess_entry.file_name();
+            let name_str = match dir_name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let session_id = match SessionId::from_hex(name_str) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
             let cfg = self.read_config(&session_id).await?;
             if cfg.receivers.is_empty() {
                 continue;
             }
-            let all_recv: HashSet<String> = cfg.receivers.iter().cloned().collect();
+            let all_recv: HashSet<[u8; 32]> = cfg.receivers.iter().map(|r| r.0).collect();
             // Read delivered.jsonl and group by chunk_idx
             let delivered_path = self.delivered_path(&session_id).await;
-            let mut per_chunk: HashMap<u32, HashSet<String>> = HashMap::new();
+            let mut per_chunk: HashMap<u32, HashSet<[u8; 32]>> = HashMap::new();
             if let Ok(f) = fs::File::open(&delivered_path).await {
                 let mut lines = BufReader::new(f).lines();
                 while let Some(line) = lines.next_line().await.map_err(io_err)? {
@@ -248,8 +263,8 @@ impl ChunkStore for FsChunkStore {
                         Some(v) => v,
                         None => continue,
                     };
-                    let rid = match it.next() {
-                        Some(s) => s.to_string(),
+                    let rid = match it.next().and_then(|s| ReceiverId::from_hex(s).ok()) {
+                        Some(r) => r.0,
                         None => continue,
                     };
                     per_chunk.entry(idx).or_default().insert(rid);

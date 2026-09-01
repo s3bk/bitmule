@@ -18,7 +18,7 @@
 //! SDP/ICE + key-exchange handshake — never chunk data. Chunk data goes over
 //! either the WebRTC data channel (direct) or the ChunkStore relay (fallback).
 
-use bitmule_core::{traits::SignalTransport, Error, Result, SessionId};
+use bitmule_core::{traits::SignalTransport, Error, ReceiverId, Result, SessionId};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -36,7 +36,7 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct WsSignalTransport {
     url: String,
     role: Role,
-    receiver_id: Option<String>,
+    receiver_id: Option<ReceiverId>,
     ws: Option<WsStream>,
 }
 
@@ -67,12 +67,12 @@ impl WsSignalTransport {
         }
     }
 
-    /// Receiver side: caller supplies a stable receiver_id (uuid).
-    pub fn receiver<S: Into<String>, R: Into<String>>(url: S, receiver_id: R) -> Self {
+    /// Receiver side: caller supplies its own [`ReceiverId`].
+    pub fn receiver<S: Into<String>>(url: S, receiver_id: ReceiverId) -> Self {
         Self {
             url: url.into(),
             role: Role::Receiver,
-            receiver_id: Some(receiver_id.into()),
+            receiver_id: Some(receiver_id),
             ws: None,
         }
     }
@@ -90,10 +90,11 @@ impl SignalTransport for WsSignalTransport {
         );
         let (mut ws, _resp) = connect_async(req).await.map_err(err)?;
 
-        // Initial hello frame with session id + role.
+        // Initial hello frame with session id + role. Both ids serialize
+        // as hex strings on the wire.
         let hello = serde_json::json!({
             "type": "hello",
-            "session_id": session.0,
+            "session_id": session,
             "role": self.role.as_str(),
             "receiver_id": self.receiver_id,
         });
@@ -102,7 +103,7 @@ impl SignalTransport for WsSignalTransport {
             .map_err(err)?;
 
         self.ws = Some(ws);
-        tracing::debug!(session = %session.0, role = ?self.role, "ws signaling connected");
+        tracing::debug!(session = %session.as_hex(), role = ?self.role, "ws signaling connected");
         Ok(())
     }
 
