@@ -319,4 +319,90 @@ impl ChunkStore for FsChunkStore {
         }
         Ok(evicted)
     }
+
+    async fn total_bytes_stored(&self) -> Result<u64> {
+        let mut total = 0u64;
+        let mut rd = match fs::read_dir(&self.root).await {
+            Ok(r) => r,
+            Err(_) => return Ok(0),
+        };
+        while let Some(sess_entry) = rd.next_entry().await.map_err(io_err)? {
+            let cdir = sess_entry.path().join("chunks");
+            if fs::metadata(&cdir).await.is_err() {
+                continue;
+            }
+            let mut chunk_rd = fs::read_dir(&cdir).await.map_err(io_err)?;
+            while let Some(entry) = chunk_rd.next_entry().await.map_err(io_err)? {
+                if let Ok(md) = entry.metadata().await {
+                    if md.is_file() {
+                        total += md.len();
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    async fn evict_to_bytes(&self, target_bytes: u64) -> Result<u64> {
+        // Collect every chunk file across every session with its mtime + size,
+        // then delete oldest-first until the running total drops to target.
+        // Cost is one pass to list, one sort, then targeted unlinks.
+        struct ChunkFile {
+            path: PathBuf,
+            mtime: SystemTime,
+            size: u64,
+        }
+
+        let mut all: Vec<ChunkFile> = Vec::new();
+        let mut total: u64 = 0;
+
+        let mut rd = match fs::read_dir(&self.root).await {
+            Ok(r) => r,
+            Err(_) => return Ok(0),
+        };
+        while let Some(sess_entry) = rd.next_entry().await.map_err(io_err)? {
+            let cdir = sess_entry.path().join("chunks");
+            if fs::metadata(&cdir).await.is_err() {
+                continue;
+            }
+            let mut chunk_rd = fs::read_dir(&cdir).await.map_err(io_err)?;
+            while let Some(entry) = chunk_rd.next_entry().await.map_err(io_err)? {
+                let md = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !md.is_file() {
+                    continue;
+                }
+                let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let size = md.len();
+                total += size;
+                all.push(ChunkFile {
+                    path: entry.path(),
+                    mtime,
+                    size,
+                });
+            }
+        }
+
+        if total <= target_bytes {
+            return Ok(0);
+        }
+
+        // Oldest first. Ties by path so behaviour is deterministic.
+        all.sort_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.path.cmp(&b.path)));
+
+        let mut freed: u64 = 0;
+        let mut remaining = total;
+        for c in all {
+            if remaining <= target_bytes {
+                break;
+            }
+            if fs::remove_file(&c.path).await.is_ok() {
+                freed += c.size;
+                remaining = remaining.saturating_sub(c.size);
+            }
+        }
+        Ok(freed)
+    }
 }

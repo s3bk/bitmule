@@ -44,7 +44,8 @@ Source of truth for feature requirements before they land in code. Every entry n
 - `GET /session/:sess/have` — bitmap of stored chunks (roaring, serialized).
 - `GET /session/:sess/capacity` — remaining bytes of session quota.
 - `POST /session/:sess/delivered/:idx` — receiver acks delivery; body is the hex ReceiverId.
-- Background loop: `gc_delivered` every 60s, `evict_older_than` every 10 min.
+- Background loop: `gc_delivered` every 60s, `evict_older_than` every 10 min, `evict_to_bytes(max_disk_bytes)` every tick.
+- `--max-disk-bytes` CLI flag (default 500 GiB) caps total stored ciphertext across all sessions. When exceeded, oldest chunks evict first until back at or below the cap. (Seb 2026-09-01)
 
 Every path segment is hex-parsed via `SessionId::from_hex` / `ReceiverId::from_hex` — non-hex gets 400 immediately, so path traversal never reaches the store.
 

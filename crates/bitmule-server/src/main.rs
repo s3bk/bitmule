@@ -33,6 +33,12 @@ struct Args {
     /// Retention for undelivered chunks. Older chunks are evicted.
     #[arg(long, default_value_t = 72)]
     retention_hours: u64,
+
+    /// Hard upper bound on total ciphertext bytes stored across all sessions.
+    /// When exceeded, the maintenance loop evicts oldest chunks first until
+    /// storage drops back at or below this value. Default 500 GiB.
+    #[arg(long, default_value_t = 500u64 * 1024 * 1024 * 1024)]
+    max_disk_bytes: u64,
 }
 
 #[tokio::main]
@@ -50,8 +56,13 @@ async fn main() -> anyhow::Result<()> {
     let store: Arc<dyn ChunkStore> = Arc::new(FsChunkStore::new(&args.data_dir));
     let state = AppState::new(store.clone());
 
-    // Periodic maintenance: gc every 60s, eviction every 10 min.
-    tokio::spawn(maintenance_loop(store.clone(), args.retention_hours));
+    // Periodic maintenance: gc every 60s, retention-eviction every 10 min,
+    // disk-cap eviction opportunistically after each pass.
+    tokio::spawn(maintenance_loop(
+        store.clone(),
+        args.retention_hours,
+        args.max_disk_bytes,
+    ));
 
     let app = Router::new()
         .route("/ws/:session", get(ws_handler))
@@ -73,7 +84,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn maintenance_loop(store: Arc<dyn ChunkStore>, retention_hours: u64) {
+async fn maintenance_loop(
+    store: Arc<dyn ChunkStore>,
+    retention_hours: u64,
+    max_disk_bytes: u64,
+) {
     let gc_period = Duration::from_secs(60);
     let evict_period = Duration::from_secs(600);
     let retention = Duration::from_secs(retention_hours * 3600);
@@ -92,6 +107,14 @@ async fn maintenance_loop(store: Arc<dyn ChunkStore>, retention_hours: u64) {
                 Err(e) => warn!(err = %e, "evict_older_than failed"),
             }
             last_evict = tokio::time::Instant::now();
+        }
+        // Global disk-cap enforcement every tick. Skips work when under cap.
+        match store.evict_to_bytes(max_disk_bytes).await {
+            Ok(freed) if freed > 0 => {
+                info!(freed_bytes = freed, cap = max_disk_bytes, "evict_to_bytes")
+            }
+            Ok(_) => {}
+            Err(e) => warn!(err = %e, "evict_to_bytes failed"),
         }
     }
 }

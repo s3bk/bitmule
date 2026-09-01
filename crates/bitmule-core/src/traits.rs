@@ -48,4 +48,12 @@ pub trait ChunkStore: Send + Sync {
 
     /// Evict undelivered chunks older than the retention threshold.
     async fn evict_older_than(&self, threshold: Duration) -> Result<u64>;
+
+    /// Total bytes of stored chunk data across all sessions.
+    async fn total_bytes_stored(&self) -> Result<u64>;
+
+    /// Evict oldest chunks first until total stored bytes falls at or below
+    /// `target_bytes`. Returns the number of bytes freed. If already at or
+    /// below `target_bytes`, returns 0 without touching anything.
+    async fn evict_to_bytes(&self, target_bytes: u64) -> Result<u64>;
 }
