@@ -5,9 +5,9 @@
 //   - Receive: URL hash is a valid 64-hex session id. Connects as
 //              receiver against that session.
 //
-// Switching modes is a route change: navigate to `#` to send, navigate
-// to `#<hex>` to receive. Live `hashchange` events flip the mode
-// without a reload.
+// Both modes open the signaling WebSocket to the server, then negotiate
+// a direct WebRTC data channel with the other peer. Chunk transfer will
+// ride the data channel; this cut only proves the connection opens.
 
 const CONFIG = {
   server:
@@ -16,6 +16,10 @@ const CONFIG = {
       ? "http://localhost:8443"
       : `${location.protocol}//${location.host}`),
   wasmModulePath: "./wasm/pkg/bitmule_client_wasm.js",
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+  ],
 };
 
 // ---- shared helpers -----------------------------------------------------
@@ -107,6 +111,96 @@ function renderQr(text) {
   }
 }
 
+// ---- WebRTC signaling adapter ------------------------------------------
+//
+// Shared by both roles. Wraps an RTCPeerConnection and speaks four frame
+// types over the caller-supplied WS:
+//   {type:"sdp", kind:"offer"|"answer", sdp}
+//   {type:"ice", candidate}    // candidate is RTCIceCandidateInit or null
+// The caller is responsible for routing incoming ws messages into
+// `handleFrame(frame)` and for closing the peer connection on cancel.
+
+function createPeer({ role, ws, onOpen, onMessage, onState }) {
+  const pc = new RTCPeerConnection({ iceServers: CONFIG.iceServers });
+  let dc = null;
+
+  function bindDataChannel(channel) {
+    dc = channel;
+    dc.binaryType = "arraybuffer";
+    dc.addEventListener("open", () => onOpen && onOpen(dc));
+    dc.addEventListener("message", (ev) => onMessage && onMessage(ev.data));
+    dc.addEventListener("close", () => onState && onState("dc-closed"));
+    dc.addEventListener("error", (e) =>
+      console.warn("data channel error:", e)
+    );
+  }
+
+  if (role === "sender") {
+    bindDataChannel(pc.createDataChannel("bitmule", { ordered: true }));
+  } else {
+    pc.addEventListener("datachannel", (ev) => bindDataChannel(ev.channel));
+  }
+
+  pc.addEventListener("icecandidate", (ev) => {
+    // ev.candidate === null signals end-of-candidates; forward that too so
+    // the peer can stop waiting.
+    try {
+      ws.send(
+        JSON.stringify({ type: "ice", candidate: ev.candidate })
+      );
+    } catch {}
+  });
+
+  pc.addEventListener("connectionstatechange", () => {
+    onState && onState(`pc:${pc.connectionState}`);
+  });
+
+  async function startOffer() {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    ws.send(
+      JSON.stringify({ type: "sdp", kind: "offer", sdp: offer.sdp })
+    );
+  }
+
+  async function handleFrame(frame) {
+    if (!frame || typeof frame !== "object") return;
+    if (frame.type === "sdp") {
+      const desc = { type: frame.kind, sdp: frame.sdp };
+      await pc.setRemoteDescription(desc);
+      if (frame.kind === "offer") {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(
+          JSON.stringify({
+            type: "sdp",
+            kind: "answer",
+            sdp: answer.sdp,
+          })
+        );
+      }
+    } else if (frame.type === "ice") {
+      try {
+        // null candidate = end-of-candidates from the peer; ignore.
+        if (frame.candidate) await pc.addIceCandidate(frame.candidate);
+      } catch (e) {
+        console.warn("addIceCandidate failed:", e);
+      }
+    }
+  }
+
+  function close() {
+    try {
+      if (dc) dc.close();
+    } catch {}
+    try {
+      pc.close();
+    } catch {}
+  }
+
+  return { pc, get dc() { return dc; }, startOffer, handleFrame, close };
+}
+
 // ---- send mode ---------------------------------------------------------
 
 let sendSession = null;
@@ -151,6 +245,9 @@ function hideSessionPanel() {
 function closeSendSession() {
   if (sendSession) {
     try {
+      sendSession.peer && sendSession.peer.close();
+    } catch {}
+    try {
       sendSession.ws.close();
     } catch {}
     sendSession = null;
@@ -162,9 +259,6 @@ function startSendSession(files) {
   renderQueue(files);
 
   const sessionHex = randomHex32();
-  // Same-page share link: navigate to the app root with the session in
-  // the hash. Receiver reads the hash on load and flips into receive
-  // mode without any URL rewriting or extra route.
   const link = `${serverHttpBase(CONFIG.server)}/#${sessionHex}`;
 
   const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHex}`;
@@ -176,20 +270,62 @@ function startSendSession(files) {
     return;
   }
 
-  const session = { sessionHex, link, ws, files };
+  const session = { sessionHex, link, ws, files, peer: null };
   sendSession = session;
   showSessionPanel(link);
 
   ws.addEventListener("open", () => {
     ws.send(JSON.stringify({ type: "hello", role: "sender" }));
   });
-  ws.addEventListener("message", (ev) => {
+
+  ws.addEventListener("message", async (ev) => {
     if (sendSession !== session) return;
-    els.sessionState.textContent =
-      "receiver joined — transfer stub (not yet wired)";
-    els.sessionState.classList.add("transferring");
-    console.info("relay frame from receiver:", ev.data);
+    let frame;
+    try {
+      frame = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+
+    // The receiver's peer_hello is the trigger to spin up WebRTC and
+    // send an SDP offer. Subsequent sdp/ice frames flow through the peer.
+    if (frame.type === "peer_hello") {
+      els.sessionState.textContent =
+        "receiver joined — negotiating direct connection…";
+      els.sessionState.classList.add("transferring");
+      if (!session.peer) {
+        session.peer = createPeer({
+          role: "sender",
+          ws,
+          onOpen: () => {
+            els.sessionState.textContent =
+              "direct channel open — ready to transfer";
+          },
+          onMessage: (data) => {
+            console.info("dc message from receiver:", data);
+          },
+          onState: (s) => {
+            console.info("sender pc state:", s);
+          },
+        });
+        try {
+          await session.peer.startOffer();
+        } catch (e) {
+          els.sessionState.textContent = `offer failed: ${e.message}`;
+        }
+      }
+      return;
+    }
+
+    if (session.peer && (frame.type === "sdp" || frame.type === "ice")) {
+      try {
+        await session.peer.handleFrame(frame);
+      } catch (e) {
+        console.warn("sender handleFrame:", e);
+      }
+    }
   });
+
   ws.addEventListener("close", () => {
     if (sendSession !== session) return;
     if (!els.sessionState.classList.contains("transferring")) {
@@ -264,6 +400,9 @@ let recvSession = null;
 function closeRecvSession() {
   if (recvSession) {
     try {
+      recvSession.peer && recvSession.peer.close();
+    } catch {}
+    try {
       recvSession.ws.close();
     } catch {}
     recvSession = null;
@@ -289,8 +428,25 @@ function startRecvSession(sessionHex) {
     return;
   }
 
-  const session = { sessionHex, receiverId, ws };
+  // Receiver preps its peer connection immediately so the SDP offer can
+  // be answered as soon as it arrives.
+  const session = { sessionHex, receiverId, ws, peer: null };
   recvSession = session;
+  session.peer = createPeer({
+    role: "receiver",
+    ws,
+    onOpen: () => {
+      els.recvState.textContent =
+        "direct channel open — ready to receive";
+      els.recvState.classList.add("transferring");
+    },
+    onMessage: (data) => {
+      console.info("dc message from sender:", data);
+    },
+    onState: (s) => {
+      console.info("receiver pc state:", s);
+    },
+  });
 
   ws.addEventListener("open", () => {
     setStatus(els.recvServerStatus, "ok", "connected");
@@ -301,17 +457,31 @@ function startRecvSession(sessionHex) {
         receiver_id: receiverId,
       })
     );
+    // The peer_hello triggers the sender to spin up its RTC + send offer.
     ws.send(
       JSON.stringify({ type: "peer_hello", receiver_id: receiverId })
     );
     els.recvState.textContent =
-      "connected — waiting for sender to start transfer";
-    els.recvState.classList.add("transferring");
+      "connected — waiting for sender to negotiate direct channel";
   });
-  ws.addEventListener("message", (ev) => {
+
+  ws.addEventListener("message", async (ev) => {
     if (recvSession !== session) return;
-    console.info("relay frame from sender:", ev.data);
+    let frame;
+    try {
+      frame = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    if (frame.type === "sdp" || frame.type === "ice") {
+      try {
+        await session.peer.handleFrame(frame);
+      } catch (e) {
+        console.warn("recv handleFrame:", e);
+      }
+    }
   });
+
   ws.addEventListener("close", () => {
     if (recvSession !== session) return;
     setStatus(els.recvServerStatus, "err", "closed");
@@ -344,7 +514,6 @@ function currentSessionHex() {
 function applyRoute() {
   const hex = currentSessionHex();
   if (hex) {
-    // Receive mode
     closeSendSession();
     hideSessionPanel();
     els.sendMode.hidden = true;
@@ -352,7 +521,6 @@ function applyRoute() {
     els.tagline.textContent = "receiving";
     startRecvSession(hex);
   } else {
-    // Send mode
     closeRecvSession();
     els.recvMode.hidden = true;
     els.sendMode.hidden = false;
