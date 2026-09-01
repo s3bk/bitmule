@@ -224,7 +224,7 @@ function createPeer({ role, ws, onOpen, onMessage, onState }) {
 // CONFIG.bufferedHighWater, pause and await 'bufferedamountlow' with a
 // low-watermark threshold of CONFIG.bufferedLowWater.
 
-async function sendFileOverDC(dc, file, { onProgress } = {}) {
+async function sendFileOverDC(dc, file, { onProgress, interruptAt } = {}) {
   const meta = {
     type: "meta",
     name: file.webkitRelativePath || file.name || "file.bin",
@@ -241,6 +241,12 @@ async function sendFileOverDC(dc, file, { onProgress } = {}) {
   let sent = 0;
 
   const flushChunk = async (chunk) => {
+    // Debug interruption hook: if configured, bail out (before send) the
+    // moment the transfer would cross the interrupt threshold. Simulates
+    // a network drop mid-transfer without needing actual network faults.
+    if (typeof interruptAt === "number" && sent >= interruptAt) {
+      throw new Error(`debug-interrupt at ${sent} bytes (threshold ${Math.floor(interruptAt)})`);
+    }
     if (dc.bufferedAmount > CONFIG.bufferedHighWater) {
       await new Promise((resolve) => {
         const handler = () => {
@@ -425,16 +431,28 @@ function startSendSession(files) {
               els.sessionState.textContent = "direct channel open (no file queued)";
               return;
             }
+            // ?debug=interrupt in the URL forces a synthetic mid-transfer
+            // abort at a random byte offset in [0, file.size). Off by
+            // default — real transfers are never interrupted by this hook.
+            const params = new URLSearchParams(location.search);
+            const opts = { onProgress: (sent, total) => {
+              if (sendSession !== session) return;
+              const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
+              els.sessionState.textContent =
+                `sending ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
+            }};
+            if (params.get("debug") === "interrupt") {
+              opts.interruptAt = Math.random() * file.size;
+              console.info(
+                "debug=interrupt enabled; will abort at byte offset ~",
+                Math.floor(opts.interruptAt),
+                "of",
+                file.size
+              );
+            }
             els.sessionState.textContent = `sending ${file.name}: 0%`;
             try {
-              await sendFileOverDC(dc, file, {
-                onProgress: (sent, total) => {
-                  if (sendSession !== session) return;
-                  const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
-                  els.sessionState.textContent =
-                    `sending ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
-                },
-              });
+              await sendFileOverDC(dc, file, opts);
               els.sessionState.textContent = `sent ${file.name} (${fmtSize(file.size)})`;
               // Flip the cancel button into a "Send another" affordance —
               // same click handler tears the session down and returns
