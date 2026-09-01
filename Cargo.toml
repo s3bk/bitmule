@@ -7,6 +7,7 @@ members = [
     "crates/bitmule-server-signal-ws",
     "crates/bitmule-server-store-fs",
     "crates/bitmule-client-wasm",
+    "crates/bitmule-client-native",
 ]
 
 [workspace.package]

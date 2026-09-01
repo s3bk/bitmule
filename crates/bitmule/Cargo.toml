@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 bitmule-core = { path = "../bitmule-core" }
+bitmule-client-native = { path = "../bitmule-client-native" }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 anyhow = { workspace = true }

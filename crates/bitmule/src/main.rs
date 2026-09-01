@@ -74,6 +74,31 @@ enum Command {
         /// FIRST is a name; ignored when FIRST is a share URL.
         pubkey: Option<String>,
     },
+    /// WebRTC connect (sender). Opens a signaling WS to the server,
+    /// waits for a receiver, exchanges SDP + ICE, opens a data channel,
+    /// and holds it open. No transfer yet — this proves the CLI reaches
+    /// the same "direct channel open" state the browser reaches. Prints
+    /// the session id the receiver needs.
+    WebrtcSend {
+        /// Signaling server URL (ws:// or wss://). Defaults to derived
+        /// from --server (http:// swapped to ws://).
+        #[arg(long)]
+        signal_url: Option<String>,
+        /// Seconds to hold the DC open before exiting.
+        #[arg(long, default_value_t = 30)]
+        hold_seconds: u64,
+    },
+    /// WebRTC connect (receiver). Given a session hex printed by
+    /// `webrtc-send`, opens a signaling WS, exchanges SDP + ICE against
+    /// the sender, and holds the DC open.
+    WebrtcRecv {
+        /// Session id (64 hex chars).
+        session: String,
+        #[arg(long)]
+        signal_url: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        hold_seconds: u64,
+    },
     /// Print version + build info.
     Version,
 }
@@ -114,6 +139,15 @@ async fn main() -> Result<()> {
             IdentityAction::Add { name, contact_base } => identity_add(name, contact_base).await,
         },
         Command::Add { first, pubkey } => contact_add(first, pubkey).await,
+        Command::WebrtcSend {
+            signal_url,
+            hold_seconds,
+        } => webrtc_send(&cli.server, signal_url, hold_seconds).await,
+        Command::WebrtcRecv {
+            session,
+            signal_url,
+            hold_seconds,
+        } => webrtc_recv(&cli.server, signal_url, session, hold_seconds).await,
         Command::Version => {
             println!("bitmule {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -249,5 +283,58 @@ async fn recv_smoke(server: &str, session_hex: String, out: PathBuf) -> Result<(
     f.sync_all().await?;
 
     println!("wrote {}", out.display());
+    Ok(())
+}
+
+fn derive_signal_url(server: &str, override_url: Option<String>) -> String {
+    if let Some(u) = override_url {
+        return u.trim_end_matches('/').to_string();
+    }
+    let base = server.trim_end_matches('/');
+    if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else {
+        base.to_string()
+    }
+}
+
+async fn webrtc_send(server: &str, signal_url: Option<String>, hold_seconds: u64) -> Result<()> {
+    let signal = derive_signal_url(server, signal_url);
+    // Print the session hex BEFORE the (blocking) wait for the receiver
+    // so the operator can paste it into the receiver CLI right away.
+    let session_id = SessionId::random();
+    println!("session: {}", session_id.as_hex());
+    println!(
+        "receive with: bitmule --server {} webrtc-recv {}",
+        server,
+        session_id.as_hex()
+    );
+    println!("opening sender WebSocket at {signal} — waiting for receiver…");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let session = bitmule_client_native::send_connect(&signal, session_id).await?;
+    println!("data channel open (label={:?}) — holding {}s", session.dc.label(), hold_seconds);
+    tokio::time::sleep(std::time::Duration::from_secs(hold_seconds)).await;
+    let _ = session.close().await;
+    Ok(())
+}
+
+async fn webrtc_recv(
+    server: &str,
+    signal_url: Option<String>,
+    session_hex: String,
+    hold_seconds: u64,
+) -> Result<()> {
+    let signal = derive_signal_url(server, signal_url);
+    let session_id = SessionId::from_hex(session_hex.trim())
+        .map_err(|e| anyhow!("bad session id: {e}"))?;
+    println!("opening receiver WebSocket at {signal}");
+    let session = bitmule_client_native::recv_connect(&signal, session_id).await?;
+    println!("connected to session {}", session.session_id.as_hex());
+    println!("data channel open (label={:?}) — holding {}s", session.dc.label(), hold_seconds);
+    tokio::time::sleep(std::time::Duration::from_secs(hold_seconds)).await;
+    let _ = session.close().await;
     Ok(())
 }

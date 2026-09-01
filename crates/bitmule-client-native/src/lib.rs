@@ -1,0 +1,400 @@
+//! bitmule-client-native — CLI-side counterpart to the browser SPA.
+//!
+//! Same wire protocol as `web/main.js`: a WebSocket to
+//! `bitmule-server`'s `/ws/<hex>` carries JSON signaling frames
+//! (`hello`, `peer_hello`, `sdp`, `ice`); a WebRTC peer connection
+//! then opens a data channel labelled `bitmule` for the actual chunk
+//! stream.
+//!
+//! Two entry points:
+//!
+//! - [`send_connect`] opens as `role=sender`. Generates a fresh session
+//!   id, waits for the receiver's `peer_hello`, sends an SDP offer,
+//!   trickles ICE. Resolves once the data channel is open.
+//! - [`recv_connect`] opens as `role=receiver`. Sends the receiver
+//!   hello + `peer_hello`, waits for an SDP offer, answers, trickles
+//!   ICE. Resolves once the data channel is open.
+//!
+//! Both entry points return a `LiveSession` that owns the peer + WS
+//! and holds them open until dropped. The chunk-transfer layer will
+//! attach on top of the data channel in a follow-up.
+
+use anyhow::{anyhow, bail, Context, Result};
+use bitmule_core::SessionId;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tracing::{debug, info, warn};
+use webrtc::{
+    api::{
+        interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
+    },
+    data_channel::RTCDataChannel,
+    ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
+    interceptor::registry::Registry,
+    peer_connection::{
+        configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
+        RTCPeerConnection,
+    },
+};
+
+/// A running, connected session: WS held open + peer connection + data channel.
+pub struct LiveSession {
+    pub session_id: SessionId,
+    pub role: Role,
+    pub pc: Arc<RTCPeerConnection>,
+    pub dc: Arc<RTCDataChannel>,
+    _ws_task: tokio::task::JoinHandle<()>,
+}
+
+impl LiveSession {
+    /// Close the peer connection (drops the WS task with it).
+    pub async fn close(&self) -> Result<()> {
+        self.pc.close().await.map_err(|e| anyhow!("pc close: {e}"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Sender,
+    Receiver,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Sender => "sender",
+            Role::Receiver => "receiver",
+        }
+    }
+}
+
+/// Wire frames on the signaling WebSocket. Mirrors what `web/main.js` sends.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SignalFrame {
+    Hello {
+        role: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        receiver_id: Option<String>,
+    },
+    PeerHello {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        receiver_id: Option<String>,
+    },
+    Sdp {
+        kind: String, // "offer" | "answer"
+        sdp: String,
+    },
+    Ice {
+        candidate: Option<serde_json::Value>,
+    },
+}
+
+type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_ws(server_url: &str, session_hex: &str) -> Result<Ws> {
+    let ws_url = format!("{}/ws/{}", server_url.trim_end_matches('/'), session_hex);
+    let (ws, _resp) = connect_async(&ws_url)
+        .await
+        .with_context(|| format!("connect {ws_url}"))?;
+    Ok(ws)
+}
+
+async fn build_peer_connection() -> Result<Arc<RTCPeerConnection>> {
+    let mut me = MediaEngine::default();
+    me.register_default_codecs().map_err(|e| anyhow!("register codecs: {e}"))?;
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut me)
+        .map_err(|e| anyhow!("register interceptors: {e}"))?;
+    let api = APIBuilder::new()
+        .with_media_engine(me)
+        .with_interceptor_registry(registry)
+        .build();
+    let cfg = RTCConfiguration {
+        ice_servers: vec![
+            RTCIceServer {
+                urls: vec![
+                    "stun:stun.l.google.com:19302".to_owned(),
+                    "stun:stun1.l.google.com:19302".to_owned(),
+                ],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let pc = api
+        .new_peer_connection(cfg)
+        .await
+        .map_err(|e| anyhow!("new_peer_connection: {e}"))?;
+    Ok(Arc::new(pc))
+}
+
+/// Splits the WS into a send-side (an mpsc that pushes JSON frames into the
+/// socket) and a receive-side (JoinHandle that pumps incoming frames into
+/// the peer's ICE + SDP paths). The join handle is kept alive by returning
+/// it to the caller as part of the LiveSession.
+fn drive_ws(
+    ws: Ws,
+    pc: Arc<RTCPeerConnection>,
+    dc_ready: Arc<tokio::sync::Notify>,
+) -> (mpsc::UnboundedSender<SignalFrame>, mpsc::UnboundedReceiver<SignalFrame>, tokio::task::JoinHandle<()>) {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalFrame>();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<SignalFrame>();
+
+    let (sink, mut stream) = ws.split();
+    let sink = Arc::new(Mutex::new(sink));
+
+    // Outbound pump: JSON-encode + send.
+    let sink_out = sink.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            let text = match serde_json::to_string(&frame) {
+                Ok(t) => t,
+                Err(e) => { warn!("frame encode: {e}"); continue; }
+            };
+            let mut s = sink_out.lock().await;
+            if let Err(e) = s.send(Message::Text(text.into())).await {
+                warn!("ws send: {e}");
+                break;
+            }
+        }
+    });
+
+    // Inbound pump: parse + route.
+    let pc_in = pc.clone();
+    let in_tx_clone = in_tx.clone();
+    let handle = tokio::spawn(async move {
+        while let Some(msg) = stream.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => { warn!("ws recv: {e}"); break; }
+            };
+            let text = match msg {
+                Message::Text(t) => t.to_string(),
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            let frame: SignalFrame = match serde_json::from_str(&text) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            match &frame {
+                SignalFrame::Sdp { kind, sdp } => {
+                    let desc = if kind == "offer" {
+                        RTCSessionDescription::offer(sdp.clone())
+                    } else {
+                        RTCSessionDescription::answer(sdp.clone())
+                    };
+                    match desc {
+                        Ok(d) => {
+                            if let Err(e) = pc_in.set_remote_description(d).await {
+                                warn!("set_remote_description: {e}");
+                            }
+                        }
+                        Err(e) => warn!("build sdp: {e}"),
+                    }
+                    let _ = in_tx_clone.send(frame);
+                }
+                SignalFrame::Ice { candidate } => {
+                    if let Some(c) = candidate {
+                        let init: RTCIceCandidateInit = match serde_json::from_value(c.clone()) {
+                            Ok(v) => v,
+                            Err(e) => { warn!("ice decode: {e}"); continue; }
+                        };
+                        if let Err(e) = pc_in.add_ice_candidate(init).await {
+                            warn!("add_ice_candidate: {e}");
+                        }
+                    }
+                    let _ = in_tx_clone.send(frame);
+                }
+                _ => {
+                    let _ = in_tx_clone.send(frame);
+                }
+            }
+        }
+        // Wake anything still waiting on the DC in case the WS dies.
+        dc_ready.notify_waiters();
+    });
+
+    (out_tx, in_rx, handle)
+}
+
+/// Wire the peer's `on_ice_candidate` handler to forward every candidate to
+/// the WS as an `ice` frame.
+fn wire_ice_forwarding(
+    pc: &Arc<RTCPeerConnection>,
+    out_tx: mpsc::UnboundedSender<SignalFrame>,
+) {
+    pc.on_ice_candidate(Box::new(move |cand| {
+        let out_tx = out_tx.clone();
+        Box::pin(async move {
+            let candidate = match cand {
+                Some(c) => match c.to_json() {
+                    Ok(init) => Some(serde_json::to_value(init).ok()).flatten(),
+                    Err(e) => { warn!("ice to_json: {e}"); None }
+                },
+                None => None,
+            };
+            let _ = out_tx.send(SignalFrame::Ice { candidate });
+        })
+    }));
+}
+
+/// Sender flow. Caller supplies the SessionId so it can be printed to
+/// the user before the (blocking) wait for the receiver's peer_hello.
+pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<LiveSession> {
+    let session_hex = session_id.as_hex();
+    info!(session = %session_hex, "opening sender WS");
+    let ws = open_ws(server_url, &session_hex).await?;
+
+    let pc = build_peer_connection().await?;
+
+    // Data channel MUST be created BEFORE the offer so its m-line is in the SDP.
+    let dc = pc
+        .create_data_channel("bitmule", None)
+        .await
+        .map_err(|e| anyhow!("create_data_channel: {e}"))?;
+
+    let dc_ready = Arc::new(tokio::sync::Notify::new());
+    let dc_ready_signal = dc_ready.clone();
+    dc.on_open(Box::new(move || {
+        let n = dc_ready_signal.clone();
+        Box::pin(async move { n.notify_waiters(); })
+    }));
+
+    let (out_tx, mut in_rx, ws_task) = drive_ws(ws, pc.clone(), dc_ready.clone());
+    wire_ice_forwarding(&pc, out_tx.clone());
+
+    // Send initial hello.
+    out_tx.send(SignalFrame::Hello {
+        role: Role::Sender.as_str().to_owned(),
+        receiver_id: None,
+    })?;
+
+    // Wait for the receiver's peer_hello — that's the go-signal to offer.
+    info!("waiting for receiver peer_hello");
+    loop {
+        let frame = in_rx.recv().await.ok_or_else(|| anyhow!("ws closed before peer_hello"))?;
+        if matches!(frame, SignalFrame::PeerHello { .. }) {
+            break;
+        }
+    }
+
+    // Offer.
+    let offer = pc
+        .create_offer(None)
+        .await
+        .map_err(|e| anyhow!("create_offer: {e}"))?;
+    pc.set_local_description(offer.clone())
+        .await
+        .map_err(|e| anyhow!("set_local_description: {e}"))?;
+    out_tx.send(SignalFrame::Sdp {
+        kind: "offer".to_owned(),
+        sdp: offer.sdp,
+    })?;
+    debug!("offer sent");
+
+    // Wait for DC open (or WS death).
+    dc_ready.notified().await;
+    if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+        bail!("data channel not open after signal ({:?})", dc.ready_state());
+    }
+    info!("sender data channel open");
+
+    Ok(LiveSession {
+        session_id,
+        role: Role::Sender,
+        pc,
+        dc,
+        _ws_task: ws_task,
+    })
+}
+
+/// Receiver flow.
+pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<LiveSession> {
+    let session_hex = session_id.as_hex();
+    info!(session = %session_hex, "opening receiver WS");
+    let ws = open_ws(server_url, &session_hex).await?;
+
+    let pc = build_peer_connection().await?;
+
+    let dc_ready = Arc::new(tokio::sync::Notify::new());
+    let dc_slot: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
+    let dc_ready_signal = dc_ready.clone();
+    let dc_slot_signal = dc_slot.clone();
+    pc.on_data_channel(Box::new(move |channel| {
+        let slot = dc_slot_signal.clone();
+        let ready = dc_ready_signal.clone();
+        Box::pin(async move {
+            let ch_for_open = channel.clone();
+            let ready_open = ready.clone();
+            ch_for_open.on_open(Box::new(move || {
+                let n = ready_open.clone();
+                Box::pin(async move { n.notify_waiters(); })
+            }));
+            *slot.lock().await = Some(channel);
+        })
+    }));
+
+    let (out_tx, mut in_rx, ws_task) = drive_ws(ws, pc.clone(), dc_ready.clone());
+    wire_ice_forwarding(&pc, out_tx.clone());
+
+    let receiver_id = SessionId::random().as_hex();
+    out_tx.send(SignalFrame::Hello {
+        role: Role::Receiver.as_str().to_owned(),
+        receiver_id: Some(receiver_id.clone()),
+    })?;
+    out_tx.send(SignalFrame::PeerHello {
+        receiver_id: Some(receiver_id),
+    })?;
+
+    // Wait for the offer (set_remote_description was already called by drive_ws),
+    // then answer.
+    info!("waiting for sender SDP offer");
+    loop {
+        let frame = in_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("ws closed before offer"))?;
+        if let SignalFrame::Sdp { kind, .. } = &frame {
+            if kind == "offer" {
+                break;
+            }
+        }
+    }
+
+    let answer = pc
+        .create_answer(None)
+        .await
+        .map_err(|e| anyhow!("create_answer: {e}"))?;
+    pc.set_local_description(answer.clone())
+        .await
+        .map_err(|e| anyhow!("set_local_description: {e}"))?;
+    out_tx.send(SignalFrame::Sdp {
+        kind: "answer".to_owned(),
+        sdp: answer.sdp,
+    })?;
+    debug!("answer sent");
+
+    dc_ready.notified().await;
+    let dc = dc_slot
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow!("no data channel arrived"))?;
+    if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+        bail!("data channel not open after signal ({:?})", dc.ready_state());
+    }
+    info!("receiver data channel open");
+
+    Ok(LiveSession {
+        session_id,
+        role: Role::Receiver,
+        pc,
+        dc,
+        _ws_task: ws_task,
+    })
+}
