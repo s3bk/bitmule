@@ -5,5 +5,24 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "bitmule-server"
+path = "src/main.rs"
+
 [dependencies]
 bitmule-core = { path = "../bitmule-core" }
+bitmule-server-store-fs = { path = "../bitmule-server-store-fs" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+futures-util = "0.3"
+hex = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }

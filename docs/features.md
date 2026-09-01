@@ -34,6 +34,22 @@ Source of truth for feature requirements before they land in code. Every entry n
 
 - **zstd, per-file adaptive.** Skip on already-compressed formats. Pipeline order: plaintext → compress → encrypt → chunk. (Seb 2026-09-01 earlier)
 
+## Server (built 2026-09-01)
+
+`bitmule-server` binary wires WebSocket signaling + REST chunk relay on top of `FsChunkStore`:
+
+- `GET /ws/:session_hex` — signaling room. First frame is a JSON hello with role (`sender`/`receiver`) and, for receivers, a receiver_id. Sender frames fan to all receivers in the room; receiver frames route to the sender. No inspection of payload — SDP, ICE, and key-exchange all ride the same relay.
+- `PUT /session/:sess/chunk/:idx` — upload ciphertext chunk. Quota-checked before write.
+- `GET /session/:sess/chunk/:idx` — download ciphertext chunk.
+- `GET /session/:sess/have` — bitmap of stored chunks (roaring, serialized).
+- `GET /session/:sess/capacity` — remaining bytes of session quota.
+- `POST /session/:sess/delivered/:idx` — receiver acks delivery; body is the hex ReceiverId.
+- Background loop: `gc_delivered` every 60s, `evict_older_than` every 10 min.
+
+Every path segment is hex-parsed via `SessionId::from_hex` / `ReceiverId::from_hex` — non-hex gets 400 immediately, so path traversal never reaches the store.
+
+Auth is deferred to the identity-key layer (contacts, pubkey routing) — every session id is accepted for now.
+
 ## Naming concern (unresolved)
 
 - Pete flagged 2026-09-01: an eMule spinoff already exists under the "bitmule" name. Rename gets cheaper the sooner it happens.
