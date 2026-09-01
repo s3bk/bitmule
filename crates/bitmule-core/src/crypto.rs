@@ -59,5 +59,3 @@ impl SessionKey {
     }
 }
 
-// rand_core re-export for convenience
-extern crate rand_core;
