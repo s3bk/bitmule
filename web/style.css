@@ -171,3 +171,65 @@ header h1 {
   font-size: 12px;
   flex: 0 0 auto;
 }
+
+.session {
+  margin-top: 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.session-title {
+  font-size: 18px;
+  margin: 0;
+  font-weight: 600;
+}
+
+.session-link-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.session-link {
+  flex: 1;
+  background: var(--page-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  min-width: 0;
+}
+
+.session-state {
+  color: var(--muted);
+  font-size: 14px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.session-state.transferring {
+  color: var(--ok);
+}
+
+.cancel-btn {
+  align-self: flex-start;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.1s, border-color 0.1s;
+}
+
+.cancel-btn:hover {
+  color: var(--err);
+  border-color: var(--err);
+}

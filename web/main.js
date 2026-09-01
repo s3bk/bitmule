@@ -1,25 +1,22 @@
 // bitmule landing-page SPA.
 //
-// Responsibilities today:
-//   - Drop-zone + file picker that accept any files.
-//   - Load the bitmule-client-wasm module in the background.
-//   - Open a signaling WebSocket to the server in the background.
-//
-// Follow-up cuts wire the file queue into an actual upload flow (via
-// wasm + WebRTC + relay fallback). For now the drop just enqueues the
-// picked files into a visible list so the UI is honest about what
-// exists and what doesn't yet.
+// Sender flow (this cut):
+//   1. User drops or picks files.
+//   2. Client generates a fresh session id.
+//   3. Client opens a signaling WebSocket to /ws/<hex> as role=sender.
+//   4. Client renders the share link the receiver will paste, and stays
+//      connected on the socket, waiting for a receiver to join the same
+//      session.
+//   5. Anything that arrives on the socket while we're waiting flips the
+//      state to "receiver joined" — the actual chunk pipeline lands in
+//      the follow-up cut.
 
 const CONFIG = {
-  // Server root. Change to your deployed bitmule-server address.
-  // Same-origin default in production; localhost during dev.
   server:
     (window.BITMULE_SERVER && String(window.BITMULE_SERVER)) ||
     (location.protocol === "file:"
       ? "http://localhost:8443"
       : `${location.protocol}//${location.host}`),
-  // Optional path where the wasm-pack --target web bundle lives.
-  // Missing bundle is not an error; the SPA still functions.
   wasmModulePath: "./wasm/pkg/bitmule_client_wasm.js",
 };
 
@@ -30,6 +27,11 @@ const els = {
   queue: document.getElementById("queue"),
   wasmStatus: document.getElementById("wasm-status"),
   serverStatus: document.getElementById("server-status"),
+  session: document.getElementById("session"),
+  sessionLink: document.getElementById("session-link"),
+  sessionState: document.getElementById("session-state"),
+  copyBtn: document.getElementById("copy-link"),
+  cancelBtn: document.getElementById("cancel-session"),
 };
 
 function setStatus(el, state, text) {
@@ -47,8 +49,13 @@ function fmtSize(bytes) {
   return `${(mb / 1024).toFixed(2)} GiB`;
 }
 
-function enqueueFiles(fileList) {
-  for (const f of fileList) {
+function clearQueue() {
+  els.queue.textContent = "";
+}
+
+function renderQueue(files) {
+  clearQueue();
+  for (const f of files) {
     const row = document.createElement("div");
     row.className = "queue-item";
     const name = document.createElement("span");
@@ -60,6 +67,107 @@ function enqueueFiles(fileList) {
     row.append(name, size);
     els.queue.appendChild(row);
   }
+}
+
+// ---- session state ------------------------------------------------------
+
+// Holds the currently-live send session. Only one at a time in this cut.
+let activeSession = null;
+
+function newSessionIdHex() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function serverToWs(url) {
+  return url.replace(/^http/, "ws").replace(/\/$/, "");
+}
+
+function serverHttpBase(url) {
+  return url.replace(/\/$/, "");
+}
+
+function showSessionPanel(link) {
+  els.dropzone.hidden = true;
+  els.session.hidden = false;
+  els.sessionLink.value = link;
+  els.sessionState.textContent = "waiting for receiver…";
+  els.sessionState.classList.remove("transferring");
+}
+
+function hideSessionPanel() {
+  els.session.hidden = true;
+  els.dropzone.hidden = false;
+  clearQueue();
+  els.sessionLink.value = "";
+}
+
+async function startSendSession(files) {
+  // If a previous session is still open, close it. The user picked new
+  // files; that supersedes the prior session.
+  if (activeSession) {
+    activeSession.close();
+    activeSession = null;
+  }
+
+  renderQueue(files);
+
+  const sessionHex = newSessionIdHex();
+  const link = `${serverHttpBase(CONFIG.server)}/r/${sessionHex}`;
+
+  const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHex}`;
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch (err) {
+    els.sessionState.textContent = `couldn't open socket: ${err.message}`;
+    return;
+  }
+
+  const session = {
+    sessionHex,
+    link,
+    ws,
+    files,
+    close() {
+      try {
+        ws.close();
+      } catch {}
+    },
+  };
+  activeSession = session;
+  showSessionPanel(link);
+
+  ws.addEventListener("open", () => {
+    ws.send(JSON.stringify({ type: "hello", role: "sender" }));
+  });
+
+  ws.addEventListener("message", (ev) => {
+    // Any frame from the server on this socket means a receiver has
+    // joined the room and their frame was relayed to us. The real
+    // pipeline (SDP exchange, KEX, chunk stream) attaches here in a
+    // follow-up. For now: flip the visible state so the user knows the
+    // other side showed up.
+    if (activeSession !== session) return;
+    els.sessionState.textContent = "receiver joined — transfer stub (not yet wired)";
+    els.sessionState.classList.add("transferring");
+    console.info("relay frame from receiver:", ev.data);
+  });
+
+  ws.addEventListener("close", () => {
+    if (activeSession !== session) return;
+    if (!els.sessionState.classList.contains("transferring")) {
+      els.sessionState.textContent = "socket closed — cancel to send another";
+    }
+  });
+
+  ws.addEventListener("error", () => {
+    if (activeSession !== session) return;
+    els.sessionState.textContent = "server unreachable";
+  });
 }
 
 // ---- drop-zone wiring ---------------------------------------------------
@@ -82,7 +190,7 @@ els.dropzone.addEventListener("keydown", (e) => {
 
 els.fileInput.addEventListener("change", (e) => {
   if (e.target.files && e.target.files.length) {
-    enqueueFiles(e.target.files);
+    startSendSession(Array.from(e.target.files));
     e.target.value = "";
   }
 });
@@ -103,7 +211,28 @@ els.fileInput.addEventListener("change", (e) => {
 });
 els.dropzone.addEventListener("drop", (e) => {
   const files = e.dataTransfer?.files;
-  if (files && files.length) enqueueFiles(files);
+  if (files && files.length) startSendSession(Array.from(files));
+});
+
+// ---- session panel buttons ---------------------------------------------
+
+els.copyBtn.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(els.sessionLink.value);
+    const prev = els.copyBtn.textContent;
+    els.copyBtn.textContent = "Copied";
+    setTimeout(() => (els.copyBtn.textContent = prev), 1200);
+  } catch {
+    els.sessionLink.select();
+  }
+});
+
+els.cancelBtn.addEventListener("click", () => {
+  if (activeSession) {
+    activeSession.close();
+    activeSession = null;
+  }
+  hideSessionPanel();
 });
 
 // ---- background: wasm load ---------------------------------------------
@@ -119,48 +248,27 @@ els.dropzone.addEventListener("drop", (e) => {
     setStatus(els.wasmStatus, "ok", `v${version}`);
     window.bitmule = mod;
   } catch (err) {
-    // No wasm bundle yet, or import failed. UI still works.
     setStatus(els.wasmStatus, "err", "not built");
     console.info("bitmule-client-wasm not loaded:", err?.message || err);
   }
 })();
 
-// ---- background: signaling socket --------------------------------------
+// ---- background: reachability probe ------------------------------------
 
-(function connectSignaling() {
-  // For the pre-transfer "server is up" probe, open a ws with a random
-  // session id and role=sender. The server accepts, we send a hello, and
-  // that's proof-of-life. Real sessions get their own sockets later.
-  const httpBase = CONFIG.server.replace(/^http/, "ws");
-  // Random 32-byte hex session id, browser-crypto.
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  const sessionHex = Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  const url = `${httpBase.replace(/\/$/, "")}/ws/${sessionHex}`;
-
-  let ws;
+// Fire-and-forget HEAD probe against the server root so the status row
+// reflects reachability without holding a socket idle. The real per-session
+// WS opens on file selection.
+(async () => {
   try {
-    ws = new WebSocket(url);
+    // Any non-network-error response — even 404 — means the server host is
+    // up and reachable. axum routes /session/... but not /, so an unrouted
+    // GET returns 404 by design.
+    const resp = await fetch(serverHttpBase(CONFIG.server) + "/", {
+      method: "GET",
+      cache: "no-store",
+    });
+    setStatus(els.serverStatus, "ok", `reachable (${resp.status})`);
   } catch (err) {
-    setStatus(els.serverStatus, "err", "url invalid");
-    return;
-  }
-  ws.addEventListener("open", () => {
-    setStatus(els.serverStatus, "ok", "connected");
-    ws.send(JSON.stringify({ type: "hello", role: "sender" }));
-  });
-  ws.addEventListener("error", () => {
     setStatus(els.serverStatus, "err", "unreachable");
-  });
-  ws.addEventListener("close", (ev) => {
-    if (ev.wasClean && els.serverStatus.classList.contains("ok")) {
-      // Kept OK — the probe closed cleanly after saying hello.
-      return;
-    }
-    if (!els.serverStatus.classList.contains("ok")) {
-      setStatus(els.serverStatus, "err", "unreachable");
-    }
-  });
+  }
 })();
