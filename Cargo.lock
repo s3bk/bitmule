@@ -206,7 +206,9 @@ name = "bitmule-client-wasm"
 version = "0.1.0"
 dependencies = [
  "bitmule-core",
+ "getrandom 0.2.17",
  "js-sys",
+ "uuid",
  "wasm-bindgen",
 ]
 
