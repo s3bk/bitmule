@@ -53,16 +53,59 @@ pub struct LiveSession {
 async fn build_rtc() -> Result<(Rtc, Arc<UdpSocket>)> {
     let socket = UdpSocket::bind("0.0.0.0:0").await.context("bind udp")?;
     let port = socket.local_addr()?.port();
-    let local_ip = discover_outbound_ip().await
-        .context("discover outbound interface IP for ICE host candidate")?;
-    let cand_addr = std::net::SocketAddr::new(local_ip, port);
     let socket = Arc::new(socket);
 
     let mut rtc = Rtc::new(Instant::now());
-    let cand = Candidate::host(cand_addr, "udp").map_err(|e| anyhow!("host candidate: {e}"))?;
-    rtc.add_local_candidate(cand);
+
+    // Announce ALL local interface IPs as host candidates so ICE can pair
+    // whatever the remote peer sees us as. Loopback matters for same-host
+    // CLI ↔ browser tests where the browser's own 127.0.0.1 candidate is
+    // the only one reachable back to us. Real LAN + WAN cases are covered
+    // by the outbound-interface discovery + any additional NIC IPs.
+    let mut announced: Vec<std::net::IpAddr> = Vec::new();
+    if let Ok(ip) = discover_outbound_ip().await {
+        announced.push(ip);
+    }
+    for ip in local_interface_ips() {
+        if !announced.contains(&ip) { announced.push(ip); }
+    }
+    if !announced.iter().any(|ip| ip.is_loopback()) {
+        announced.push(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    if announced.is_empty() {
+        // Very degenerate — fall back to loopback so we at least try.
+        announced.push(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    for ip in announced {
+        let addr = std::net::SocketAddr::new(ip, port);
+        match Candidate::host(addr, "udp") {
+            Ok(c) => { rtc.add_local_candidate(c); }
+            Err(e) => warn!("skipping host candidate {addr}: {e}"),
+        }
+    }
 
     Ok((rtc, socket))
+}
+
+/// Enumerate local interface IPs by parsing `getifaddrs`-style output.
+/// Falls back to empty on failure (build_rtc still has the outbound-IP
+/// discovery + loopback fallback to cover the important cases).
+fn local_interface_ips() -> Vec<std::net::IpAddr> {
+    // Small no-extra-dep read of /proc/net/if_inet6 + local socket bind
+    // enumeration would be ideal; simplest correct thing without adding
+    // a crate is to call `hostname -I` and parse. Skip on macOS/Windows.
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(out) = std::process::Command::new("hostname").arg("-I").output() {
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Find a routable local interface IP by opening a scratch UDP socket to
