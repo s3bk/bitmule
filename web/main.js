@@ -161,26 +161,47 @@ function createPeer({ role, ws, onOpen, onMessage, onState }) {
   const pc = new RTCPeerConnection({ iceServers: CONFIG.iceServers });
   let dc = null;
 
+  // Debug output for the DTLS/ICE cross-side diagnosis (2026-09-02, Seb).
+  // Every ICE state, DTLS state, and signaling state gets logged with
+  // enough context to correlate against the native side's log lines.
+  const dbg = (...args) => console.log(`[bitmule ${role}]`, ...args);
+  pc.addEventListener("iceconnectionstatechange", () =>
+    dbg("iceConnectionState =>", pc.iceConnectionState));
+  pc.addEventListener("icegatheringstatechange", () =>
+    dbg("iceGatheringState =>", pc.iceGatheringState));
+  pc.addEventListener("signalingstatechange", () =>
+    dbg("signalingState =>", pc.signalingState));
+  pc.addEventListener("icecandidateerror", (e) =>
+    dbg("iceCandidateError:", e.errorCode, e.errorText, "url:", e.url));
+
   function bindDataChannel(channel) {
     dc = channel;
     dc.binaryType = "arraybuffer";
-    dc.addEventListener("open", () => onOpen && onOpen(dc));
+    dbg("bound data channel, initial state =", dc.readyState);
+    dc.addEventListener("open", () => { dbg("dc open"); onOpen && onOpen(dc); });
     dc.addEventListener("message", (ev) => onMessage && onMessage(ev.data));
-    dc.addEventListener("close", () => onState && onState("dc-closed"));
-    dc.addEventListener("error", (e) =>
-      console.warn("data channel error:", e)
-    );
+    dc.addEventListener("close", () => { dbg("dc close"); onState && onState("dc-closed"); });
+    dc.addEventListener("error", (e) => {
+      dbg("dc error:", e);
+      console.warn("data channel error:", e);
+    });
   }
 
   if (role === "sender") {
     bindDataChannel(pc.createDataChannel("bitmule", { ordered: true }));
   } else {
-    pc.addEventListener("datachannel", (ev) => bindDataChannel(ev.channel));
+    pc.addEventListener("datachannel", (ev) => {
+      dbg("ondatachannel fired, label =", ev.channel.label);
+      bindDataChannel(ev.channel);
+    });
   }
 
   pc.addEventListener("icecandidate", (ev) => {
-    // ev.candidate === null signals end-of-candidates; forward that too so
-    // the peer can stop waiting.
+    if (ev.candidate) {
+      dbg("local ICE candidate:", ev.candidate.candidate);
+    } else {
+      dbg("local ICE end-of-candidates");
+    }
     try {
       ws.send(
         JSON.stringify({ type: "ice", candidate: ev.candidate })
@@ -189,12 +210,14 @@ function createPeer({ role, ws, onOpen, onMessage, onState }) {
   });
 
   pc.addEventListener("connectionstatechange", () => {
+    dbg("connectionState =>", pc.connectionState);
     onState && onState(`pc:${pc.connectionState}`);
   });
 
   async function startOffer() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
+    dbg(`local SDP (offer):\n${offer.sdp}`);
     ws.send(
       JSON.stringify({ type: "sdp", kind: "offer", sdp: offer.sdp })
     );
@@ -203,11 +226,19 @@ function createPeer({ role, ws, onOpen, onMessage, onState }) {
   async function handleFrame(frame) {
     if (!frame || typeof frame !== "object") return;
     if (frame.type === "sdp") {
+      dbg(`remote SDP (${frame.kind}):\n${frame.sdp}`);
       const desc = { type: frame.kind, sdp: frame.sdp };
-      await pc.setRemoteDescription(desc);
+      try {
+        await pc.setRemoteDescription(desc);
+        dbg("setRemoteDescription OK");
+      } catch (e) {
+        dbg("setRemoteDescription FAILED:", e);
+        throw e;
+      }
       if (frame.kind === "offer") {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+        dbg(`local SDP (answer):\n${answer.sdp}`);
         ws.send(
           JSON.stringify({
             type: "sdp",
@@ -217,10 +248,15 @@ function createPeer({ role, ws, onOpen, onMessage, onState }) {
         );
       }
     } else if (frame.type === "ice") {
+      if (frame.candidate) {
+        dbg("remote ICE candidate:", frame.candidate.candidate);
+      } else {
+        dbg("remote ICE end-of-candidates");
+      }
       try {
-        // null candidate = end-of-candidates from the peer; ignore.
         if (frame.candidate) await pc.addIceCandidate(frame.candidate);
       } catch (e) {
+        dbg("addIceCandidate FAILED:", e);
         console.warn("addIceCandidate failed:", e);
       }
     }
