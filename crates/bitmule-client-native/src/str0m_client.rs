@@ -168,13 +168,16 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
                     SignalFrame::PeerHello { .. } if !peer_hello_seen => {
                         peer_hello_seen = true;
                         let offer = offer_holder.take().expect("offer set on entry");
+                        let offer_sdp = offer.to_sdp_string();
+                        info!("OFFER SDP:\n{}", offer_sdp);
                         ws_send(&mut ws, &SignalFrame::Sdp {
                             kind: "offer".into(),
-                            sdp: offer.to_sdp_string(),
+                            sdp: offer_sdp,
                         }).await?;
                         debug!("offer sent");
                     }
                     SignalFrame::Sdp { kind, sdp } if kind == "answer" => {
+                        info!("ANSWER SDP:\n{}", sdp);
                         let ans = SdpAnswer::from_sdp_string(&sdp)
                             .map_err(|e| anyhow!("parse answer: {e}"))?;
                         let pending_taken = pending_holder.take().expect("pending set on entry");
