@@ -623,40 +623,64 @@ async fn build_peer_connection() -> Result<Arc<RTCPeerConnection>> {
     Ok(Arc::new(pc))
 }
 
-/// Splits the WS into a send-side (an mpsc that pushes JSON frames into the
-/// socket) and a receive-side (JoinHandle that pumps incoming frames into
-/// the peer's ICE + SDP paths). The join handle is kept alive by returning
-/// it to the caller as part of the LiveSession.
+/// Handles returned from [`drive_ws`]. Typed channels for the four
+/// SignalFrame variants (Hello/PeerHello/Sdp/Ice); raw JSON channels
+/// for anything else — relay-mode framing (meta_relay / chunk_relay /
+/// relay_done) and server-side peer_joined notifications ride the raw
+/// channel. Callers that only need the typed side can ignore raw.
+struct WsHandles {
+    typed_out: mpsc::UnboundedSender<SignalFrame>,
+    typed_in: mpsc::UnboundedReceiver<SignalFrame>,
+    raw_out: mpsc::UnboundedSender<String>,
+    raw_in: mpsc::UnboundedReceiver<String>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 fn drive_ws(
     ws: Ws,
     pc: Arc<RTCPeerConnection>,
     dc_ready: Arc<tokio::sync::Notify>,
-) -> (mpsc::UnboundedSender<SignalFrame>, mpsc::UnboundedReceiver<SignalFrame>, tokio::task::JoinHandle<()>) {
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalFrame>();
-    let (in_tx, in_rx) = mpsc::unbounded_channel::<SignalFrame>();
+) -> WsHandles {
+    let (typed_out, mut typed_out_rx) = mpsc::unbounded_channel::<SignalFrame>();
+    let (typed_in_tx, typed_in) = mpsc::unbounded_channel::<SignalFrame>();
+    let (raw_out, mut raw_out_rx) = mpsc::unbounded_channel::<String>();
+    let (raw_in_tx, raw_in) = mpsc::unbounded_channel::<String>();
 
     let (sink, mut stream) = ws.split();
     let sink = Arc::new(Mutex::new(sink));
 
-    // Outbound pump: JSON-encode + send.
-    let sink_out = sink.clone();
+    // Outbound pump — typed frames.
+    let sink_typed = sink.clone();
     tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
+        while let Some(frame) = typed_out_rx.recv().await {
             let text = match serde_json::to_string(&frame) {
                 Ok(t) => t,
                 Err(e) => { warn!("frame encode: {e}"); continue; }
             };
-            let mut s = sink_out.lock().await;
+            let mut s = sink_typed.lock().await;
             if let Err(e) = s.send(Message::Text(text.into())).await {
-                warn!("ws send: {e}");
+                warn!("ws send typed: {e}");
                 break;
             }
         }
     });
 
-    // Inbound pump: parse + route.
+    // Outbound pump — raw strings (relay-mode framing, etc).
+    let sink_raw = sink.clone();
+    tokio::spawn(async move {
+        while let Some(text) = raw_out_rx.recv().await {
+            let mut s = sink_raw.lock().await;
+            if let Err(e) = s.send(Message::Text(text.into())).await {
+                warn!("ws send raw: {e}");
+                break;
+            }
+        }
+    });
+
+    // Inbound pump: parse + route + always mirror raw text into raw_in.
     let pc_in = pc.clone();
-    let in_tx_clone = in_tx.clone();
+    let typed_in_clone = typed_in_tx.clone();
+    let raw_in_clone = raw_in_tx.clone();
     let handle = tokio::spawn(async move {
         while let Some(msg) = stream.next().await {
             let msg = match msg {
@@ -668,6 +692,9 @@ fn drive_ws(
                 Message::Close(_) => break,
                 _ => continue,
             };
+            // Every text frame flows out on raw regardless of parse.
+            let _ = raw_in_clone.send(text.clone());
+
             let frame: SignalFrame = match serde_json::from_str(&text) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -687,7 +714,7 @@ fn drive_ws(
                         }
                         Err(e) => warn!("build sdp: {e}"),
                     }
-                    let _ = in_tx_clone.send(frame);
+                    let _ = typed_in_clone.send(frame);
                 }
                 SignalFrame::Ice { candidate } => {
                     if let Some(c) = candidate {
@@ -699,10 +726,10 @@ fn drive_ws(
                             warn!("add_ice_candidate: {e}");
                         }
                     }
-                    let _ = in_tx_clone.send(frame);
+                    let _ = typed_in_clone.send(frame);
                 }
                 _ => {
-                    let _ = in_tx_clone.send(frame);
+                    let _ = typed_in_clone.send(frame);
                 }
             }
         }
@@ -710,7 +737,7 @@ fn drive_ws(
         dc_ready.notify_waiters();
     });
 
-    (out_tx, in_rx, handle)
+    WsHandles { typed_out, typed_in, raw_out, raw_in, task: handle }
 }
 
 /// Wire the peer's `on_ice_candidate` handler to forward every candidate to
@@ -756,7 +783,8 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
         Box::pin(async move { n.notify_waiters(); })
     }));
 
-    let (out_tx, mut in_rx, ws_task) = drive_ws(ws, pc.clone(), dc_ready.clone());
+    let WsHandles { typed_out: out_tx, typed_in: mut in_rx, task: ws_task, .. } =
+        drive_ws(ws, pc.clone(), dc_ready.clone());
     wire_ice_forwarding(&pc, out_tx.clone());
 
     // Send initial hello.
@@ -830,7 +858,8 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
         })
     }));
 
-    let (out_tx, mut in_rx, ws_task) = drive_ws(ws, pc.clone(), dc_ready.clone());
+    let WsHandles { typed_out: out_tx, typed_in: mut in_rx, task: ws_task, .. } =
+        drive_ws(ws, pc.clone(), dc_ready.clone());
     wire_ice_forwarding(&pc, out_tx.clone());
 
     let receiver_id = SessionId::random().as_hex();
@@ -888,4 +917,346 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
         dc,
         _ws_task: ws_task,
     })
+}
+
+// ---- top-level file transfer with WebRTC / relay auto-fallback ----------
+//
+// send_file / recv_file are the CLI-facing entry points that unify the DC
+// and relay paths. Default (mode=Auto) is WebRTC-first with a 3s fallback
+// timer to the relay path; --webrtc and --relay force a single mode.
+
+/// How the caller wants file transfer to happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Try WebRTC first; if the data channel hasn't opened after
+    /// [`WEBRTC_FALLBACK_MS`], fall back to relay. Default for CLI.
+    Auto,
+    /// Only WebRTC. Errors if the DC never opens.
+    Webrtc,
+    /// Skip WebRTC entirely; use server relay from the start.
+    Relay,
+}
+
+/// How long the auto mode waits for the DC to open before falling back.
+pub const WEBRTC_FALLBACK_MS: u64 = 3000;
+
+async fn build_pc_and_dc()
+    -> Result<(Arc<RTCPeerConnection>, Arc<RTCDataChannel>, Arc<tokio::sync::Notify>)>
+{
+    let pc = build_peer_connection().await?;
+    let dc = pc
+        .create_data_channel("bitmule", None)
+        .await
+        .map_err(|e| anyhow!("create_data_channel: {e}"))?;
+    let dc_ready = Arc::new(tokio::sync::Notify::new());
+    let n = dc_ready.clone();
+    dc.on_open(Box::new(move || {
+        let n = n.clone();
+        Box::pin(async move { n.notify_waiters(); })
+    }));
+    Ok((pc, dc, dc_ready))
+}
+
+/// Send `file_path` over a fresh session. Auto mode tries WebRTC first
+/// and falls back to server relay after WEBRTC_FALLBACK_MS if the DC
+/// hasn't opened. `--webrtc` / `--relay` on the CLI force one path.
+pub async fn send_file(
+    server_url_http: &str,
+    session_id: SessionId,
+    file_path: std::path::PathBuf,
+    mode: TransportMode,
+    on_progress: impl FnMut(u64, u64, &str) + Send + 'static,
+) -> Result<()> {
+    let session_hex = session_id.as_hex();
+    let ws = open_ws(&derive_ws_url(server_url_http), &session_hex).await?;
+    let (pc, dc, dc_ready) = build_pc_and_dc().await?;
+    let WsHandles {
+        typed_out, mut typed_in, raw_out, mut raw_in, task: _ws_task
+    } = drive_ws(ws, pc.clone(), dc_ready.clone());
+    wire_ice_forwarding(&pc, typed_out.clone());
+
+    typed_out.send(SignalFrame::Hello {
+        role: Role::Sender.as_str().to_owned(),
+        receiver_id: None,
+    })?;
+
+    // Relay progress state — shared between the send loop and the raw-in
+    // task that resends on peer_joined.
+    let relay_progress = Arc::new(Mutex::new(RelaySendProgress::default()));
+    let file_name = file_path.file_name().map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".to_string());
+    let file_size = tokio::fs::metadata(&file_path).await?.len();
+
+    // Watch raw_in for peer_joined:receiver notifications; if the relay
+    // path is running, re-emit the progress so the newcomer catches up.
+    let raw_out_for_task = raw_out.clone();
+    let relay_progress_for_task = relay_progress.clone();
+    let peer_joined_task = tokio::spawn(async move {
+        while let Some(text) = raw_in.recv().await {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let ty = v.get("type").and_then(|x| x.as_str());
+            let role = v.get("role").and_then(|x| x.as_str());
+            if ty == Some("peer_joined") && role == Some("receiver") {
+                resend_relay_progress(&raw_out_for_task, relay_progress_for_task.clone()).await;
+            }
+        }
+    });
+
+    match mode {
+        TransportMode::Relay => {
+            // No WebRTC — just upload.
+            let fname = file_name.clone();
+            let sess = session_id.clone();
+            let file_path_cloned = file_path.clone();
+            let mut prog_cb = on_progress;
+            send_file_over_relay(
+                server_url_http, &sess, &file_path_cloned,
+                raw_out.clone(), relay_progress.clone(),
+                move |s, t| prog_cb(s, t, &fname),
+            ).await?;
+            peer_joined_task.abort();
+            return Ok(());
+        }
+        TransportMode::Webrtc => {
+            // Wait for the receiver's peer_hello, offer, wait for DC open.
+            loop {
+                let frame = typed_in.recv().await.ok_or_else(|| anyhow!("ws closed before peer_hello"))?;
+                if matches!(frame, SignalFrame::PeerHello { .. }) { break; }
+            }
+            let offer = pc.create_offer(None).await.map_err(|e| anyhow!("offer: {e}"))?;
+            pc.set_local_description(offer.clone()).await.map_err(|e| anyhow!("set_local: {e}"))?;
+            typed_out.send(SignalFrame::Sdp { kind: "offer".into(), sdp: offer.sdp })?;
+            dc_ready.notified().await;
+            if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+                bail!("data channel didn't open");
+            }
+            let fname = file_name.clone();
+            let mut prog_cb = on_progress;
+            send_file_over_dc(dc.clone(), &file_path, move |s, t| prog_cb(s, t, &fname)).await?;
+            peer_joined_task.abort();
+            return Ok(());
+        }
+        TransportMode::Auto => {}
+    }
+
+    // Auto: race WebRTC negotiation vs 3s timer. Whichever fires first
+    // decides the transport. The other is cancelled cleanly.
+
+    // Handle peer_hello → offer in a task so it runs alongside the timer.
+    let typed_out_offer = typed_out.clone();
+    let pc_offer = pc.clone();
+    let offer_task = tokio::spawn(async move {
+        loop {
+            let frame = match typed_in.recv().await {
+                Some(f) => f, None => return,
+            };
+            if matches!(frame, SignalFrame::PeerHello { .. }) {
+                match pc_offer.create_offer(None).await {
+                    Ok(offer) => {
+                        if let Err(e) = pc_offer.set_local_description(offer.clone()).await {
+                            warn!("set_local: {e}"); return;
+                        }
+                        let _ = typed_out_offer.send(SignalFrame::Sdp { kind: "offer".into(), sdp: offer.sdp });
+                    }
+                    Err(e) => { warn!("create_offer: {e}"); return; }
+                }
+                return;
+            }
+        }
+    });
+
+    let dc_ready_clone = dc_ready.clone();
+    let timer = tokio::time::sleep(Duration::from_millis(WEBRTC_FALLBACK_MS));
+    let dc_wait = async move { dc_ready_clone.notified().await; };
+    tokio::pin!(timer);
+    tokio::pin!(dc_wait);
+
+    let mut prog_cb = on_progress;
+    let fname = file_name.clone();
+    tokio::select! {
+        _ = &mut dc_wait => {
+            if dc.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+                let _ = offer_task;
+                info!("auto: DC open, using WebRTC");
+                send_file_over_dc(dc.clone(), &file_path, move |s, t| prog_cb(s, t, &fname)).await?;
+                peer_joined_task.abort();
+                return Ok(());
+            }
+        }
+        _ = &mut timer => {
+            info!("auto: {WEBRTC_FALLBACK_MS}ms elapsed without DC; falling back to relay");
+        }
+    }
+    // Fallback: relay upload. offer_task keeps running (if peer_hello
+    // arrives later, DC may still open; the receiver dedups by index).
+    let fname2 = file_name.clone();
+    let sess = session_id.clone();
+    send_file_over_relay(
+        server_url_http, &sess, &file_path,
+        raw_out.clone(), relay_progress.clone(),
+        move |s, t| prog_cb(s, t, &fname2),
+    ).await?;
+    peer_joined_task.abort();
+    let _ = file_size;
+    Ok(())
+}
+
+/// Receive one file from `session_id`. Auto mode watches both DC and
+/// relay paths in parallel; whichever completes first wins.
+pub async fn recv_file(
+    server_url_http: &str,
+    session_id: SessionId,
+    out_dir: std::path::PathBuf,
+    mode: TransportMode,
+    on_progress: impl FnMut(u64, u64, &str) + Send + 'static,
+) -> Result<std::path::PathBuf> {
+    let session_hex = session_id.as_hex();
+    let ws = open_ws(&derive_ws_url(server_url_http), &session_hex).await?;
+    let pc = build_peer_connection().await?;
+    let dc_ready = Arc::new(tokio::sync::Notify::new());
+    let dc_slot: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
+    let dc_ready_signal = dc_ready.clone();
+    let dc_slot_signal = dc_slot.clone();
+    pc.on_data_channel(Box::new(move |channel| {
+        let slot = dc_slot_signal.clone();
+        let ready = dc_ready_signal.clone();
+        Box::pin(async move {
+            let ready_open = ready.clone();
+            let ch = channel.clone();
+            ch.on_open(Box::new(move || {
+                let n = ready_open.clone();
+                Box::pin(async move { n.notify_waiters(); })
+            }));
+            *slot.lock().await = Some(channel);
+        })
+    }));
+    let WsHandles {
+        typed_out, mut typed_in, raw_out: _, raw_in, task: _ws_task
+    } = drive_ws(ws, pc.clone(), dc_ready.clone());
+    wire_ice_forwarding(&pc, typed_out.clone());
+
+    let receiver_id = SessionId::random().as_hex();
+    typed_out.send(SignalFrame::Hello {
+        role: Role::Receiver.as_str().to_owned(),
+        receiver_id: Some(receiver_id.clone()),
+    })?;
+    typed_out.send(SignalFrame::PeerHello { receiver_id: Some(receiver_id) })?;
+
+    // Wrap the callback in Arc<Mutex> so both the DC path and the relay
+    // path can call it as chunks land.
+    let on_progress = Arc::new(Mutex::new(on_progress));
+
+    // Watch typed_in for the SDP offer; once seen, answer.
+    let typed_out_ans = typed_out.clone();
+    let pc_ans = pc.clone();
+    let answer_task = tokio::spawn(async move {
+        while let Some(f) = typed_in.recv().await {
+            if let SignalFrame::Sdp { kind, .. } = &f {
+                if kind == "offer" {
+                    match pc_ans.create_answer(None).await {
+                        Ok(a) => {
+                            if let Err(e) = pc_ans.set_local_description(a.clone()).await {
+                                warn!("recv set_local: {e}"); return;
+                            }
+                            let _ = typed_out_ans.send(SignalFrame::Sdp { kind: "answer".into(), sdp: a.sdp });
+                        }
+                        Err(e) => { warn!("recv create_answer: {e}"); return; }
+                    }
+                    return;
+                }
+            }
+        }
+    });
+
+    match mode {
+        TransportMode::Relay => {
+            let progress_cb = on_progress.clone();
+            let cb = move |a, b, c: &str| {
+                if let Ok(mut g) = progress_cb.try_lock() { (*g)(a, b, c); }
+            };
+            let path = recv_file_over_relay(
+                server_url_http, &session_id, &out_dir, raw_in, cb,
+            ).await?;
+            answer_task.abort();
+            return Ok(path);
+        }
+        TransportMode::Webrtc => {
+            dc_ready.notified().await;
+            let dc = dc_slot.lock().await.clone().ok_or_else(|| anyhow!("no dc arrived"))?;
+            if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+                bail!("dc not open");
+            }
+            let progress_cb = on_progress.clone();
+            let cb = move |a, b, c: &str| {
+                if let Ok(mut g) = progress_cb.try_lock() { (*g)(a, b, c); }
+            };
+            let path = recv_file_over_dc(dc, &out_dir, cb).await?;
+            answer_task.abort();
+            return Ok(path);
+        }
+        TransportMode::Auto => {}
+    }
+
+    // Auto: run both paths in parallel; whichever completes first wins,
+    // cancel the other. The relay-mode consumer takes ownership of
+    // raw_in so we can't share it — that means auto mode uses raw for
+    // relay, DC for direct, no crossover.
+    let out_dir_dc = out_dir.clone();
+    let dc_slot_clone = dc_slot.clone();
+    let dc_ready_clone = dc_ready.clone();
+    let progress_dc = on_progress.clone();
+    let dc_task = tokio::spawn(async move {
+        dc_ready_clone.notified().await;
+        let dc = dc_slot_clone.lock().await.clone().ok_or_else(|| anyhow!("no dc"))?;
+        if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+            bail!("dc not open");
+        }
+        let cb = move |a, b, c: &str| {
+            if let Ok(mut g) = progress_dc.try_lock() { (*g)(a, b, c); }
+        };
+        recv_file_over_dc(dc, &out_dir_dc, cb).await
+    });
+
+    let server_url_owned = server_url_http.to_string();
+    let session_id_clone = session_id.clone();
+    let out_dir_relay = out_dir.clone();
+    let progress_relay = on_progress.clone();
+    let relay_task = tokio::spawn(async move {
+        let cb = move |a, b, c: &str| {
+            if let Ok(mut g) = progress_relay.try_lock() { (*g)(a, b, c); }
+        };
+        recv_file_over_relay(&server_url_owned, &session_id_clone, &out_dir_relay, raw_in, cb).await
+    });
+
+    let dc_abort = dc_task.abort_handle();
+    let relay_abort = relay_task.abort_handle();
+    tokio::pin!(dc_task);
+    tokio::pin!(relay_task);
+    tokio::select! {
+        r = &mut dc_task => {
+            relay_abort.abort();
+            answer_task.abort();
+            match r {
+                Ok(Ok(p)) => Ok(p),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow!("dc task join: {e}")),
+            }
+        }
+        r = &mut relay_task => {
+            dc_abort.abort();
+            answer_task.abort();
+            match r {
+                Ok(Ok(p)) => Ok(p),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow!("relay task join: {e}")),
+            }
+        }
+    }
+}
+
+fn derive_ws_url(server_url_http: &str) -> String {
+    let base = server_url_http.trim_end_matches('/');
+    if let Some(rest) = base.strip_prefix("http://") { format!("ws://{rest}") }
+    else if let Some(rest) = base.strip_prefix("https://") { format!("wss://{rest}") }
+    else { base.to_string() }
 }
