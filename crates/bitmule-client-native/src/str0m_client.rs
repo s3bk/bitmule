@@ -147,7 +147,7 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
     let mut offer_holder: Option<SdpOffer> = Some(offer);
     let mut pending_holder: Option<_> = Some(pending);
     let mut opened = false;
-    let mut buf = vec![0u8; 2000];
+    let mut buf = vec![0u8; 4096];
 
     while !opened {
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
@@ -188,6 +188,7 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
 
             r = socket.recv_from(&mut buf) => {
                 let (n, source) = r.context("udp recv_from")?;
+                info!("RX ← {} ({} bytes)", source, n);
                 let local = socket.local_addr().context("local_addr")?;
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
@@ -229,7 +230,7 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
     ws_send(&mut ws, &SignalFrame::PeerHello { receiver_id: Some(receiver_id) }).await?;
 
     let mut opened: Option<ChannelId> = None;
-    let mut buf = vec![0u8; 2000];
+    let mut buf = vec![0u8; 4096];
 
     while opened.is_none() {
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
@@ -265,6 +266,7 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
 
             r = socket.recv_from(&mut buf) => {
                 let (n, source) = r.context("udp recv_from")?;
+                info!("RX ← {} ({} bytes)", source, n);
                 let local = socket.local_addr().context("local_addr")?;
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
@@ -358,7 +360,7 @@ async fn channel_write_all(
     buf: &[u8],
 ) -> Result<()> {
     let mut next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
-    let mut recv_buf = vec![0u8; 2000];
+    let mut recv_buf = vec![0u8; 4096];
 
     loop {
         let accepted = {
@@ -427,7 +429,7 @@ fn channel_set_low_threshold(rtc: &mut Rtc, id: ChannelId, threshold: usize) -> 
 /// session cleanly without truncating the tail.
 async fn drain_until_buffer_empty(session: &mut LiveSession) -> Result<()> {
     let mut next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
-    let mut recv_buf = vec![0u8; 2000];
+    let mut recv_buf = vec![0u8; 4096];
     loop {
         let buffered = {
             let mut ch = session.rtc.channel(session.channel_id)
@@ -484,7 +486,7 @@ pub async fn recv_file_over_dc(
     let mut path_opt: Option<PathBuf> = None;
     let mut received: u64 = 0;
     let mut done = false;
-    let mut buf = vec![0u8; 2000];
+    let mut buf = vec![0u8; 4096];
 
     let mut next_timeout = drain_rtc_capture_data(
         &mut session.rtc, &session.socket, session.channel_id,
@@ -567,6 +569,7 @@ async fn drain_rtc_capture_data(
         match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
+                info!("TX → {} ({} bytes)", t.destination, t.contents.len());
                 socket.send_to(&t.contents, t.destination).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
@@ -805,6 +808,7 @@ async fn drain_rtc(rtc: &mut Rtc, socket: &UdpSocket) -> Result<Instant> {
         match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
+                info!("TX → {} ({} bytes)", t.destination, t.contents.len());
                 socket.send_to(&t.contents, t.destination).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
@@ -826,6 +830,7 @@ async fn drain_rtc_capture_open(
         match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
+                info!("TX → {} ({} bytes)", t.destination, t.contents.len());
                 socket.send_to(&t.contents, t.destination).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
@@ -848,6 +853,7 @@ async fn drain_rtc_capture_id(
         match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
+                info!("TX → {} ({} bytes)", t.destination, t.contents.len());
                 socket.send_to(&t.contents, t.destination).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
@@ -863,7 +869,10 @@ fn handle_generic_event(e: &Event) -> Result<()> {
     if let Event::IceConnectionStateChange(IceConnectionState::Disconnected) = e {
         bail!("ICE disconnected");
     }
-    debug!("str0m event: {:?}", e);
+    // Bump to info! for the DTLS-handshake-debug pass (2026-09-02): we
+    // want every connection-state + signaling-state + channel-open
+    // transition surfaced without asking users to flip RUST_LOG.
+    info!("str0m event: {:?}", e);
     Ok(())
 }
 
