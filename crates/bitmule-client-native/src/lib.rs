@@ -35,7 +35,7 @@ use webrtc::{
     api::{
         interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
     },
-    data_channel::RTCDataChannel,
+    data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel},
     ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
     interceptor::registry::Registry,
     peer_connection::{
@@ -129,6 +129,158 @@ pub async fn send_file_over_dc(
         tokio::time::sleep(BACKPRESSURE_POLL).await;
     }
     Ok(())
+}
+
+/// Receive a single file over an opened WebRTC data channel using the
+/// browser-parity wire framing (see [`send_file_over_dc`]). Writes the
+/// file into `out_dir/<sanitized-name>` and returns the final path.
+///
+/// Blocks until the sender emits `{"type":"done"}` OR the DC dies. If the
+/// DC closes before `done`, returns an error and the partial file stays
+/// on disk (caller can decide whether to unlink or resume).
+pub async fn recv_file_over_dc(
+    dc: Arc<RTCDataChannel>,
+    out_dir: &Path,
+    mut on_progress: impl FnMut(u64, u64, &str) + Send,
+) -> Result<std::path::PathBuf> {
+    #[derive(Debug)]
+    enum RxEvent {
+        Meta(MetaFrame),
+        Chunk(Bytes),
+        Done,
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<RxEvent>();
+    let close_notify = Arc::new(tokio::sync::Notify::new());
+
+    tokio::fs::create_dir_all(out_dir)
+        .await
+        .with_context(|| format!("mkdir -p {}", out_dir.display()))?;
+
+    // on_message pushes events into the channel; the main task below
+    // drains them and writes to disk. Errors in the callback are logged
+    // rather than surfaced — the caller sees them via the closed channel.
+    let tx_msg = tx.clone();
+    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+        let tx = tx_msg.clone();
+        Box::pin(async move {
+            if msg.is_string {
+                let text = match std::str::from_utf8(&msg.data) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return,
+                };
+                let value: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                match value.get("type").and_then(|x| x.as_str()) {
+                    Some("meta") => {
+                        if let Ok(m) = serde_json::from_value::<MetaFrame>(value) {
+                            let _ = tx.send(RxEvent::Meta(m));
+                        } else {
+                            warn!("dc meta decode failed");
+                        }
+                    }
+                    Some("done") => {
+                        let _ = tx.send(RxEvent::Done);
+                    }
+                    _ => {}
+                }
+            } else {
+                let _ = tx.send(RxEvent::Chunk(msg.data));
+            }
+        })
+    }));
+
+    let close_notify2 = close_notify.clone();
+    dc.on_close(Box::new(move || {
+        let n = close_notify2.clone();
+        Box::pin(async move {
+            n.notify_waiters();
+        })
+    }));
+
+    let mut meta_opt: Option<MetaFrame> = None;
+    let mut file_opt: Option<tokio::fs::File> = None;
+    let mut path_opt: Option<std::path::PathBuf> = None;
+    let mut received: u64 = 0;
+    let mut done = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            ev = rx.recv() => {
+                let Some(ev) = ev else { break };
+                match ev {
+                    RxEvent::Meta(m) => {
+                        let name = sanitize_filename(&m.name);
+                        let path = out_dir.join(&name);
+                        let file = tokio::fs::File::create(&path)
+                            .await
+                            .with_context(|| format!("create {}", path.display()))?;
+                        on_progress(0, m.size, &m.name);
+                        file_opt = Some(file);
+                        path_opt = Some(path);
+                        meta_opt = Some(m);
+                    }
+                    RxEvent::Chunk(bytes) => {
+                        if let Some(f) = file_opt.as_mut() {
+                            use tokio::io::AsyncWriteExt;
+                            f.write_all(&bytes).await?;
+                            received += bytes.len() as u64;
+                            if let Some(m) = meta_opt.as_ref() {
+                                on_progress(received, m.size, &m.name);
+                            }
+                        }
+                    }
+                    RxEvent::Done => {
+                        if let Some(mut f) = file_opt.take() {
+                            use tokio::io::AsyncWriteExt;
+                            f.flush().await?;
+                            f.sync_all().await?;
+                        }
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            _ = close_notify.notified() => {
+                bail!("data channel closed before done (received {received}/{} bytes)",
+                    meta_opt.as_ref().map(|m| m.size).unwrap_or(0));
+            }
+        }
+    }
+
+    if !done {
+        bail!("data channel event stream ended without a done frame");
+    }
+    path_opt.ok_or_else(|| anyhow!("no meta received before done"))
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MetaFrame {
+    #[serde(rename = "type")]
+    ty: String,
+    name: String,
+    size: u64,
+    #[serde(rename = "chunkBytes")]
+    chunk_bytes: u32,
+    #[serde(rename = "totalChunks")]
+    total_chunks: u64,
+}
+
+/// Reject any name that would escape `out_dir` or is otherwise unsafe on
+/// the local filesystem. Keeps only the file-name component. Returns a
+/// safe fallback if the sender's `name` degenerates to nothing.
+fn sanitize_filename(name: &str) -> String {
+    let stripped = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if stripped.is_empty() || stripped == "." || stripped == ".." {
+        return "received.bin".to_string();
+    }
+    stripped.to_string()
 }
 
 /// A running, connected session: WS held open + peer connection + data channel.
