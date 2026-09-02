@@ -1,37 +1,50 @@
 # bitmule end-to-end cryptography
 
-Spec + implementation notes for the confidentiality layer riding on top
-of the WebRTC data channel (or the server-relay HTTP path). Written up
-alongside the initial crypto module 2026-09-02 per Seb.
+Confidentiality + authenticity for file transfers, riding on top of the
+WebRTC data channel (or the server-relay HTTP path). Spec authored + iterated
+2026-09-02 through 2026-09-03 with Seb driving; Kenna writing.
 
 ## Threat model
 
-- The server sees `session_id` (the WebSocket handle) and, on the relay
-  path, ciphertext bytes for each chunk. Server never sees the URL
-  fragment, never sees any key material.
-- Passive network attackers see the same as the server on the wire.
-- A URL leak (someone captures the share link after the transfer) must
-  NOT let an attacker decrypt captured ciphertext from the finished
-  session. This is the forward-secrecy requirement.
+- **Signaling server** sees `session_id` (WebSocket handle) and, on the
+  relay path, ciphertext bytes for each chunk. Server never sees the
+  URL fragment, never sees any key material.
+- **Passive network attacker** sees what the server sees on the wire.
+- **Active network attacker without the URL secret** cannot inject
+  valid signaling, cannot substitute keys, and cannot read ciphertext.
+- **URL-secret holder** IS effectively an authorized party. Sharing the
+  URL is the credential; anyone who has it is trusted. Same as any
+  share-link scheme.
+- **URL-secret leak AFTER the session** (recording captured, URL later
+  reveals) must not decrypt the recording. This is the forward-secrecy
+  requirement.
 
-## Keys
+## Key hierarchy
 
-| Symbol | Bytes | Lifetime         | Source           | Purpose                                                    |
-|--------|-------|------------------|------------------|------------------------------------------------------------|
-| `A`    | 32    | share URL        | initiator RNG    | URL-shared secret. In the `#` fragment; server never sees. |
-| `E`    | 32    | one session      | each side RNG    | Ephemeral X25519 private key. Wiped after `S` is derived.  |
-| `S`    | 32    | one session      | X25519 + HKDF    | Symmetric wrap key for `B`. Derived per session.           |
-| `B`    | 32    | one file transfer| sender RNG       | Bulk stream key (ChaCha20-Poly1305).                       |
+| Symbol      | Bytes | Lifetime           | Source                                  | Purpose                                              |
+|-------------|-------|--------------------|-----------------------------------------|------------------------------------------------------|
+| `A`         | 32    | share URL          | initiator RNG                           | URL-shared secret. Lives in URL `#` fragment.        |
+| `session_id`| 32    | ambient            | SHA256(A)                               | Public session identifier. Server sees it.           |
+| `E_priv/pub`| 32/32 | one session        | each side RNG (fresh per session)       | Ephemeral X25519 keypair. Priv wiped after DH.       |
+| `S`         | 32    | one session        | X25519(local_E_priv, peer_E_pub)        | Raw DH shared secret. Non-uniform.                   |
+| `wrap_key`  | 32    | one session        | HKDF(S, salt=session_id, "wrap-key")    | Wraps B for wire transport.                          |
+| `meta_key`  | 32    | one session        | HKDF(S, salt=session_id, "meta-key")    | Encrypts the meta frame.                             |
+| `B`         | 32    | one file transfer  | sender-of-file RNG                      | Bulk stream key. ChaCha20-Poly1305.                  |
 
 **Initiator generates `A`.** For `bitmule send`, that's the sender; for
-`bitmule recv` (receiver invites a file), that's the receiver. Either way,
-the initiator puts `A` in the URL fragment and shares it out-of-band
-(clicking the link, scanning the QR).
+`bitmule recv` (recipient invites file), that's the recipient. Either
+way the initiator puts `A` in the URL fragment and shares out-of-band
+(link, QR).
 
-**Sender-of-file generates `B`.** In the `send` flow that's the same
-side as the initiator. In the `recv` flow (recipient invites the sender)
-the initiator generates `A` but the OTHER party generates `B` when they
-open the link and start streaming their file.
+**Sender-of-file generates `B`.** In `send` flow that's the initiator;
+in `recv` flow it's the OTHER party who opens the link and streams
+their file.
+
+**B is stable for the lifetime of the file being sent.** If the transfer
+restarts, the same B is reused: since the file is immutable during
+transfer, the same idx maps to the same plaintext, which produces the
+same ciphertext deterministically. No nonce-reuse-with-different-plaintext
+problem. A different file or a modified file requires a fresh B.
 
 ## Session identifier
 
@@ -40,219 +53,268 @@ session_id = SHA256(A)
 ```
 
 64 hex characters, matches the existing session-hex format the server
-already uses. Deterministic, so both sides compute the same one from the
-same `A`. One-way — server sees `session_id`, cannot recover `A`.
+uses. Deterministic (both sides derive it independently from A). One-way
+— server holding session_id cannot recover A.
 
 ## Per-session key exchange
 
-Both sides generate a fresh ephemeral X25519 keypair `(E_priv, E_pub)`.
-Each announces its `E_pub` over the signaling WebSocket (SignalFrame
-variants defined in the next section). Each message includes a MAC
-computed under `A`:
+Both sides:
 
-```
-mac = HMAC-SHA256(A, E_pub)
-```
+1. Generate a fresh ephemeral X25519 keypair `(E_priv, E_pub)`.
+2. Announce their `E_pub` over the signaling WebSocket as a
+   `KexPub { pub, mac }` SignalFrame, with `mac = HMAC-SHA256(A, E_pub)`.
+   Sends immediately after being paired (concurrent with SDP exchange).
+3. On receiving the peer's `KexPub`:
+   - Recompute `HMAC-SHA256(A, peer_pub)` and constant-time-compare
+     against the received MAC. Mismatch → abort.
+   - Validate `peer_pub` against the RFC 7748 §7 list of low-order /
+     small-subgroup X25519 points. Any match → abort.
+4. Derive the raw DH shared secret:
+   ```
+   S = X25519(local_E_priv, peer_E_pub)
+   ```
+   Additionally verify S is not all zeros (catches any small-subgroup
+   variant the pre-check missed; x25519-dalek returns zeros silently on
+   this case rather than erroring). Zero → abort.
+5. Derive purpose-specific keys:
+   ```
+   wrap_key = HKDF-SHA256(ikm=S, salt=session_id, info="transfer-v1 wrap-key", 32)
+   meta_key = HKDF-SHA256(ikm=S, salt=session_id, info="transfer-v1 meta-key", 32)
+   ```
+   Different info strings guarantee wrap_key and meta_key are
+   independent — a break of one does not propagate.
+6. Wipe `E_priv` and `S` from memory as soon as `wrap_key` + `meta_key`
+   are derived. Only `wrap_key` and `meta_key` live to be used.
 
-Verification: on receiving the peer's `{ephemeral_pub, mac}` frame, the
-local side recomputes `HMAC-SHA256(A, peer_pub)` and constant-time-
-compares against the received MAC. Mismatch → abort the connection.
-
-A passive listener without `A` cannot forge a MAC that verifies. This
-authenticates the exchange without a full public-key infrastructure —
-possession of `A` is the credential.
-
-Both sides then derive the raw shared secret and, from it, a
-purpose-specific wrap key:
-
-```
-S        = X25519(local_E_priv, peer_E_pub)          # 32 bytes, non-uniform
-wrap_key = HKDF-SHA256(
-             ikm  = S,
-             salt = session_id,                       # = SHA256(A), public
-             info = b"transfer-v1 wrap-key",
-             length = 32,
-           )
-```
-
-`session_id` is public, but binding the derivation to it guarantees
-`wrap_key` is specific to THIS session AND this exact purpose. The
-info string is versioned (`transfer-v1`) so a future protocol change
-can bump it without colliding with fielded implementations.
-
-The X25519 private halves are consumed by the derivation and dropped
-immediately after `S` is computed. `S` itself sticks around only long
-enough to derive `wrap_key`, then is dropped too. `A` stays as long
-as the URL is live but is not sufficient alone to recover any of
-this — the ephemerals are.
+Possession of `A` is the credential that authenticates the exchange —
+a passive listener without A cannot forge a MAC that verifies. Forward
+secrecy holds because the ephemeral privates are wiped after use;
+someone acquiring A later cannot reconstruct S.
 
 ## Bulk key exchange
 
-Sender generates `B` (32 random bytes) and wraps it under `wrap_key`:
+Sender-of-file generates `B` (32 random bytes) and wraps it under
+`wrap_key`:
 
 ```
 nonce = 12 random bytes
 enc_B = ChaCha20-Poly1305(wrap_key, nonce, plaintext=B, aad="")
 ```
 
-Sends `{enc_B, nonce}` over the WebSocket as a new SignalFrame variant.
-Receiver, holding `wrap_key`, unwraps:
+Sends `KeyWrap { enc_B, nonce }` over the WebSocket. Receiver, holding
+`wrap_key`, unwraps:
 
 ```
 B = ChaCha20-Poly1305-Decrypt(wrap_key, nonce, enc_B, aad="")
 ```
 
-`wrap_key` (and `S`) are dropped (zeroized) as soon as `B` is in hand;
-they aren't needed for the bulk stream.
+`wrap_key` and `S` are wiped after B is in hand.
 
 ## Meta frame encryption
 
-Per Seb 2026-09-03: the meta frame carries file metadata (name, size,
-chunk boundaries, compression choice, optional identity signature).
-Attackers may PLAUSIBLY know some of these fields from out-of-band
-context, so meta encryption is designed such that a known-plaintext
-meta doesn't leak S or B.
-
-```
-meta_key = HKDF-SHA256(
-             ikm  = S,
-             salt = session_id,
-             info = b"transfer-v1 meta-key",
-             length = 32,
-           )
-```
-
-`meta_key` is DISTINCT from both `wrap_key` and `B`. Deriving them
-from S with different `info` strings guarantees a break of any one
-key does not propagate to the others.
+Meta carries file metadata: name, size, chunkBytes, totalChunks,
+compression choice. Attackers may plausibly know some of these fields
+out-of-band (e.g. filename via context), so meta encryption is
+constructed to guard S and B even if the meta plaintext is known:
 
 ```
 meta_nonce = 12 random bytes
 meta_ct    = ChaCha20-Poly1305(meta_key, meta_nonce, plaintext=meta_json, aad=session_id)
 ```
 
-The AAD binds the ciphertext to this specific session — replaying
-meta from one session into another (even with the same A) fails the
-AEAD check because session_ids differ across replays. (In practice
-same-A cross-session replay isn't a real risk since ephemerals + B
-also differ, but the bound AAD is a cheap belt-and-suspenders.)
+`meta_key` is DISTINCT from both `wrap_key` and `B` — HKDF with
+different info strings. AAD binds the ciphertext to this specific
+session so cross-session replay fails at decrypt time.
 
-### Optional meta signing
+### Optional meta signing (identity)
 
-If the sender has a bitmule identity keypair (Ed25519), they may
-sign the meta:
+If the sender has a bitmule Ed25519 identity keypair
+(`bitmule identity add`), they may sign the meta:
 
 ```
-sig_hash = SHA256(session_id || meta_nonce || meta_ct)
+sig_hash  = SHA256(session_id || meta_nonce || meta_ct)
 signature = Ed25519_sign(sender_identity_priv, sig_hash)
 ```
 
-The signature covers the exact session + ciphertext + nonce, so an
-attacker cannot lift a signature onto a different meta or replay
-across sessions. Receiver verifies with the sender's Ed25519 public
-key (out-of-band via prior contact-add) before decrypting.
+The signature covers the exact session + exact ciphertext + exact
+nonce, so a signature cannot be lifted onto a different meta or
+replayed across sessions. Receiver, if they know the sender's Ed25519
+public key out-of-band (prior contact-add flow), verifies the
+signature before attempting decrypt. Displays "authenticated as
+<sender>" on completion.
 
-Signature ships alongside meta ciphertext:
+Anonymous transfers work without any signature — the field is
+optional. The signature adds a "who sent it" bit on top of the always-
+present confidentiality.
+
+Wire frame:
 
 ```
 {"type":"meta_enc", "nonce":"<hex-24>", "ct":"<hex-var>",
  "sig":"<hex-128>?", "signer_pub":"<hex-64>?"}
 ```
 
-## Chunk encryption
+## Bulk data pipeline
 
-Each file chunk (whatever size the transport uses — 16 KiB for WebRTC
-DC, 1 MiB for relay) is compressed then AEAD-encrypted under `B`:
+For each file chunk:
+
+1. **Frame the plaintext with a length prefix and pad to a fixed size**
+   so ciphertext length is uniform regardless of content:
+   ```
+   payload = [u32 length_prefix][plaintext_bytes][zero_padding]
+   ```
+   where `length(payload) == CHUNK_BYTES` (16 KiB for the DC path,
+   1 MiB for the relay path). The length prefix lets the receiver
+   recover the original plaintext boundary after decrypt; padding
+   prevents any per-chunk size-based inference by the observer. Total
+   plaintext bytes across the transfer is redundantly recorded in the
+   meta so the receiver validates end-of-stream.
+2. **Compress** the framed payload if the file was flagged compressible
+   in meta (see below). Compressed size is bounded by the padded frame
+   so ciphertext stays uniform. If not compressible, skip the
+   compression pass.
+3. **AEAD-encrypt** under `B` with a deterministic nonce from the
+   chunk index:
+   ```
+   nonce      = chunk_index (u64 LE) padded to 12 bytes
+   ciphertext = ChaCha20-Poly1305(B, nonce, payload, aad="")
+   ```
+   `B` is fresh per file, so nonce reuse is only a concern within one
+   session, and monotonic chunk_index guarantees uniqueness there.
+
+### Compression choice
+
+Sender probes the first ~64 KiB of the plaintext file with zstd -3.
+If the ratio is meaningful (say < 0.98), the whole file is compressed
+with zstd -3 and meta records `compression: "zstd"`. If not (already-
+compressed formats: jpg, mp4, pre-zipped archives), skip and record
+`compression: "none"`. Receiver reads meta to know whether to
+decompress.
+
+### Receiver pipeline
 
 ```
-compressed = zstd(-3, plaintext_chunk)          // per Seb's compression note
-nonce      = chunk_index as u64 little-endian, right-padded to 12 bytes
-ciphertext = ChaCha20-Poly1305(B, nonce, compressed, aad="")
+ciphertext → AEAD decrypt(B, chunk_nonce) → payload
+payload → strip length prefix + trim padding → compressed_bytes (or raw)
+compressed_bytes → zstd decode (if meta said so) → plaintext bytes
+plaintext bytes → append to output file
 ```
 
-The chunk index doubles as a nonce because `B` is fresh per transfer,
-so nonce reuse is only a concern within one session and monotonic idx
-guarantees uniqueness there. AEAD tag authenticates both the payload
-and (implicitly, via nonce mismatch failing decrypt) the chunk position.
+### Chunk-count validation at close
 
-The receiver reverses:
+Receiver tracks `set of received idx` during transfer. On the final
+"done" signal, receiver checks: `received_set == {0..totalChunks}`.
+If any idx is missing, the transfer is rejected — writes are
+discarded (or the partial file is renamed with a `.partial` suffix
+per operator preference), and the caller sees an error. Prevents an
+attacker from silently deleting a mid-stream chunk and leaving the
+receiver with a corrupted file.
 
-```
-compressed = ChaCha20-Poly1305-Decrypt(B, chunk_index_nonce, ciphertext)
-plaintext  = zstd_decode(compressed)
-```
+## Design commitments
 
-Compression algorithm and level ride in the meta frame so the receiver
-knows what to unpack. Sender picks: probe first ~64 KiB with zstd -3;
-if ratio < 1.02 (near-incompressible content — video, jpg, already-
-compressed archives), skip compression for the whole file and mark
-`compression: "none"` in meta.
+Encoded in code + enforced by tests, not just spec:
+
+1. **No plaintext-fallback path.** Sender ALWAYS encrypts chunks
+   under B. If KEX doesn't complete (peer never sends KexPub, or the
+   MAC verify fails), the transfer errors out rather than downgrading
+   to plaintext. A downgrade attack becomes a denial-of-service, not
+   a decryption.
+2. **Chunk padding.** Fixed padded chunk size (per transport)
+   regardless of content compressibility.
+3. **Dedicated SPA domain, zero third-party scripts.** The web SPA is
+   served from a domain that runs no analytics, no fonts, no ads, no
+   external JS at all. CI enforces this via a script-tag audit on the
+   built bundle. This is the only mitigation available against the
+   `#`-fragment-leak-via-page-JS class.
+4. **B is immutable per file.** Sender does not rotate B mid-transfer.
+   Restarts reuse the same B against the same immutable-file plaintext.
 
 ## Wire protocol additions
 
-New SignalFrame variants (WebSocket JSON):
+New SignalFrame variants over the signaling WebSocket:
 
 ```
 {"type":"kex_pub",  "pub":"<hex-64>",       "mac":"<hex-64>"}
 {"type":"key_wrap", "enc_b":"<hex-var>",    "nonce":"<hex-24>"}
+{"type":"meta_enc", "nonce":"<hex-24>",     "ct":"<hex-var>",
+                    "sig":"<hex-128>?",     "signer_pub":"<hex-64>?"}
 ```
 
-Meta frame gains a `compression` field:
+Chunk frames on the DC or relay path carry ciphertext bytes directly
+— receiver knows chunk index from its position in the stream and
+derives the nonce from that.
 
-```
-{"type":"meta", "name":..., "size":..., "chunkBytes":..., "totalChunks":..., "compression":"zstd"|"none"}
-```
+## Adversarial review: attacks considered
 
-Chunk frames on the DC / relay path carry ciphertext bytes directly,
-no additional envelope needed — the receiver knows chunk index from
-its position in the stream and derives the nonce from that.
+Every credible attack we thought of + why the design closes it (or the
+constraint that pushes it into "known + accepted"). Reviewed 2026-09-03.
 
-## Optional identity signing (per Seb 2026-09-02)
+| # | Attack                                       | Outcome | Why                                                                  |
+|---|----------------------------------------------|---------|----------------------------------------------------------------------|
+| 1 | Per-chunk bit-flip                           | Safe    | AEAD tag fails → decrypt errors → chunk rejected.                    |
+| 2 | Chunk reorder (swap ct of idx 5 into idx 7)  | Safe    | Nonce = idx mismatch → tag fails.                                    |
+| 3 | Chunk insertion by attacker without B        | Safe    | AEAD tag fails → dropped.                                            |
+| 4 | Chunk deletion (silent drop)                 | Safe    | Chunk-count validation at close rejects if any idx is missing.       |
+| 5 | Whole-file replay in later session           | Safe    | New ephemerals → new B → old ciphertext undecipherable.              |
+| 6 | Low-order X25519 pub injection               | Safe    | Rejected pre-DH against the RFC 7748 §7 point list.                  |
+| 7 | Small-subgroup variant not in point list     | Safe    | Post-DH zero-shared-secret check catches it.                         |
+| 8 | Signaling-server MITM without A              | Safe    | KEX MAC under A fails; server can't forge a valid `kex_pub`.         |
+| 9 | Signaling-server MITM to strip KEX (downgrade)| Safe    | No plaintext-fallback; sender encrypts unconditionally under B; receiver simply can't decrypt without KEX → transfer errors. |
+| 10| Signaling-server MITM on SDP fingerprint     | Safe    | WebRTC DTLS-fingerprint check in the SDP layer prevents casual substitution below our layer. |
+| 11| Attacker with A: MITM (KEX with each side)   | Accepted| A IS the credential. Anyone with A is authorized. Documented.        |
+| 12| Meta ciphertext replay across sessions       | Safe    | session_id bound as AAD; replay fails decrypt.                       |
+| 13| Meta ciphertext modification                 | Safe    | AEAD tag over ct.                                                    |
+| 14| Meta signature lifted onto different meta    | Safe    | Sig hash covers session_id + nonce + ct.                             |
+| 15| B leak via known-plaintext meta              | Safe    | meta_key is HKDF-distinct from wrap_key; break of one doesn't leak the other. |
+| 16| CRIME-class compression side channel         | Safe    | Bitmule transfers a whole file; no attacker-controlled input mixed in. Compressed size + chunk padding leak only chunk count. |
+| 17| B reuse on transfer restart                  | Safe    | File is immutable per B; same idx → same plaintext → deterministic ct. |
+| 18| DoS via forged KEX MAC flooding              | Bounded | MAC verify is O(one HMAC-SHA256); server-layer WS rate limiting caps the flood. Not a decryption threat. |
+| 19| Per-chunk size-based content inference       | Safe    | Chunks padded to fixed size before AEAD. Observer sees uniform-size ciphertext + chunk count only. |
+| 20| `#`-fragment leak via SPA third-party script | Safe    | Dedicated bitmule domain, zero third-party scripts, CI-enforced. Only mitigation available at this layer.  |
+| 21| URL leak DURING an active session            | Accepted| Any share-link scheme has this. Session in progress + URL leaks = MITM window until session ends. |
+| 22| Endpoint compromise                          | N/A     | Out of scope. Keys in RAM leak if the host is owned. Standard.       |
 
-If the initiating user has a stored bitmule identity keypair (Ed25519
-sign key from `bitmule identity add`), the sender may additionally
-compute:
+## What this doesn't try to protect against
 
-```
-file_hash = SHA256(entire plaintext file)
-signature = Ed25519_sign(sender_identity_priv, file_hash)
-```
-
-And send `{file_hash_hex, signature_hex, signer_pubkey_hex}` as a
-`sign` SignalFrame either before the meta or as a distinguished last
-frame after `done`. The receiver, if it knows the sender's identity
-from prior contact-add flow, verifies the signature and can display
-"file authenticated as <sender>" alongside the completion notification.
-
-Signing is optional — anonymous transfers still work end-to-end
-without an identity. The authentication only adds a "who sent it" bit
-on top of confidentiality.
-
-## What this DOESN'T protect against
-
-- Compromise of `A` DURING the session (before ephemerals are wiped):
-  attacker with `A` can conduct their own KEX with either side and
-  MITM. Same as with any share-link scheme.
-- Endpoint compromise: if the sending or receiving box is owned, keys
-  in memory leak. Standard.
-- Traffic analysis: the relay server sees ciphertext sizes and timing.
-  Chunk-size stability + zstd compression removes some info but not
-  all.
-- Sender identity denial-of-service: any URL-holder can send SOMETHING
-  under the same session. The receiver has no way to tell without the
-  optional identity signing above.
+- **URL-secret compromise mid-session** — the attacker who obtains A
+  during a live session can MITM. Design assumption: A is treated as
+  sensitive credential material by the human sharing it.
+- **Traffic analysis at the metadata layer** — server sees timing +
+  aggregate ciphertext size + chunk count. Chunk padding + zstd
+  compression before encryption remove some info but not all.
+- **Sender identity denial-of-service** — any URL-holder can send
+  SOMETHING under the same session. Receiver has no way to distinguish
+  legitimate sender from URL-thief without the optional identity
+  signing above.
+- **Endpoint compromise** — if either sending or receiving box is
+  owned, keys in memory leak. Standard.
 
 ## Implementation
 
 See `crates/bitmule-client-native/src/crypto.rs` for the Rust
-primitives: `ShareKey`, `Ephemeral`, `SessionKey`, `BulkKey`. Each type
-owns its key material and zeroizes on drop. Unit tests cover:
-- HKDF roundtrip on shared-key derivation (both sides produce the same S)
-- MAC binding — different `A` produces different MAC for the same pub
-- Chunk encrypt/decrypt roundtrip at multiple indices
-- Session-id determinism + hex format
-- ShareKey hex roundtrip
-- Wrong chunk index fails AEAD (authentication check)
+primitives:
 
-Wiring into `str0m_client` (KEX over WS, encryption on chunk pipeline)
-is in a follow-up push.
+- `ShareKey` — A + session_id derivation + MAC over ephemeral pubs.
+- `Ephemeral` — X25519 keypair, consumed on `derive_shared_secret`
+  which rejects low-order pubs and zero shared secrets.
+- `SessionKey` (S) — raw X25519 output. Non-uniform. `wrap_key(sid)`
+  and `meta_key(sid)` derive purpose-specific AEAD keys.
+- `WrapKey` — encrypts / decrypts B via ChaCha20-Poly1305.
+- `MetaKey` — encrypts / decrypts meta with session_id bound as AAD.
+  Provides `meta_signing_hash(sid, nonce, ct)` helper for the optional
+  Ed25519 signature.
+- `BulkKey` (B) — chunk encrypt / decrypt with idx-derived nonces.
+
+Every key type Zeroizes on drop. All unit tests cover:
+- HKDF derivations distinct across info strings
+- Session-key equality across both sides of a full KEX
+- MAC-A binding (different A → different MAC)
+- Meta encrypt/decrypt roundtrip + session_id AAD binding (wrong
+  session_id fails)
+- Chunk encrypt/decrypt + wrong-idx nonce fails AEAD
+- Low-order pub rejection
+- Share-key hex roundtrip
+- Session-id determinism
+
+Wiring into `str0m_client` (KEX over WS, encryption on chunk pipeline,
+chunk-count validation) is in a follow-up push.
