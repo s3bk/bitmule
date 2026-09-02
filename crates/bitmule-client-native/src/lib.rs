@@ -718,10 +718,24 @@ fn drive_ws(
                 }
                 SignalFrame::Ice { candidate } => {
                     if let Some(c) = candidate {
-                        let init: RTCIceCandidateInit = match serde_json::from_value(c.clone()) {
+                        let mut init: RTCIceCandidateInit = match serde_json::from_value(c.clone()) {
                             Ok(v) => v,
                             Err(e) => { warn!("ice decode: {e}"); continue; }
                         };
+                        // Firefox (and Chrome by default) obfuscates host
+                        // candidates as mDNS `.local` hostnames. webrtc-rs
+                        // doesn't resolve those, so the resulting candidate
+                        // is unusable. Resolve `.local` via the system
+                        // resolver (which honours libnss-mdns / avahi on
+                        // Linux, mDNSResponder on macOS) and rewrite the
+                        // candidate string with the resolved IP before
+                        // handing to add_ice_candidate. On resolution
+                        // failure we drop the candidate — the browser will
+                        // usually also emit a srflx candidate we can pair
+                        // with instead.
+                        if let Some(resolved) = maybe_resolve_mdns_candidate(&init.candidate).await {
+                            init.candidate = resolved;
+                        }
                         if let Err(e) = pc_in.add_ice_candidate(init).await {
                             warn!("add_ice_candidate: {e}");
                         }
@@ -738,6 +752,52 @@ fn drive_ws(
     });
 
     WsHandles { typed_out, typed_in, raw_out, raw_in, task: handle }
+}
+
+/// If `candidate_line` is an mDNS-obfuscated ICE candidate (address ends
+/// in `.local`), try to resolve the hostname via the system resolver
+/// and return a new candidate line with the resolved IP substituted.
+/// Returns None if the candidate isn't mDNS, doesn't parse, or resolution
+/// fails within a short timeout.
+///
+/// ICE candidate line format (RFC 5245 §15.1):
+///   candidate:<foundation> <component> <transport> <priority> <addr> <port> typ <type> [...]
+/// We only need to look at the 5th token (addr).
+async fn maybe_resolve_mdns_candidate(candidate_line: &str) -> Option<String> {
+    // Some browsers send an empty end-of-candidates as candidate:"" — skip.
+    if candidate_line.is_empty() { return None; }
+    let parts: Vec<&str> = candidate_line.split_whitespace().collect();
+    // Need at least: candidate:<f> <comp> <transport> <prio> <addr> <port>
+    if parts.len() < 6 { return None; }
+    let addr = parts[4];
+    if !addr.ends_with(".local") { return None; }
+
+    // System resolver lookup with a 500ms timeout so a broken mDNS setup
+    // doesn't stall the ICE pump.
+    let lookup_host = format!("{addr}:0");
+    let resolved = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::lookup_host(lookup_host),
+    ).await {
+        Ok(Ok(mut iter)) => iter.next(),
+        Ok(Err(e)) => {
+            debug!("mdns resolve of {addr} failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            debug!("mdns resolve of {addr} timed out");
+            return None;
+        }
+    };
+    let sock = resolved?;
+    let ip_str = sock.ip().to_string();
+    debug!("resolved mdns {addr} -> {ip_str}");
+
+    // Substitute the address token and reassemble. Preserve everything
+    // else verbatim.
+    let mut out_parts = parts.clone();
+    out_parts[4] = &ip_str;
+    Some(out_parts.join(" "))
 }
 
 /// Wire the peer's `on_ice_candidate` handler to forward every candidate to
