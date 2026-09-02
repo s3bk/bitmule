@@ -579,7 +579,7 @@ struct WsHandles {
 }
 
 fn drive_ws(
-    ws: Ws,
+    mut ws: Ws,
     mut pc: RTCPeerConnection,
     dc_ready: Arc<tokio::sync::Notify>,
 ) -> WsHandles {
@@ -587,8 +587,6 @@ fn drive_ws(
     let (typed_in_tx, typed_in) = mpsc::unbounded_channel::<SignalFrame>();
     let (raw_out, mut raw_out_rx) = mpsc::unbounded_channel::<String>();
     let (raw_in_tx, raw_in) = mpsc::unbounded_channel::<String>();
-
-    let (mut sink, mut stream) = ws.split();
 
     // Single select! loop: inbound stream + both outbound channels share
     // one task, so the sink no longer needs a Mutex and teardown is one path.
@@ -602,7 +600,7 @@ fn drive_ws(
                         Ok(t) => t,
                         Err(e) => { warn!("frame encode: {e}"); continue; }
                     };
-                    if let Err(e) = sink.send(Message::Text(text.into())).await {
+                    if let Err(e) = ws.send(Message::Text(text.into())).await {
                         warn!("ws send typed: {e}");
                         break;
                     }
@@ -611,14 +609,14 @@ fn drive_ws(
                 // Outbound: raw strings (relay-mode framing, etc).
                 maybe_text = raw_out_rx.recv() => {
                     let Some(text) = maybe_text else { break };
-                    if let Err(e) = sink.send(Message::Text(text.into())).await {
+                    if let Err(e) = ws.send(Message::Text(text.into())).await {
                         warn!("ws send raw: {e}");
                         break;
                     }
                 }
 
                 // Inbound: parse + route + always mirror raw text into raw_in.
-                maybe_msg = stream.next() => {
+                maybe_msg = ws.next() => {
                     let msg = match maybe_msg {
                         Some(Ok(m)) => m,
                         Some(Err(e)) => { warn!("ws recv: {e}"); break; }
