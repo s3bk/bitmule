@@ -157,13 +157,17 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()
     if !meta.is_file() {
         return Err(anyhow!("{} must be a regular file", path.display()));
     }
-    let session_id = SessionId::random();
+    // ShareKey random for now — file-hash commitment (A = SHA256(data || B))
+    // lands in a follow-up push. URL secret is 32 bytes hex-encoded.
+    let share_key = bitmule_client_native::crypto::ShareKey::random();
+    let session_hex = share_key.session_id_hex();
+    let share_hex = share_key.to_hex();
     let share = format!(
         "{}/#{}",
         server.trim_end_matches('/'),
-        session_id.as_hex()
+        share_hex
     );
-    println!("session: {}", session_id.as_hex());
+    println!("session: {}", session_hex);
     println!("share:   {share}");
     println!("mode:    {}", mode_label(mode));
     println!("sending {} ({} bytes)…", path.display(), meta.len());
@@ -174,7 +178,7 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".to_string());
     let mut last_pct = 0u64;
-    send_file(server, session_id.clone(), &path, mode, move |sent, total| {
+    send_file(server, share_key, &path, mode, move |sent, total| {
         if total == 0 { return }
         let pct = sent * 100 / total;
         if pct != last_pct {
@@ -194,33 +198,35 @@ async fn cmd_recv(
     out: PathBuf,
     mode: TransportMode,
 ) -> Result<()> {
-    let session_id = match session_arg.as_ref() {
+    let share_key = match session_arg.as_ref() {
         Some(raw) => {
             let hex = extract_session_hex(raw)
-                .ok_or_else(|| anyhow!("couldn't extract 64-hex session from {raw:?}"))?;
-            SessionId::from_hex(&hex).map_err(|e| anyhow!("bad session: {e}"))?
+                .ok_or_else(|| anyhow!("couldn't extract 64-hex share key from {raw:?}"))?;
+            bitmule_client_native::crypto::ShareKey::from_hex(&hex)
+                .map_err(|e| anyhow!("bad share key: {e}"))?
         }
-        None => SessionId::random(),
+        None => bitmule_client_native::crypto::ShareKey::random(),
     };
+    let session_hex = share_key.session_id_hex();
 
     if session_arg.is_none() {
         let share = format!(
             "{}/send#{}",
             server.trim_end_matches('/'),
-            session_id.as_hex()
+            share_key.to_hex()
         );
         println!("share this link with the sender:");
         println!("  {share}");
         println!();
     }
-    println!("session: {}", session_id.as_hex());
+    println!("session: {}", session_hex);
     println!("mode:    {}", mode_label(mode));
     println!("waiting for transfer…");
     use std::io::Write;
     std::io::stdout().flush().ok();
 
     let mut last_pct = 0u64;
-    let path = recv_file(server, session_id, &out, mode, move |received, total, name| {
+    let path = recv_file(server, share_key, &out, mode, move |received, total, name| {
         if total == 0 { return }
         let pct = received * 100 / total;
         if pct != last_pct {

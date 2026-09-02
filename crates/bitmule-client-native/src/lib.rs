@@ -357,6 +357,32 @@ pub(crate) enum SignalFrame {
     Ice {
         candidate: Option<serde_json::Value>,
     },
+    /// Crypto handshake: this side's ephemeral X25519 public key, plus
+    /// the MAC-under-A that proves the sender knows the URL secret.
+    /// Sent by both sides as soon as they're paired, concurrent with SDP.
+    KexPub {
+        pub_hex: String,
+        mac_hex: String,
+    },
+    /// Bulk key wrap: sender-of-file generates B, AEAD-wraps under
+    /// wrap_key (HKDF-of-S), sends over WS. Receiver unwraps to
+    /// recover B for the chunk stream.
+    KeyWrap {
+        enc_b_hex: String,
+        nonce_hex: String,
+    },
+    /// Encrypted meta frame: AEAD-encrypted under meta_key with
+    /// session_id bound as AAD. Optional Ed25519 signature over
+    /// SHA256(session_id || nonce || ct) if the sender has a
+    /// bitmule identity keypair.
+    MetaEnc {
+        nonce_hex: String,
+        ct_hex: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        sig_hex: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        signer_pub_hex: Option<String>,
+    },
 }
 
 pub(crate) type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;

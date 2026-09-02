@@ -30,6 +30,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::{MetaFrame, Role, SignalFrame, Ws};
+use crate::crypto::{BulkKey, Ephemeral, MetaKey, ShareKey, WrapKey};
 
 /// A single received UDP packet — its bytes, source, and (critically)
 /// the SPECIFIC local socket address it was delivered to. str0m's ICE
@@ -95,6 +96,21 @@ pub struct LiveSession {
     pub pool: SocketPool,
     pub ws: Ws,
     pub channel_id: ChannelId,
+    /// Session AEAD key derived from HKDF(S, salt=session_id,
+    /// "transfer-v1 wrap-key"). Both sides derive identically after
+    /// the KEX-over-WS handshake completes.
+    pub wrap_key: WrapKey,
+    /// Session AEAD key derived from HKDF(S, salt=session_id,
+    /// "transfer-v1 meta-key"). Distinct from wrap_key so a break of
+    /// one doesn't propagate.
+    pub meta_key: MetaKey,
+    /// Bulk stream key. Sender-of-file generates it; receiver-of-file
+    /// gets it via KeyWrap after wrapping by wrap_key. `None` until
+    /// the wrap frame lands on either side.
+    pub bulk_key: Option<BulkKey>,
+    /// URL secret A. Held here so post-decrypt commitment checks
+    /// (send-initiated flow) can call `share_key.verify_data_commitment`.
+    pub share_key: ShareKey,
 }
 
 /// Build a fresh Rtc + a SocketPool with one UdpSocket per host-candidate
@@ -225,8 +241,10 @@ async fn discover_outbound_ip() -> Result<std::net::IpAddr> {
 
 /// Sender entry point — active side: create data channel, produce offer,
 /// send over WS, wait for answer, run loop until ChannelOpen.
-pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<LiveSession> {
-    let session_hex = session_id.as_hex();
+pub async fn send_connect(server_url: &str, share_key: ShareKey) -> Result<LiveSession> {
+    let session_hex = share_key.session_id_hex();
+    let session_id = SessionId::from_hex(&session_hex)
+        .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     info!(session = %session_hex, "opening sender WS + Rtc");
 
     let mut ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
@@ -245,6 +263,20 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
         role: Role::Sender.as_str().to_owned(),
         receiver_id: None,
     }).await?;
+
+    // Crypto handshake — send our ephemeral immediately, wait for peer's
+    // in the loop below (concurrent with SDP exchange).
+    let local_ephemeral = Ephemeral::generate();
+    let local_pub = local_ephemeral.public_bytes();
+    let local_mac = share_key.mac_ephemeral_pub(&local_pub);
+    ws_send(&mut ws, &SignalFrame::KexPub {
+        pub_hex: hex_encode(&local_pub),
+        mac_hex: hex_encode(&local_mac),
+    }).await?;
+    let mut ephemeral_holder = Some(local_ephemeral);
+    let mut wrap_key: Option<WrapKey> = None;
+    let mut meta_key: Option<MetaKey> = None;
+    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
     let mut peer_hello_seen = false;
     let mut offer_holder: Option<SdpOffer> = Some(offer);
@@ -288,6 +320,24 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
                             .map_err(|e| anyhow!("accept_answer: {e}"))?;
                         next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
                     }
+                    SignalFrame::KexPub { pub_hex, mac_hex } => {
+                        if wrap_key.is_some() {
+                            warn!("duplicate KexPub from peer — ignoring");
+                            continue;
+                        }
+                        let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                        let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
+                        let expected_mac = share_key.mac_ephemeral_pub(&peer_pub);
+                        if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                            bail!("KexPub MAC verify failed — peer does not know the share key");
+                        }
+                        let eph = ephemeral_holder.take()
+                            .ok_or_else(|| anyhow!("local ephemeral gone before peer KexPub arrived"))?;
+                        let s = eph.derive_shared_secret(&peer_pub)?;
+                        wrap_key = Some(s.wrap_key(&session_id_bytes));
+                        meta_key = Some(s.meta_key(&session_id_bytes));
+                        info!("KEX complete — wrap_key + meta_key derived");
+                    }
                     _ => {}
                 }
             }
@@ -313,14 +363,21 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
         }
     }
     info!("sender data channel open");
-    Ok(LiveSession { session_id, role: Role::Sender, rtc, pool, ws, channel_id })
+    let wrap_key = wrap_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
+    let meta_key = meta_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
+    Ok(LiveSession {
+        session_id, role: Role::Sender, rtc, pool, ws, channel_id,
+        wrap_key, meta_key, bulk_key: None, share_key,
+    })
 }
 
 /// Receiver entry point — passive side: send hello + peer_hello, wait
 /// for offer, produce + send answer, run loop until ChannelOpen (which
 /// carries the id str0m assigned on the passive side).
-pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<LiveSession> {
-    let session_hex = session_id.as_hex();
+pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveSession> {
+    let session_hex = share_key.session_id_hex();
+    let session_id = SessionId::from_hex(&session_hex)
+        .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     info!(session = %session_hex, "opening receiver WS + Rtc");
 
     let mut ws = crate::open_ws(server_url, &session_hex).await?;
@@ -333,6 +390,19 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
         receiver_id: Some(receiver_id.clone()),
     }).await?;
     ws_send(&mut ws, &SignalFrame::PeerHello { receiver_id: Some(receiver_id) }).await?;
+
+    // Crypto handshake — same symmetric KEX as send_connect.
+    let local_ephemeral = Ephemeral::generate();
+    let local_pub = local_ephemeral.public_bytes();
+    let local_mac = share_key.mac_ephemeral_pub(&local_pub);
+    ws_send(&mut ws, &SignalFrame::KexPub {
+        pub_hex: hex_encode(&local_pub),
+        mac_hex: hex_encode(&local_mac),
+    }).await?;
+    let mut ephemeral_holder = Some(local_ephemeral);
+    let mut wrap_key: Option<WrapKey> = None;
+    let mut meta_key: Option<MetaKey> = None;
+    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
     let mut opened: Option<ChannelId> = None;
     let mut buf = vec![0u8; 4096];
@@ -365,6 +435,24 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
                         debug!("answer sent");
                         next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
                     }
+                    SignalFrame::KexPub { pub_hex, mac_hex } => {
+                        if wrap_key.is_some() {
+                            warn!("duplicate KexPub from peer — ignoring");
+                            continue;
+                        }
+                        let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                        let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
+                        let expected_mac = share_key.mac_ephemeral_pub(&peer_pub);
+                        if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                            bail!("KexPub MAC verify failed — peer does not know the share key");
+                        }
+                        let eph = ephemeral_holder.take()
+                            .ok_or_else(|| anyhow!("local ephemeral gone before peer KexPub arrived"))?;
+                        let s = eph.derive_shared_secret(&peer_pub)?;
+                        wrap_key = Some(s.wrap_key(&session_id_bytes));
+                        meta_key = Some(s.meta_key(&session_id_bytes));
+                        info!("KEX complete — wrap_key + meta_key derived");
+                    }
                     _ => {}
                 }
             }
@@ -392,7 +480,12 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
 
     let channel_id = opened.unwrap();
     info!("receiver data channel open (id={:?})", channel_id);
-    Ok(LiveSession { session_id, role: Role::Receiver, rtc, pool, ws, channel_id })
+    let wrap_key = wrap_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
+    let meta_key = meta_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
+    Ok(LiveSession {
+        session_id, role: Role::Receiver, rtc, pool, ws, channel_id,
+        wrap_key, meta_key, bulk_key: None, share_key,
+    })
 }
 
 // ---- file transfer over the data channel --------------------------------
@@ -747,14 +840,14 @@ fn websocket_url(http_url: &str) -> Result<String> {
 ///   path starts from 0 on the retry.
 pub async fn send_file(
     server_url_http: &str,
-    session_id: SessionId,
+    share_key: ShareKey,
     file_path: &Path,
     mode: TransportMode,
     on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
     match mode {
-        TransportMode::Webrtc => send_file_webrtc(server_url_http, session_id, file_path, on_progress).await,
-        TransportMode::Relay => send_file_relay(server_url_http, session_id, file_path, on_progress).await,
+        TransportMode::Webrtc => send_file_webrtc(server_url_http, share_key, file_path, on_progress).await,
+        TransportMode::Relay => send_file_relay(server_url_http, share_key, file_path, on_progress).await,
         TransportMode::Auto => {
             let dur = std::time::Duration::from_millis(WEBRTC_FALLBACK_MS);
             // We split on_progress so the fallback retry has its own callback
@@ -763,7 +856,7 @@ pub async fn send_file(
             let progress = std::sync::Arc::new(tokio::sync::Mutex::new(on_progress));
             let webrtc_progress = progress.clone();
             let webrtc_fut = async {
-                let mut sess = tokio::time::timeout(dur, send_connect(server_url_http, session_id.clone())).await
+                let mut sess = tokio::time::timeout(dur, send_connect(server_url_http, share_key.clone())).await
                     .map_err(|_| anyhow!("webrtc DC open exceeded {} ms", WEBRTC_FALLBACK_MS))??;
                 send_file_over_dc(&mut sess, file_path, |a, b| {
                     if let Ok(mut g) = webrtc_progress.try_lock() { g(a, b); }
@@ -774,7 +867,7 @@ pub async fn send_file(
                 Err(e) => {
                     warn!("webrtc path failed ({e}), falling back to relay");
                     let relay_progress = progress.clone();
-                    send_file_relay(server_url_http, session_id, file_path, move |a, b| {
+                    send_file_relay(server_url_http, share_key, file_path, move |a, b| {
                         if let Ok(mut g) = relay_progress.try_lock() { g(a, b); }
                     }).await
                 }
@@ -786,20 +879,20 @@ pub async fn send_file(
 /// Receive one file for `session_id`. Same dispatch shape as [`send_file`].
 pub async fn recv_file(
     server_url_http: &str,
-    session_id: SessionId,
+    share_key: ShareKey,
     out_dir: &Path,
     mode: TransportMode,
     on_progress: impl FnMut(u64, u64, &str) + Send,
 ) -> Result<PathBuf> {
     match mode {
-        TransportMode::Webrtc => recv_file_webrtc(server_url_http, session_id, out_dir, on_progress).await,
-        TransportMode::Relay => recv_file_relay(server_url_http, session_id, out_dir, on_progress).await,
+        TransportMode::Webrtc => recv_file_webrtc(server_url_http, share_key, out_dir, on_progress).await,
+        TransportMode::Relay => recv_file_relay(server_url_http, share_key, out_dir, on_progress).await,
         TransportMode::Auto => {
             let dur = std::time::Duration::from_millis(WEBRTC_FALLBACK_MS);
             let progress = std::sync::Arc::new(tokio::sync::Mutex::new(on_progress));
             let webrtc_progress = progress.clone();
             let webrtc_fut = async {
-                let mut sess = tokio::time::timeout(dur, recv_connect(server_url_http, session_id.clone())).await
+                let mut sess = tokio::time::timeout(dur, recv_connect(server_url_http, share_key.clone())).await
                     .map_err(|_| anyhow!("webrtc DC open exceeded {} ms", WEBRTC_FALLBACK_MS))??;
                 recv_file_over_dc(&mut sess, out_dir, |a, b, n| {
                     if let Ok(mut g) = webrtc_progress.try_lock() { g(a, b, n); }
@@ -810,7 +903,7 @@ pub async fn recv_file(
                 Err(e) => {
                     warn!("webrtc path failed ({e}), falling back to relay");
                     let relay_progress = progress.clone();
-                    recv_file_relay(server_url_http, session_id, out_dir, move |a, b, n| {
+                    recv_file_relay(server_url_http, share_key, out_dir, move |a, b, n| {
                         if let Ok(mut g) = relay_progress.try_lock() { g(a, b, n); }
                     }).await
                 }
@@ -823,31 +916,33 @@ pub async fn recv_file(
 
 async fn send_file_webrtc(
     server_url_http: &str,
-    session_id: SessionId,
+    share_key: ShareKey,
     file_path: &Path,
     on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
-    let mut sess = send_connect(server_url_http, session_id).await?;
+    let mut sess = send_connect(server_url_http, share_key).await?;
     send_file_over_dc(&mut sess, file_path, on_progress).await
 }
 
 async fn recv_file_webrtc(
     server_url_http: &str,
-    session_id: SessionId,
+    share_key: ShareKey,
     out_dir: &Path,
     on_progress: impl FnMut(u64, u64, &str) + Send,
 ) -> Result<PathBuf> {
-    let mut sess = recv_connect(server_url_http, session_id).await?;
+    let mut sess = recv_connect(server_url_http, share_key).await?;
     recv_file_over_dc(&mut sess, out_dir, on_progress).await
 }
 
 async fn send_file_relay(
     server_url_http: &str,
-    session_id: SessionId,
+    share_key: ShareKey,
     file_path: &Path,
     on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
-    let session_hex = session_id.as_hex();
+    let session_hex = share_key.session_id_hex();
+    let session_id = SessionId::from_hex(&session_hex)
+        .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     let ws = crate::open_ws(server_url_http, &session_hex).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -858,11 +953,13 @@ async fn send_file_relay(
 
 async fn recv_file_relay(
     server_url_http: &str,
-    session_id: SessionId,
+    share_key: ShareKey,
     out_dir: &Path,
     on_progress: impl FnMut(u64, u64, &str) + Send,
 ) -> Result<PathBuf> {
-    let session_hex = session_id.as_hex();
+    let session_hex = share_key.session_id_hex();
+    let session_id = SessionId::from_hex(&session_hex)
+        .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     let ws = crate::open_ws(server_url_http, &session_hex).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1028,4 +1125,28 @@ async fn parse_ice_candidate(v: &serde_json::Value) -> Option<Candidate> {
         Ok(c) => { info!("  → added to str0m"); Some(c) }
         Err(e) => { warn!("  → bad ice candidate: {e}"); None }
     }
+}
+
+// ---- hex + constant-time helpers ---------------------------------------
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode_fixed<const N: usize>(s: &str) -> Result<[u8; N]> {
+    if s.len() != N * 2 {
+        bail!("hex string length {} != expected {}", s.len(), N * 2);
+    }
+    let mut out = [0u8; N];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let byte_str = std::str::from_utf8(chunk).map_err(|_| anyhow!("non-utf8 hex"))?;
+        out[i] = u8::from_str_radix(byte_str, 16).map_err(|_| anyhow!("bad hex byte at {i}"))?;
+    }
+    Ok(out)
+}
+
+fn constant_time_eq_bytes<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..N { diff |= a[i] ^ b[i]; }
+    diff == 0
 }
