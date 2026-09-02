@@ -283,6 +283,254 @@ fn sanitize_filename(name: &str) -> String {
     stripped.to_string()
 }
 
+// ---- server-relay path (fallback for when WebRTC doesn't come up) -------
+//
+// These primitives mirror the browser sendFileOverRelay / makeRelayReceiver
+// in web/main.js. They take String-based mpsc channels so the caller can
+// decide how to plumb them into whatever WebSocket transport the caller
+// already has (drive_ws in this crate, a raw websocket in a test, etc).
+
+/// Snapshot of what the sender has already emitted over the relay path,
+/// so a fresh receiver joining mid-upload can be caught up by re-emitting
+/// meta + all sent chunk_relay frames + relay_done if applicable. Match
+/// for `sendSession.relayProgress` on the browser side.
+#[derive(Debug, Default)]
+pub struct RelaySendProgress {
+    pub meta_frame: Option<String>,
+    pub sent_idxs: Vec<u32>,
+    pub done: bool,
+}
+
+/// Send a file via the server relay. HTTP PUT each chunk to
+/// `/session/:sess/chunk/:idx`, and for every successful PUT push a
+/// `chunk_relay` JSON frame into `out_json_tx` so the peer can `GET` it.
+///
+/// Frames pushed on `out_json_tx`:
+///   {"type":"meta_relay", name, size, chunkBytes, totalChunks}
+///   {"type":"chunk_relay", "idx": N}   (per chunk after PUT ok)
+///   {"type":"relay_done"}
+pub async fn send_file_over_relay(
+    server_url_http: &str,
+    session_id: &SessionId,
+    file_path: &Path,
+    out_json_tx: mpsc::UnboundedSender<String>,
+    progress: Arc<Mutex<RelaySendProgress>>,
+    mut on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<()> {
+    let http_base = server_url_http.trim_end_matches('/').to_string();
+    let session_hex = session_id.as_hex();
+
+    let meta_fs = tokio::fs::metadata(file_path).await
+        .with_context(|| format!("stat {}", file_path.display()))?;
+    if !meta_fs.is_file() {
+        bail!("{} is not a regular file", file_path.display());
+    }
+    let size = meta_fs.len();
+    let name = file_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".to_string());
+    let total_chunks = if size == 0 { 0 } else { (size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
+
+    let meta_json = serde_json::json!({
+        "type": "meta_relay",
+        "name": name,
+        "size": size,
+        "chunkBytes": CHUNK_BYTES,
+        "totalChunks": total_chunks,
+    }).to_string();
+
+    {
+        let mut p = progress.lock().await;
+        p.meta_frame = Some(meta_json.clone());
+        p.sent_idxs.clear();
+        p.done = false;
+    }
+    let _ = out_json_tx.send(meta_json);
+
+    let client = reqwest::Client::new();
+    let mut f = tokio::fs::File::open(file_path).await?;
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut idx: u32 = 0;
+    let mut sent: u64 = 0;
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 { break; }
+        let url = format!("{http_base}/session/{session_hex}/chunk/{idx}");
+        let body = Bytes::copy_from_slice(&buf[..n]);
+        let resp = client
+            .put(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_LENGTH, n)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            bail!("relay PUT {idx} → {status} {body_text}");
+        }
+
+        let chunk_frame = serde_json::json!({"type":"chunk_relay","idx": idx}).to_string();
+        let _ = out_json_tx.send(chunk_frame);
+        {
+            let mut p = progress.lock().await;
+            p.sent_idxs.push(idx);
+        }
+        sent += n as u64;
+        on_progress(sent, size);
+        idx += 1;
+    }
+
+    let done_frame = r#"{"type":"relay_done"}"#.to_string();
+    let _ = out_json_tx.send(done_frame);
+    {
+        let mut p = progress.lock().await;
+        p.done = true;
+    }
+    Ok(())
+}
+
+/// Given a snapshot of RelaySendProgress (typically stored in the
+/// sender's session), re-emit meta + all sent chunk_relay + relay_done
+/// (if done) into the outbound channel. Call this when the server
+/// notifies the sender that a new receiver joined mid-upload.
+pub async fn resend_relay_progress(
+    out_json_tx: &mpsc::UnboundedSender<String>,
+    progress: Arc<Mutex<RelaySendProgress>>,
+) {
+    let p = progress.lock().await;
+    if let Some(meta) = &p.meta_frame {
+        let _ = out_json_tx.send(meta.clone());
+    }
+    for idx in &p.sent_idxs {
+        let _ = out_json_tx.send(
+            serde_json::json!({"type":"chunk_relay","idx": idx}).to_string(),
+        );
+    }
+    if p.done {
+        let _ = out_json_tx.send(r#"{"type":"relay_done"}"#.to_string());
+    }
+}
+
+/// Receive a file via the server relay. Consumes JSON frames from
+/// `in_json_rx`, filters to the relay-mode ones, and for each
+/// `chunk_relay` frame does HTTP GET `/session/:sess/chunk/:idx`.
+/// On `relay_done`, fetches any still-missing chunks, assembles the
+/// file into `out_dir/<sanitized-name>`, and returns the final path.
+///
+/// Frames on the WS other than meta_relay/chunk_relay/relay_done are
+/// ignored — the caller can share the same channel between this and
+/// e.g. the WebRTC-signaling path.
+pub async fn recv_file_over_relay(
+    server_url_http: &str,
+    session_id: &SessionId,
+    out_dir: &Path,
+    mut in_json_rx: mpsc::UnboundedReceiver<String>,
+    mut on_progress: impl FnMut(u64, u64, &str) + Send,
+) -> Result<std::path::PathBuf> {
+    let http_base = server_url_http.trim_end_matches('/').to_string();
+    let session_hex = session_id.as_hex();
+    tokio::fs::create_dir_all(out_dir).await?;
+
+    let client = reqwest::Client::new();
+    let mut meta_opt: Option<MetaRelayFrame> = None;
+    // chunks[idx] = Some(bytes) or None. Allocated once meta arrives.
+    let mut chunks: Vec<Option<Bytes>> = Vec::new();
+    let mut filled: u64 = 0;
+    let mut received_bytes: u64 = 0;
+
+    async fn fetch_chunk(
+        client: &reqwest::Client,
+        http_base: &str,
+        session_hex: &str,
+        idx: u32,
+    ) -> Result<Bytes> {
+        let url = format!("{http_base}/session/{session_hex}/chunk/{idx}");
+        let resp = client.get(&url).send().await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            bail!("relay GET {idx} → {}", resp.status());
+        }
+        Ok(resp.bytes().await?)
+    }
+
+    while let Some(text) = in_json_rx.recv().await {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let Some(ty) = value.get("type").and_then(|x| x.as_str()) else { continue };
+        match ty {
+            "meta_relay" => {
+                let m: MetaRelayFrame = match serde_json::from_value(value) {
+                    Ok(v) => v,
+                    Err(e) => { warn!("meta_relay decode: {e}"); continue }
+                };
+                if chunks.is_empty() {
+                    chunks = vec![None; m.total_chunks as usize];
+                    on_progress(0, m.size, &m.name);
+                }
+                meta_opt = Some(m);
+            }
+            "chunk_relay" => {
+                let Some(idx) = value.get("idx").and_then(|x| x.as_u64()) else { continue };
+                let idx_u32 = idx as u32;
+                if (idx_u32 as usize) >= chunks.len() { continue }
+                if chunks[idx_u32 as usize].is_some() { continue }
+                let bytes = fetch_chunk(&client, &http_base, &session_hex, idx_u32).await?;
+                received_bytes += bytes.len() as u64;
+                chunks[idx_u32 as usize] = Some(bytes);
+                filled += 1;
+                if let Some(m) = meta_opt.as_ref() {
+                    on_progress(received_bytes, m.size, &m.name);
+                }
+            }
+            "relay_done" => {
+                let Some(m) = meta_opt.clone() else { continue };
+                // Backfill any missing chunks by direct GET before we
+                // finalize. Sender may have raced ahead of notifications.
+                for i in 0..(m.total_chunks as usize) {
+                    if chunks[i].is_none() {
+                        let b = fetch_chunk(&client, &http_base, &session_hex, i as u32).await?;
+                        received_bytes += b.len() as u64;
+                        chunks[i] = Some(b);
+                        filled += 1;
+                    }
+                }
+                if filled != m.total_chunks {
+                    bail!("relay_done but {} of {} chunks still missing", m.total_chunks - filled, m.total_chunks);
+                }
+                let name = sanitize_filename(&m.name);
+                let path = out_dir.join(&name);
+                let mut f = tokio::fs::File::create(&path).await?;
+                use tokio::io::AsyncWriteExt;
+                for chunk in chunks.iter() {
+                    if let Some(b) = chunk {
+                        f.write_all(b).await?;
+                    }
+                }
+                f.flush().await?;
+                f.sync_all().await?;
+                on_progress(received_bytes, m.size, &m.name);
+                return Ok(path);
+            }
+            _ => {}
+        }
+    }
+    bail!("json input channel closed before relay_done");
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MetaRelayFrame {
+    #[serde(rename = "type")]
+    ty: String,
+    name: String,
+    size: u64,
+    #[serde(rename = "chunkBytes")]
+    chunk_bytes: u32,
+    #[serde(rename = "totalChunks")]
+    total_chunks: u64,
+}
+
 /// A running, connected session: WS held open + peer connection + data channel.
 pub struct LiveSession {
     pub session_id: SessionId,
