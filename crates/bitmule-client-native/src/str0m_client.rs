@@ -25,7 +25,7 @@ use str0m::{
     net::{Protocol, Receive},
     Candidate, Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::{io::AsyncWriteExt, net::UdpSocket};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
@@ -227,6 +227,174 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
 }
 
 // ---- file transfer over the data channel --------------------------------
+
+const CHUNK_BYTES: usize = 16 * 1024;
+const BUFFERED_LOW_THRESHOLD: usize = 1 * 1024 * 1024;
+
+/// Send a file over the opened WebRTC data channel using the browser-parity
+/// wire framing (see [`recv_file_over_dc`]).
+///
+/// Backpressure: str0m's `channel.write()` returns Ok(false) when the SCTP
+/// send buffer can't accept the payload. We set the buffered-amount-low
+/// threshold to 1 MiB, and on a rejected write we keep pumping the run
+/// loop (which drives SCTP and fires ChannelBufferedAmountLow when it's
+/// safe to try again) until the write is accepted.
+pub async fn send_file_over_dc(
+    session: &mut LiveSession,
+    file_path: &Path,
+    mut on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<()> {
+    let meta_stat = tokio::fs::metadata(file_path).await
+        .with_context(|| format!("stat {}", file_path.display()))?;
+    if !meta_stat.is_file() {
+        bail!("{} is not a regular file", file_path.display());
+    }
+    let size = meta_stat.len();
+    let name = file_path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".to_string());
+    let total_chunks = if size == 0 { 0 } else { (size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
+
+    let meta_json = serde_json::json!({
+        "type": "meta",
+        "name": name,
+        "size": size,
+        "chunkBytes": CHUNK_BYTES,
+        "totalChunks": total_chunks,
+    }).to_string();
+
+    // Set the flow-control threshold once, then send meta as a text frame.
+    channel_set_low_threshold(&mut session.rtc, session.channel_id, BUFFERED_LOW_THRESHOLD)?;
+    channel_write_all(session, false, meta_json.as_bytes()).await?;
+
+    let mut f = tokio::fs::File::open(file_path).await
+        .with_context(|| format!("open {}", file_path.display()))?;
+    let mut sent: u64 = 0;
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 { break; }
+        channel_write_all(session, true, &buf[..n]).await?;
+        sent += n as u64;
+        on_progress(sent, size);
+    }
+
+    // Done marker + drain the SCTP queue before returning (caller closing
+    // the session immediately after should not cut the tail).
+    channel_write_all(session, false, br#"{"type":"done"}"#).await?;
+    drain_until_buffer_empty(session).await?;
+    Ok(())
+}
+
+/// Write `buf` (text or binary) to the session's data channel, awaiting
+/// backpressure if the SCTP buffer is full. Every write is followed by a
+/// drain per str0m's single-mutation invariant.
+async fn channel_write_all(
+    session: &mut LiveSession,
+    binary: bool,
+    buf: &[u8],
+) -> Result<()> {
+    let mut next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+    let mut recv_buf = vec![0u8; 2000];
+
+    loop {
+        let accepted = {
+            let mut ch = session.rtc.channel(session.channel_id)
+                .ok_or_else(|| anyhow!("channel {:?} gone", session.channel_id))?;
+            ch.write(binary, buf).map_err(|e| anyhow!("channel write: {e}"))?
+        };
+        if accepted {
+            next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+            let _ = next_timeout;
+            return Ok(());
+        }
+
+        // Buffer full — pump one iteration of the run loop to let SCTP
+        // drain, then retry. This is the same select! shape as the
+        // connect loops but scoped to a single wait-tick.
+        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+        tokio::select! {
+            maybe_msg = session.ws.next() => {
+                let frame = match parse_ws_frame(maybe_msg)? {
+                    Some(f) => f,
+                    None => continue,
+                };
+                if let SignalFrame::Ice { candidate: Some(c) } = frame {
+                    if let Some(remote) = parse_ice_candidate(&c).await {
+                        session.rtc.add_remote_candidate(remote);
+                        next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+                    }
+                }
+            }
+            r = session.socket.recv_from(&mut recv_buf) => {
+                let (n, source) = r.context("udp recv_from")?;
+                let local = session.socket.local_addr().context("local_addr")?;
+                let input = Input::Receive(Instant::now(), Receive {
+                    proto: Protocol::Udp,
+                    source,
+                    destination: local,
+                    contents: (&recv_buf[..n]).try_into().map_err(|_| anyhow!("packet oversize"))?,
+                });
+                session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+            }
+            _ = tokio::time::sleep(dur) => {
+                session.rtc.handle_input(Input::Timeout(Instant::now()))
+                    .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+            }
+        }
+    }
+}
+
+/// Set the SCTP buffered-amount-low threshold on the session's channel,
+/// then drain per str0m's invariant.
+fn channel_set_low_threshold(rtc: &mut Rtc, id: ChannelId, threshold: usize) -> Result<()> {
+    let mut ch = rtc.channel(id).ok_or_else(|| anyhow!("channel {:?} gone", id))?;
+    ch.set_buffered_amount_low_threshold(threshold);
+    // Note: set_buffered_amount_low_threshold takes &mut self but doesn't
+    // return a Result and isn't itself listed as a "mutation" in str0m's
+    // README enumeration. We still drain in the caller (channel_write_all)
+    // via its initial drain_rtc call — safe.
+    Ok(())
+}
+
+/// Keep pumping the run loop until the send buffer drains to 0. Used by
+/// send_file_over_dc after the "done" frame so callers can drop the
+/// session cleanly without truncating the tail.
+async fn drain_until_buffer_empty(session: &mut LiveSession) -> Result<()> {
+    let mut next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+    let mut recv_buf = vec![0u8; 2000];
+    loop {
+        let buffered = {
+            let mut ch = session.rtc.channel(session.channel_id)
+                .ok_or_else(|| anyhow!("channel gone"))?;
+            ch.buffered_amount()
+        };
+        if buffered == 0 { return Ok(()); }
+
+        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+        tokio::select! {
+            r = session.socket.recv_from(&mut recv_buf) => {
+                let (n, source) = r.context("udp recv_from")?;
+                let local = session.socket.local_addr().context("local_addr")?;
+                let input = Input::Receive(Instant::now(), Receive {
+                    proto: Protocol::Udp,
+                    source,
+                    destination: local,
+                    contents: (&recv_buf[..n]).try_into().map_err(|_| anyhow!("packet oversize"))?,
+                });
+                session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+            }
+            _ = tokio::time::sleep(dur) => {
+                session.rtc.handle_input(Input::Timeout(Instant::now()))
+                    .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+            }
+        }
+    }
+}
 
 /// Receive a single file over the opened WebRTC data channel using the
 /// browser-parity wire framing:
