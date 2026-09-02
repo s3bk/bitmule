@@ -369,6 +369,96 @@ pub(crate) async fn open_ws(server_url: &str, session_hex: &str) -> Result<Ws> {
 
 ///   candidate:<foundation> <component> <transport> <priority> <addr> <port> typ <type> [...]
 /// We only need to look at the 5th token (addr).
+/// Run both resolvers concurrently, log which won by elapsed time, and
+/// return the winning IP. If both fail/time out, return None.
+async fn race_mdns_resolvers(hostname: &str, timeout: std::time::Duration) -> Option<std::net::IpAddr> {
+    use tracing::info;
+    let start = tokio::time::Instant::now();
+    let mdns_fut = resolve_mdns_hostname(hostname, timeout);
+    let sys_fut = resolve_via_system(hostname, timeout);
+    tokio::pin!(mdns_fut);
+    tokio::pin!(sys_fut);
+    tokio::select! {
+        m = &mut mdns_fut => {
+            match m {
+                Some(ip) => {
+                    info!("mdns crate WON for {hostname} in {:?} -> {ip}", start.elapsed());
+                    Some(ip)
+                }
+                None => {
+                    // mdns crate failed; wait on the system resolver.
+                    let sys = sys_fut.await;
+                    if let Some(ip) = sys {
+                        info!("mdns crate failed, system resolver got {hostname} in {:?} -> {ip}", start.elapsed());
+                    }
+                    sys
+                }
+            }
+        }
+        s = &mut sys_fut => {
+            match s {
+                Some(ip) => {
+                    info!("system resolver WON for {hostname} in {:?} -> {ip}", start.elapsed());
+                    Some(ip)
+                }
+                None => {
+                    let m = mdns_fut.await;
+                    if let Some(ip) = m {
+                        info!("system resolver failed, mdns crate got {hostname} in {:?} -> {ip}", start.elapsed());
+                    }
+                    m
+                }
+            }
+        }
+    }
+}
+
+/// Fallback / comparison resolver: whatever the system libc gives us
+/// through tokio::net::lookup_host (needs libnss-mdns wired in for
+/// `.local` to work).
+async fn resolve_via_system(hostname: &str, timeout: std::time::Duration) -> Option<std::net::IpAddr> {
+    let lookup = format!("{hostname}:0");
+    match tokio::time::timeout(timeout, tokio::net::lookup_host(lookup)).await {
+        Ok(Ok(mut iter)) => iter.next().map(|s| s.ip()),
+        _ => None,
+    }
+}
+
+/// Ask the local multicast DNS responders for the A record behind
+/// `hostname` (a `.local` name). Returns the first IP that comes back,
+/// or None on timeout.
+async fn resolve_mdns_hostname(hostname: &str, timeout: std::time::Duration) -> Option<std::net::IpAddr> {
+    use futures_util::{pin_mut, stream::StreamExt};
+    // The mdns crate's discover API is oriented at DNS-SD (service
+    // browsing), but the underlying multicast query works for plain
+    // A-record lookups when we pass the hostname as the "service" and
+    // filter response records for A/AAAA on the matching hostname.
+    let stream = match mdns::discover::all(hostname, timeout).ok()?.listen() {
+        s => s,
+    };
+    pin_mut!(stream);
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(response))) => {
+                for record in response.records() {
+                    if !record.name.eq_ignore_ascii_case(hostname) { continue; }
+                    match record.kind {
+                        mdns::RecordKind::A(v4) => return Some(std::net::IpAddr::V4(v4)),
+                        mdns::RecordKind::AAAA(v6) => return Some(std::net::IpAddr::V6(v6)),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Err(_))) => continue,
+            Ok(None) => return None,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 pub(crate) async fn maybe_resolve_mdns_candidate(candidate_line: &str) -> Option<String> {
     // Some browsers send an empty end-of-candidates as candidate:"" — skip.
     if candidate_line.is_empty() { return None; }
@@ -378,27 +468,19 @@ pub(crate) async fn maybe_resolve_mdns_candidate(candidate_line: &str) -> Option
     let addr = parts[4];
     if !addr.ends_with(".local") { return None; }
 
-    // System resolver lookup — avahi typically resolves .local names in
-    // ~1-3s (multicast query + response wait), longer under load, so we
-    // give it 5s before giving up. Below that we get spurious drops on
-    // healthy stacks (observed 2026-09-02 on Seb's box).
-    let lookup_host = format!("{addr}:0");
-    let resolved = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::net::lookup_host(lookup_host),
-    ).await {
-        Ok(Ok(mut iter)) => iter.next(),
-        Ok(Err(e)) => {
-            debug!("mdns resolve of {addr} failed: {e}");
-            return None;
-        }
-        Err(_) => {
-            debug!("mdns resolve of {addr} timed out");
+    // Race two resolvers per Seb 2026-09-02: the in-process `mdns` crate
+    // (portable, no avahi dep) AND tokio's system lookup_host (which
+    // uses whatever the OS resolver has wired for .local, typically
+    // libnss-mdns + avahi if installed). Whichever returns first wins;
+    // print which one it was so we can retire the loser if one is
+    // consistently faster.
+    let ip_str = match race_mdns_resolvers(addr, std::time::Duration::from_secs(5)).await {
+        Some(ip) => ip.to_string(),
+        None => {
+            debug!("mdns resolve of {addr} failed / timed out (both resolvers)");
             return None;
         }
     };
-    let sock = resolved?;
-    let ip_str = sock.ip().to_string();
     debug!("resolved mdns {addr} -> {ip_str}");
 
     // Substitute the address token and reassemble. Preserve everything
