@@ -23,7 +23,7 @@
 //! Same protection covers server-stored relay chunks.
 
 use anyhow::{anyhow, bail, Context, Result};
-use chacha20poly1305::{aead::Aead, AeadCore, ChaCha20Poly1305, Key, KeyInit, Nonce};
+use aes_gcm::{aead::Aead, AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
@@ -214,19 +214,19 @@ impl MetaKey {
     /// session_ids match but wrap keys differ — this belts + suspenders
     /// prevents any cross-session mixing).
     pub fn encrypt_meta(&self, session_id: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ct = cipher
-            .encrypt(&nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad: session_id })
+            .encrypt(&nonce, aes_gcm::aead::Payload { msg: plaintext, aad: session_id })
             .map_err(|e| anyhow!("encrypt_meta: {e}"))?;
         Ok((nonce.to_vec(), ct))
     }
 
     pub fn decrypt_meta(&self, session_id: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
         if nonce.len() != 12 { bail!("meta nonce must be 12 bytes"); }
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
         cipher
-            .decrypt(Nonce::from_slice(nonce), chacha20poly1305::aead::Payload { msg: ct, aad: session_id })
+            .decrypt(Nonce::from_slice(nonce), aes_gcm::aead::Payload { msg: ct, aad: session_id })
             .map_err(|e| anyhow!("decrypt_meta: {e}"))
     }
 
@@ -257,8 +257,8 @@ impl WrapKey {
     /// wrap key. Returns (nonce, ciphertext) — both need to be sent on
     /// the wire.
     pub fn wrap_bulk_key(&self, bulk: &BulkKey) -> Result<(Vec<u8>, Vec<u8>)> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ct = cipher
             .encrypt(&nonce, bulk.0.as_slice())
             .map_err(|e| anyhow!("wrap_bulk_key: {e}"))?;
@@ -268,7 +268,7 @@ impl WrapKey {
     /// Unwrap the sender-provided ciphertext to recover B.
     pub fn unwrap_bulk_key(&self, nonce: &[u8], ct: &[u8]) -> Result<BulkKey> {
         if nonce.len() != 12 { bail!("nonce must be 12 bytes"); }
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
         let pt = cipher
             .decrypt(Nonce::from_slice(nonce), ct)
             .map_err(|e| anyhow!("unwrap_bulk_key: {e}"))?;
@@ -301,7 +301,7 @@ impl BulkKey {
     }
 
     pub fn encrypt_chunk(&self, idx: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
         let nonce = Self::chunk_nonce(idx);
         cipher
             .encrypt(Nonce::from_slice(&nonce), plaintext)
@@ -309,7 +309,7 @@ impl BulkKey {
     }
 
     pub fn decrypt_chunk(&self, idx: u64, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
         let nonce = Self::chunk_nonce(idx);
         cipher
             .decrypt(Nonce::from_slice(&nonce), ciphertext)

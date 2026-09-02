@@ -29,7 +29,7 @@ WebRTC data channel (or the server-relay HTTP path). Spec authored + iterated
 | `S`         | 32    | one session        | X25519(local_E_priv, peer_E_pub)        | Raw DH shared secret. Non-uniform.                   |
 | `wrap_key`  | 32    | one session        | HKDF(S, salt=session_id, "wrap-key")    | Wraps B for wire transport.                          |
 | `meta_key`  | 32    | one session        | HKDF(S, salt=session_id, "meta-key")    | Encrypts the meta frame.                             |
-| `B`         | 32    | one file transfer  | sender-of-file RNG                      | Bulk stream key. ChaCha20-Poly1305.                  |
+| `B`         | 32    | one file transfer  | sender-of-file RNG                      | Bulk stream key. AES-256-GCM.                  |
 
 **Initiator generates `A`.** For `bitmule send`, that's the sender; for
 `bitmule recv` (recipient invites file), that's the recipient. Either
@@ -98,14 +98,14 @@ Sender-of-file generates `B` (32 random bytes) and wraps it under
 
 ```
 nonce = 12 random bytes
-enc_B = ChaCha20-Poly1305(wrap_key, nonce, plaintext=B, aad="")
+enc_B = AES-256-GCM(wrap_key, nonce, plaintext=B, aad="")
 ```
 
 Sends `KeyWrap { enc_B, nonce }` over the WebSocket. Receiver, holding
 `wrap_key`, unwraps:
 
 ```
-B = ChaCha20-Poly1305-Decrypt(wrap_key, nonce, enc_B, aad="")
+B = AES-256-GCM-Decrypt(wrap_key, nonce, enc_B, aad="")
 ```
 
 `wrap_key` and `S` are wiped after B is in hand.
@@ -119,7 +119,7 @@ constructed to guard S and B even if the meta plaintext is known:
 
 ```
 meta_nonce = 12 random bytes
-meta_ct    = ChaCha20-Poly1305(meta_key, meta_nonce, plaintext=meta_json, aad=session_id)
+meta_ct    = AES-256-GCM(meta_key, meta_nonce, plaintext=meta_json, aad=session_id)
 ```
 
 `meta_key` is DISTINCT from both `wrap_key` and `B` — HKDF with
@@ -177,7 +177,7 @@ For each file chunk:
    chunk index:
    ```
    nonce      = chunk_index (u64 LE) padded to 12 bytes
-   ciphertext = ChaCha20-Poly1305(B, nonce, payload, aad="")
+   ciphertext = AES-256-GCM(B, nonce, payload, aad="")
    ```
    `B` is fresh per file, so nonce reuse is only a concern within one
    session, and monotonic chunk_index guarantees uniqueness there.
@@ -289,6 +289,27 @@ constraint that pushes it into "known + accepted"). Reviewed 2026-09-03.
 - **Endpoint compromise** — if either sending or receiving box is
   owned, keys in memory leak. Standard.
 
+## Browser (SubtleCrypto) compatibility
+
+The bulk chunk cipher is AES-256-GCM specifically because SubtleCrypto
+supports it natively in every current browser and gives us hardware-
+accelerated AES-NI perf on the SPA side. Bulk decryption is the only
+place where perf matters (many-chunk stream). Everything else runs
+one-shot per session, so a WASM implementation in the SPA is fine.
+
+| Primitive             | SubtleCrypto              | SPA fallback if unsupported            |
+|-----------------------|---------------------------|----------------------------------------|
+| AES-256-GCM (bulk)    | ✅ native everywhere      | required for bulk perf; no fallback    |
+| SHA-256               | ✅ native everywhere      | —                                      |
+| HMAC-SHA256           | ✅ native everywhere      | —                                      |
+| HKDF-SHA256           | ✅ native everywhere      | —                                      |
+| X25519 (ECDH)         | ⚠ Chrome 133+ / FF 132+ / Safari 18 | WASM `@noble/curves`         |
+| Ed25519 (optional)    | ⚠ Chrome 137+ / FF 137+ / Safari 17 | WASM `@noble/curves` (only if signing enabled) |
+| getRandomValues       | ✅ everywhere             | —                                      |
+
+Native (Rust) uses `aes-gcm` for the same primitive, so the two sides
+interop byte-for-byte on chunks + wraps + meta.
+
 ## Implementation
 
 See `crates/bitmule-client-native/src/crypto.rs` for the Rust
@@ -299,7 +320,7 @@ primitives:
   which rejects low-order pubs and zero shared secrets.
 - `SessionKey` (S) — raw X25519 output. Non-uniform. `wrap_key(sid)`
   and `meta_key(sid)` derive purpose-specific AEAD keys.
-- `WrapKey` — encrypts / decrypts B via ChaCha20-Poly1305.
+- `WrapKey` — encrypts / decrypts B via AES-256-GCM.
 - `MetaKey` — encrypts / decrypts meta with session_id bound as AAD.
   Provides `meta_signing_hash(sid, nonce, ct)` helper for the optional
   Ed25519 signature.
