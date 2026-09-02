@@ -19,6 +19,8 @@
 //! and holds them open until dropped. The chunk-transfer layer will
 //! attach on top of the data channel in a follow-up.
 
+pub mod str0m_client;
+
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
 use bytes::{Bytes, BytesMut};
@@ -508,7 +510,7 @@ impl Role {
 /// Wire frames on the signaling WebSocket. Mirrors what `web/main.js` sends.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum SignalFrame {
+pub(crate) enum SignalFrame {
     Hello {
         role: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -527,9 +529,9 @@ enum SignalFrame {
     },
 }
 
-type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+pub(crate) type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn open_ws(server_url: &str, session_hex: &str) -> Result<Ws> {
+pub(crate) async fn open_ws(server_url: &str, session_hex: &str) -> Result<Ws> {
     let ws_url = format!("{}/ws/{}", server_url.trim_end_matches('/'), session_hex);
     let (ws, _resp) = connect_async(&ws_url)
         .await
