@@ -28,3 +28,4 @@ zeroize = "1.9.0"
 hmac = "0.12"
 rand_core = { version = "0.6", features = ["std"] }
 aes-gcm = "0.10"
+zstd = "0.13"
