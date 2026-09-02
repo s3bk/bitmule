@@ -100,20 +100,70 @@ impl Ephemeral {
 
     /// Derive the session shared secret S = X25519(our_priv, peer_pub).
     /// S is the RAW 32-byte X25519 output — non-uniform, don't use as a
-    /// symmetric key directly. Feed it into `SessionKey::wrap_key_from`
+    /// symmetric key directly. Feed it into `SessionKey::wrap_key`
     /// with the session's salt to derive a proper symmetric key for
     /// AEAD wrapping of B.
     ///
     /// Consumes the ephemeral secret — forward-secrecy hedge, the
     /// private half can't be reused or exported.
-    pub fn derive_shared_secret(self, peer_pub: &[u8; 32]) -> SessionKey {
+    ///
+    /// Rejects malformed `peer_pub`:
+    /// - Small-subgroup / low-order points (RFC 7748 §7). These are
+    ///   pre-enumerated points that would force the shared secret to
+    ///   a value under the attacker's control.
+    /// - Post-DH check that the shared secret isn't all zeros (the
+    ///   generic form of the small-subgroup catch, in case the
+    ///   pre-check missed a variant). x25519-dalek returns zeros
+    ///   silently in that case rather than erroring; we treat as fatal.
+    pub fn derive_shared_secret(self, peer_pub: &[u8; 32]) -> Result<SessionKey> {
+        if is_low_order_x25519(peer_pub) {
+            bail!("peer ephemeral pub is a known low-order / small-subgroup point");
+        }
         let peer = PublicKey::from(*peer_pub);
         let raw: SharedSecret = self.secret.diffie_hellman(&peer);
+        let raw_bytes = raw.as_bytes();
+        if raw_bytes.iter().all(|b| *b == 0) {
+            bail!("X25519 shared secret is all zeros — invalid peer_pub");
+        }
         let mut out = [0u8; 32];
-        out.copy_from_slice(raw.as_bytes());
+        out.copy_from_slice(raw_bytes);
         // raw + our secret are dropped here.
-        SessionKey(out)
+        Ok(SessionKey(out))
     }
+}
+
+/// Known low-order / small-subgroup X25519 public keys per RFC 7748 §7.
+/// Any peer sending one of these is either malformed or actively hostile;
+/// derivation with them would produce a predictable shared secret.
+fn is_low_order_x25519(pub_bytes: &[u8; 32]) -> bool {
+    const LOW_ORDER: [[u8; 32]; 7] = [
+        // 0
+        [0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        // 1
+        [0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        // 325606250916557431795983626356110631294008115727848805560023387167927233504
+        [0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
+         0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
+        // 39382357235489614581723060781553021112529911719440698176882885853963445705823
+        [0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
+         0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
+        // p - 1
+        [0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+        // p
+        [0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+        // p + 1
+        [0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    ];
+    LOW_ORDER.iter().any(|p| constant_time_eq(p, pub_bytes))
+}
+
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..32 { diff |= a[i] ^ b[i]; }
+    diff == 0
 }
 
 /// Raw X25519 shared secret S = X25519(local_priv, peer_pub). 32 bytes,
@@ -251,8 +301,8 @@ mod tests {
         let bob = Ephemeral::generate();
         let alice_pub = alice.public_bytes();
         let bob_pub = bob.public_bytes();
-        let alice_s = alice.derive_shared_secret(&bob_pub);
-        let bob_s = bob.derive_shared_secret(&alice_pub);
+        let alice_s = alice.derive_shared_secret(&bob_pub).unwrap();
+        let bob_s = bob.derive_shared_secret(&alice_pub).unwrap();
         assert_eq!(alice_s.0, bob_s.0);
     }
 
