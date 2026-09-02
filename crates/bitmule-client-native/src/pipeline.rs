@@ -51,11 +51,75 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, bail, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::crypto::BulkKey;
 
 const STAGE_QUEUE: usize = 4;
+/// How many buffers a pool pre-allocates. Chosen so all in-flight
+/// buffers across the pipeline (reader queue + 2 stage queues + caller
+/// downstream) can be served without falling back to on-the-fly
+/// allocation. STAGE_QUEUE (4) × 3 hops + slack.
+pub const POOL_DEFAULT_COUNT: usize = 16;
+
+/// Shared bounded buffer pool. Callers rent a Vec<u8> to write into,
+/// return it after consumption so it circulates. Backpressure is
+/// natural: if the pool is drained, `rent`/`rent_blocking` waits
+/// until a buffer is returned.
+///
+/// Bytes are cleared on rent (not on return) so returned buffers
+/// don't linger with sensitive plaintext / ciphertext in memory
+/// longer than needed. Capacity is preserved across rent-cycles so
+/// no re-allocation happens.
+///
+/// Sharing shape: `Arc<BufferPool>`. Both async tasks and std::thread
+/// workers use it — async uses `rent`/`return_buf`, threads use
+/// `rent_blocking`/`return_buf_blocking`. `tokio::sync::Mutex::blocking_lock`
+/// works from plain threads (does NOT work from inside a spawned tokio
+/// task, so async callers stick to the async path).
+pub struct BufferPool {
+    rent_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    ret_tx: mpsc::Sender<Vec<u8>>,
+    capacity: usize,
+}
+
+impl BufferPool {
+    /// Pre-allocate `count` buffers of `capacity` each. All buffers
+    /// start in the pool ready to rent.
+    pub fn new(count: usize, capacity: usize) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(count);
+        for _ in 0..count {
+            let _ = tx.try_send(Vec::with_capacity(capacity));
+        }
+        Arc::new(Self { rent_rx: Mutex::new(rx), ret_tx: tx, capacity })
+    }
+
+    pub fn capacity(&self) -> usize { self.capacity }
+
+    /// Async rent — waits until a buffer is available.
+    pub async fn rent(&self) -> Vec<u8> {
+        let mut guard = self.rent_rx.lock().await;
+        let mut buf = guard.recv().await.unwrap_or_else(|| Vec::with_capacity(self.capacity));
+        buf.clear();
+        buf
+    }
+
+    /// Blocking rent for use from std::thread workers. Never call from
+    /// inside a tokio task.
+    pub fn rent_blocking(&self) -> Vec<u8> {
+        let mut guard = self.rent_rx.blocking_lock();
+        let mut buf = guard.blocking_recv().unwrap_or_else(|| Vec::with_capacity(self.capacity));
+        buf.clear();
+        buf
+    }
+
+    /// Return a buffer to the pool. Non-blocking; if the pool is full
+    /// (shouldn't happen — count is bounded and matches rents), the
+    /// buffer is silently dropped.
+    pub fn return_buf(&self, buf: Vec<u8>) {
+        let _ = self.ret_tx.try_send(buf);
+    }
+}
 
 // ------------------------------------------------------------------ send
 
@@ -292,6 +356,32 @@ mod tests {
         recv.push(idx, ct).await.unwrap();
         recv.close_input();
         assert!(recv.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn buffer_pool_rent_return_cycles() {
+        let pool = BufferPool::new(2, 1024);
+        let a = pool.rent().await;
+        let b = pool.rent().await;
+        assert_eq!(a.capacity(), 1024);
+        assert_eq!(a.len(), 0);
+        pool.return_buf(a);
+        let c = pool.rent().await;
+        assert_eq!(c.capacity(), 1024);
+        pool.return_buf(b);
+        pool.return_buf(c);
+    }
+
+    #[test]
+    fn buffer_pool_rent_blocking_from_std_thread() {
+        let pool = BufferPool::new(2, 512);
+        let pool_c = pool.clone();
+        let t = std::thread::spawn(move || {
+            let buf = pool_c.rent_blocking();
+            assert_eq!(buf.capacity(), 512);
+            pool_c.return_buf(buf);
+        });
+        t.join().unwrap();
     }
 
     #[tokio::test]
