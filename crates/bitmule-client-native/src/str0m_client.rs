@@ -63,7 +63,7 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
     let session_hex = session_id.as_hex();
     info!(session = %session_hex, "opening sender WS + Rtc");
 
-    let mut ws = crate::open_ws(server_url, &session_hex).await?;
+    let mut ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
     let (mut rtc, socket) = build_rtc().await?;
 
     // Active side: create the data channel BEFORE offer generation so its
@@ -557,6 +557,16 @@ async fn drain_rtc_capture_data(
 // ---- top-level dispatchers (unify DC + relay per TransportMode) ---------
 
 use crate::{TransportMode, WEBRTC_FALLBACK_MS};
+
+fn websocket_url(http_url: &str) -> Result<String> {
+    if let Some(rest) = http_url.strip_prefix("http://") {
+        Ok(format!("ws://{rest}"))
+    } else if let Some(rest) = http_url.strip_prefix("https://") {
+        Ok(format!("wss://{rest}"))
+    } else {
+        bail!("invalid protocol")
+    }
+}
 
 /// Send `file_path` over a fresh session. Dispatch by TransportMode:
 /// - `Webrtc`: send_connect → send_file_over_dc.

@@ -20,7 +20,7 @@
 //! attach on top of the data channel in a follow-up.
 
 pub mod str0m_client;
-pub use str0m_client::LiveSession;
+pub use str0m_client::{LiveSession, recv_file, send_file};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
