@@ -21,10 +21,14 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::{path::Path, sync::Arc, time::Duration};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{mpsc, Mutex},
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 use webrtc::{
@@ -39,6 +43,93 @@ use webrtc::{
         RTCPeerConnection,
     },
 };
+
+/// 16 KiB is the SCTP-safe universal message size (Firefox cap). Matches
+/// the browser side (`web/main.js` CONFIG.chunkBytes) so a native sender
+/// and a browser receiver see identical framing.
+pub const CHUNK_BYTES: usize = 16 * 1024;
+const BUFFERED_HIGH_WATER: usize = 4 * 1024 * 1024;
+const BUFFERED_LOW_WATER: usize = 1 * 1024 * 1024;
+const BACKPRESSURE_POLL: Duration = Duration::from_millis(10);
+
+/// Send a file over an opened WebRTC data channel using the same wire
+/// framing as the browser sender:
+///
+/// - text frame: `{"type":"meta", name, size, chunkBytes, totalChunks}`
+/// - binary frames: raw `CHUNK_BYTES`-sized (or smaller for the tail) payloads
+/// - text frame: `{"type":"done"}`
+///
+/// Backpressure: waits for `dc.buffered_amount()` to fall below
+/// `BUFFERED_HIGH_WATER` before sending the next chunk. Simple polling
+/// rather than the callback-based `on_buffered_amount_low` pattern —
+/// bounded latency (10ms poll) and no shared-state plumbing between the
+/// callback and this async loop.
+pub async fn send_file_over_dc(
+    dc: Arc<RTCDataChannel>,
+    file_path: &Path,
+    mut on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<()> {
+    let meta_file = tokio::fs::metadata(file_path)
+        .await
+        .with_context(|| format!("stat {}", file_path.display()))?;
+    if !meta_file.is_file() {
+        bail!("{} is not a regular file", file_path.display());
+    }
+    let size = meta_file.len();
+    let name = file_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".to_string());
+    let total_chunks = if size == 0 { 0 } else { (size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
+
+    let meta = serde_json::json!({
+        "type": "meta",
+        "name": name,
+        "size": size,
+        "chunkBytes": CHUNK_BYTES,
+        "totalChunks": total_chunks,
+    });
+    dc.send_text(meta.to_string())
+        .await
+        .map_err(|e| anyhow!("dc send meta: {e}"))?;
+
+    dc.set_buffered_amount_low_threshold(BUFFERED_LOW_WATER)
+        .await;
+
+    let mut f = tokio::fs::File::open(file_path)
+        .await
+        .with_context(|| format!("open {}", file_path.display()))?;
+    let mut sent: u64 = 0;
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        // Backpressure: pause sending while the SCTP send queue is above
+        // the high-water mark. Poll at BACKPRESSURE_POLL granularity;
+        // bounded to a small tail wait so the file finish is prompt.
+        while dc.buffered_amount().await > BUFFERED_HIGH_WATER {
+            tokio::time::sleep(BACKPRESSURE_POLL).await;
+        }
+        let payload = Bytes::copy_from_slice(&buf[..n]);
+        dc.send(&payload)
+            .await
+            .map_err(|e| anyhow!("dc send chunk: {e}"))?;
+        sent += n as u64;
+        on_progress(sent, size);
+    }
+
+    dc.send_text(r#"{"type":"done"}"#.to_string())
+        .await
+        .map_err(|e| anyhow!("dc send done: {e}"))?;
+
+    // Ensure the SCTP queue drains before the caller closes the DC.
+    while dc.buffered_amount().await > 0usize {
+        tokio::time::sleep(BACKPRESSURE_POLL).await;
+    }
+    Ok(())
+}
 
 /// A running, connected session: WS held open + peer connection + data channel.
 pub struct LiveSession {
