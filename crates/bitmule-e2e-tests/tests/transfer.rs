@@ -12,7 +12,7 @@
 
 mod common;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use common::*;
 use tempfile::TempDir;
 use thirtyfour::prelude::*;
@@ -28,27 +28,23 @@ async fn cli_to_cli() -> Result<()> {
     let (file, want_hash) = make_random_file(src.path(), size)?;
     eprintln!("cli_to_cli: file {} ({} bytes)", file.display(), size);
 
-    // Receiver first — it prints the session hex we hand to the sender.
-    let recv_handle = tokio::spawn({
-        let url = env.server_url.clone();
-        let out = dst.path().to_owned();
-        async move {
-            run_cli(&url, &["recv", "--out", out.to_str().unwrap()], None).await
-        }
-    });
+    // Sender-initiated (SPA mode 2 shape): `bitmule send` generates the
+    // session id + prints `<server>/#<hex>` to stdout, then blocks
+    // waiting for a receiver.
+    let mut sender = spawn_cli(&env.server_url, &["send", file.to_str().unwrap()])?;
+    let hex = read_stdout_for_hex(&mut sender, std::time::Duration::from_secs(5)).await?;
 
-    // Give the receiver a moment to print its share link. In production
-    // we'd stream stdout and wait for the hex line specifically; the
-    // simpler smoke shape below waits then re-reads. Left inline TODO.
-    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-    let (_status, recv_stdout) = recv_handle.await??;
-    let session_hex = extract_session_hex(&recv_stdout)?;
+    // Receiver joins the session with the hex the sender printed.
+    let mut receiver = spawn_cli(&env.server_url, &["recv", &hex, "--out", dst.path().to_str().unwrap()])?;
 
-    let (send_status, _) = run_cli(&env.server_url, &["send", file.to_str().unwrap()], None).await?;
-    assert!(send_status.success(), "send exited non-zero");
+    // Both should exit cleanly once the DC has drained.
+    let send_status = sender.wait().await?;
+    let recv_status = receiver.wait().await?;
+    assert!(send_status.success(), "send exited non-zero: {send_status}");
+    assert!(recv_status.success(), "recv exited non-zero: {recv_status}");
 
-    // Locate the received file under dst — the CLI writes it with the
-    // sender's basename. Grab any file in dst and hash.
+    // Locate the received file under dst — the CLI writes it under the
+    // sender's basename.
     let received = std::fs::read_dir(dst.path())?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -70,101 +66,134 @@ async fn web_to_cli() -> Result<()> {
     let (file, want_hash) = make_random_file(src.path(), size)?;
     eprintln!("web_to_cli: file {} ({} bytes)", file.display(), size);
 
-    // CLI receiver first — prints session hex.
-    let recv_handle = tokio::spawn({
-        let url = env.server_url.clone();
-        let out = dst.path().to_owned();
-        async move {
-            run_cli(&url, &["recv", "--out", out.to_str().unwrap()], None).await
-        }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-
-    // Drive a headless Chrome via the web SPA to send the file.
+    // Web sender: open SPA at `/`, drop the file, wait for the share
+    // link that carries the session hex (SPA mode 1 → mode 2 URL shape).
     let caps = DesiredCapabilities::chrome();
     let driver = WebDriver::new(&env.webdriver_url, caps).await
         .context("connect webdriver")?;
     driver.goto(&format!("{}/", env.server_url)).await?;
-    // Wait for the drop-zone to render.
     let file_input = driver.find(By::Css("input[type='file']")).await
         .context("no file input on send page")?;
     file_input.send_keys(file.to_str().unwrap()).await?;
-    // Wait for the share link to appear so we can hand its hex to the CLI receiver.
     let link_el = driver.query(By::Css("a[href*='#']")).first().await?;
     let href = link_el.attr("href").await?.unwrap_or_default();
-    let _hex_from_web = href.split_once('#').map(|(_, h)| h.trim().to_owned())
+    let hex = href.split_once('#').map(|(_, h)| h.trim().chars().take(64).collect::<String>())
         .ok_or_else(|| anyhow!("no session hex in web share link: {href}"))?;
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("share link hex bogus: {hex}");
+    }
 
-    // In real end-to-end shape: the CLI recv was launched with `recv`
-    // (no session arg) so it generated its OWN session hex. To make
-    // web-sender ↔ cli-receiver work we'd need the CLI to accept the
-    // web sender's hex OR the web page to accept a pre-generated hex.
-    // Bitmule's current CLI recv doesn't take a session id and reuses
-    // the one it printed; correct wiring requires this direction:
-    //   1. Start CLI recv first, capture its hex.
-    //   2. Drive web sender to open `<server>/#<hex>` directly (not the
-    //      base URL) — the SPA in receiver mode uses the hash as session
-    //      id; the send SPA needs a way to be told the id up front.
-    // If web-main.js doesn't currently support pre-set session ids for
-    // sender mode, this test needs a small SPA tweak before it passes.
-    // Marked TODO for Seb to say which side accommodates.
-    let (_status, _stdout) = recv_handle.await??;
+    // CLI receiver joins with the hex the web sender exposed.
+    let mut receiver = spawn_cli(&env.server_url, &["recv", &hex, "--out", dst.path().to_str().unwrap()])?;
+    let recv_status = receiver.wait().await?;
+    assert!(recv_status.success(), "recv exited non-zero: {recv_status}");
+
+    let received = std::fs::read_dir(dst.path())?
+        .filter_map(|e| e.ok()).map(|e| e.path()).next()
+        .ok_or_else(|| anyhow!("no file landed in {}", dst.path().display()))?;
+    assert_eq!(sha256_file(&received)?, want_hash, "received bytes differ from sent");
     driver.quit().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires chromedriver + built bitmule binaries"]
+#[ignore = "requires chromedriver + built bitmule binaries + downloads sink"]
 async fn cli_to_web() -> Result<()> {
     let env = Env::bring_up().await?;
     let src = TempDir::new()?;
-    let _dst = TempDir::new()?;
+    let dl = TempDir::new()?;
 
     let size = random_size_bytes();
-    let (file, _want_hash) = make_random_file(src.path(), size)?;
+    let (file, want_hash) = make_random_file(src.path(), size)?;
     eprintln!("cli_to_web: file {} ({} bytes)", file.display(), size);
 
-    // Same session-id-plumbing question as web_to_cli — need Seb's word
-    // on whether SPA supports being told the session id externally or
-    // whether the CLI grows a "recv against this hex" mode.
-    let caps = DesiredCapabilities::chrome();
+    // CLI sender generates the session + prints `<server>/#<hex>`.
+    let mut sender = spawn_cli(&env.server_url, &["send", file.to_str().unwrap()])?;
+    let hex = read_stdout_for_hex(&mut sender, std::time::Duration::from_secs(5)).await?;
+
+    // Point Chrome downloads at `dl` so we can hash the received file.
+    let mut caps = DesiredCapabilities::chrome();
+    caps.set_headless()?;
+    // Chrome download-directory prefs. thirtyfour surfaces this via
+    // add_experimental_option — path shape per Chromium docs.
+    caps.insert_browser_option("prefs", serde_json::json!({
+        "download.default_directory": dl.path().to_str().unwrap(),
+        "download.prompt_for_download": false,
+    }))?;
+
     let driver = WebDriver::new(&env.webdriver_url, caps).await?;
-    // Start CLI sender first, capture the hex it prints (`bitmule send`
-    // doesn't currently print one — sender side generates the id then
-    // waits; the receiver has to know the id via the SPA hash). Deferred.
-    let _ = &driver;
+    let url = format!("{}/#{}", env.server_url, hex);
+    driver.goto(&url).await?;
+
+    // Wait for the sender to complete + Chrome to finish the download.
+    // Selector for "transfer complete" in the SPA is still open — for
+    // now: poll `dl` for a file to appear (Chrome writes .crdownload
+    // during transit + renames to final on completion).
+    let final_path = wait_for_final_download(dl.path(), std::time::Duration::from_secs(60)).await?;
+    assert_eq!(sha256_file(&final_path)?, want_hash);
+
+    sender.wait().await?;
     driver.quit().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires chromedriver + built bitmule binaries"]
+#[ignore = "requires chromedriver + built bitmule binaries + downloads sink"]
 async fn web_to_web() -> Result<()> {
     let env = Env::bring_up().await?;
     let src = TempDir::new()?;
+    let dl = TempDir::new()?;
 
     let size = random_size_bytes();
-    let (file, _want_hash) = make_random_file(src.path(), size)?;
+    let (file, want_hash) = make_random_file(src.path(), size)?;
     eprintln!("web_to_web: file {} ({} bytes)", file.display(), size);
 
-    let caps = DesiredCapabilities::chrome();
-    let sender = WebDriver::new(&env.webdriver_url, caps.clone()).await?;
+    // Sender browser.
+    let mut send_caps = DesiredCapabilities::chrome();
+    send_caps.set_headless()?;
+    let sender = WebDriver::new(&env.webdriver_url, send_caps).await?;
     sender.goto(&format!("{}/", env.server_url)).await?;
     let file_input = sender.find(By::Css("input[type='file']")).await?;
     file_input.send_keys(file.to_str().unwrap()).await?;
     let link_el = sender.query(By::Css("a[href*='#']")).first().await?;
     let href = link_el.attr("href").await?.unwrap_or_default();
 
-    let receiver = WebDriver::new(&env.webdriver_url, caps).await?;
+    // Receiver browser with downloads sink.
+    let mut recv_caps = DesiredCapabilities::chrome();
+    recv_caps.set_headless()?;
+    recv_caps.insert_browser_option("prefs", serde_json::json!({
+        "download.default_directory": dl.path().to_str().unwrap(),
+        "download.prompt_for_download": false,
+    }))?;
+    let receiver = WebDriver::new(&env.webdriver_url, recv_caps).await?;
     receiver.goto(&href).await?;
-    // Wait for progress-complete indicator in the SPA. Selector TBD —
-    // depends on what web/main.js exposes for "transfer done"; using
-    // 30s deadline as a first cut. This is the assertion that would
-    // actually fail loudly if the transfer breaks, so pinning it is
-    // where the real test-value lands. Deferred until we know the SPA's
-    // completion signal shape.
-    let _ = &receiver;
+
+    let final_path = wait_for_final_download(dl.path(), std::time::Duration::from_secs(60)).await?;
+    assert_eq!(sha256_file(&final_path)?, want_hash);
+
     sender.quit().await?;
     receiver.quit().await?;
     Ok(())
+}
+
+/// Poll `dir` for the first file whose name doesn't end in `.crdownload`
+/// (Chrome's mid-transit suffix). Returns the final PathBuf when the
+/// download completes.
+async fn wait_for_final_download(dir: &std::path::Path, timeout: std::time::Duration) -> Result<std::path::PathBuf> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut it) = std::fs::read_dir(dir) {
+            if let Some(entry) = it.find_map(|e| e.ok()) {
+                let p = entry.path();
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !name.ends_with(".crdownload") && !name.is_empty() {
+                    // Give one more tick for the rename to settle.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    return Ok(p);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Err(anyhow!("no completed download in {} after {:?}", dir.display(), timeout))
 }

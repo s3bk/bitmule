@@ -145,9 +145,10 @@ pub fn cli_bin() -> String {
     "cargo".into() // caller handles the `run -p bitmule --` prefix
 }
 
-/// Run the CLI as a subprocess with the given args. Waits for completion
-/// and returns (exit-status, stdout).
-pub async fn run_cli(server_url: &str, args: &[&str], stdin: Option<&[u8]>) -> Result<(std::process::ExitStatus, String)> {
+/// Spawn the CLI as a subprocess with piped stdout. Caller reads stdout
+/// (typically to capture the share URL that send/recv print on start-up
+/// before blocking on the transfer) and then awaits the child.
+pub fn spawn_cli(server_url: &str, args: &[&str]) -> Result<Child> {
     let bin = cli_bin();
     let (program, prefix): (&str, Vec<&str>) = if bin.ends_with("cargo") || bin == "cargo" {
         ("cargo", vec!["run", "--quiet", "-p", "bitmule", "--"])
@@ -158,17 +159,46 @@ pub async fn run_cli(server_url: &str, args: &[&str], stdin: Option<&[u8]>) -> R
     cmd.args(&prefix)
         .arg("--server").arg(server_url)
         .args(args)
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let mut child = cmd.spawn().context("spawn bitmule cli")?;
-    if let Some(data) = stdin {
-        use tokio::io::AsyncWriteExt;
-        child.stdin.as_mut().unwrap().write_all(data).await?;
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    cmd.spawn().context("spawn bitmule cli")
+}
+
+/// Read lines from a child's stdout until one contains a URL with a `#<hex>`
+/// fragment (matches both `<server>/#<hex>` and `<server>/send#<hex>` per
+/// Seb 2026-09-02: SPA modes 2 and 3). Returns the 64-char hex on the
+/// first match, or times out after `timeout`.
+pub async fn read_stdout_for_hex(child: &mut Child, timeout: Duration) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no piped stdout"))?;
+    let mut reader = BufReader::new(stdout).lines();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, reader.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                if let Some((_, hash)) = line.split_once('#') {
+                    let hex: String = hash.chars().take(64).collect();
+                    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                        // Put the reader back so subsequent stdout drains don't stall
+                        // the child (bounded stdout pipe buffer would otherwise
+                        // block send/recv once full). We spawn a background task
+                        // to consume the rest.
+                        let mut lines = reader;
+                        tokio::spawn(async move {
+                            while let Ok(Some(_)) = lines.next_line().await {}
+                        });
+                        return Ok(hex);
+                    }
+                }
+            }
+            Ok(Ok(None)) => bail!("CLI stdout closed before printing a session URL"),
+            Ok(Err(e)) => bail!("CLI stdout read: {e}"),
+            Err(_) => bail!("timed out waiting for session URL on CLI stdout"),
+        }
     }
-    let out = child.wait_with_output().await?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    Ok((out.status, stdout))
 }
 
 /// Extract the 64-char session hex from `bitmule recv --server ...` stdout.
