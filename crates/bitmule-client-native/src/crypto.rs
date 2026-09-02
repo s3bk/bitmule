@@ -98,30 +98,52 @@ impl Ephemeral {
 
     pub fn public_bytes(&self) -> [u8; 32] { *self.public.as_bytes() }
 
-    /// Derive the session shared key S = X25519(our_priv, peer_pub).
-    /// Consumes the ephemeral secret. `A` used purely as a domain-separation
-    /// input to HKDF so the exchanged key material feeds into a proper
-    /// symmetric key of exact length; MAC-authentication of the raw
-    /// exchange is handled separately via `ShareKey::mac_ephemeral_pub`.
-    pub fn derive_shared_key(self, peer_pub: &[u8; 32], share: &ShareKey) -> SessionKey {
+    /// Derive the session shared secret S = X25519(our_priv, peer_pub).
+    /// S is the RAW 32-byte X25519 output — non-uniform, don't use as a
+    /// symmetric key directly. Feed it into `SessionKey::wrap_key_from`
+    /// with the session's salt to derive a proper symmetric key for
+    /// AEAD wrapping of B.
+    ///
+    /// Consumes the ephemeral secret — forward-secrecy hedge, the
+    /// private half can't be reused or exported.
+    pub fn derive_shared_secret(self, peer_pub: &[u8; 32]) -> SessionKey {
         let peer = PublicKey::from(*peer_pub);
         let raw: SharedSecret = self.secret.diffie_hellman(&peer);
-        let hkdf = Hkdf::<Sha256>::new(Some(&share.0), raw.as_bytes());
         let mut out = [0u8; 32];
-        hkdf.expand(b"bitmule-session-key-v1", &mut out)
-            .expect("32 bytes fits within HKDF output length");
-        // raw + our secret are dropped here — forward secrecy hedge.
+        out.copy_from_slice(raw.as_bytes());
+        // raw + our secret are dropped here.
         SessionKey(out)
     }
 }
 
-/// Derived per-session key S. Wraps a 32-byte ChaCha20-Poly1305 key.
+/// Raw X25519 shared secret S = X25519(local_priv, peer_pub). 32 bytes,
+/// non-uniform distribution — never use directly as an AEAD key. Feed
+/// through `wrap_key(session_id)` to get a proper symmetric key.
 pub struct SessionKey(pub [u8; 32]);
 impl Drop for SessionKey { fn drop(&mut self) { self.0.zeroize(); } }
 
 impl SessionKey {
-    /// AEAD-wrap the sender's freshly-generated bulk key B under S.
-    /// Returns (nonce, ciphertext) — both need to be sent on the wire.
+    /// Derive the AEAD wrap key from S with session_id as salt. Per Seb
+    /// 2026-09-03: session_id is public, but binding the derivation to
+    /// it guarantees the wrap key is specific to this exact session +
+    /// this specific purpose ("transfer-v1 wrap-key" info string).
+    pub fn wrap_key(&self, session_id: &[u8; 32]) -> WrapKey {
+        let hkdf = Hkdf::<Sha256>::new(Some(session_id), &self.0);
+        let mut out = [0u8; 32];
+        hkdf.expand(b"transfer-v1 wrap-key", &mut out)
+            .expect("32 bytes fits within HKDF-SHA256 output length");
+        WrapKey(out)
+    }
+}
+
+/// Purpose-specific 32-byte AEAD key derived from S + session_id.
+pub struct WrapKey(pub [u8; 32]);
+impl Drop for WrapKey { fn drop(&mut self) { self.0.zeroize(); } }
+
+impl WrapKey {
+    /// AEAD-wrap the sender's freshly-generated bulk key B under this
+    /// wrap key. Returns (nonce, ciphertext) — both need to be sent on
+    /// the wire.
     pub fn wrap_bulk_key(&self, bulk: &BulkKey) -> Result<(Vec<u8>, Vec<u8>)> {
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -189,13 +211,23 @@ mod tests {
 
     #[test]
     fn wrap_unwrap_roundtrip() {
+        let share = ShareKey::random();
+        let session_id_bytes: [u8; 32] = {
+            let mut buf = [0u8; 32];
+            for (i, byte) in share.session_id_hex().as_bytes().chunks(2).enumerate() {
+                let s = std::str::from_utf8(byte).unwrap();
+                buf[i] = u8::from_str_radix(s, 16).unwrap();
+            }
+            buf
+        };
         let s = SessionKey({
             let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b
         });
+        let wk = s.wrap_key(&session_id_bytes);
         let b = BulkKey::random();
         let orig = b.0;
-        let (nonce, ct) = s.wrap_bulk_key(&b).unwrap();
-        let unwrapped = s.unwrap_bulk_key(&nonce, &ct).unwrap();
+        let (nonce, ct) = wk.wrap_bulk_key(&b).unwrap();
+        let unwrapped = wk.unwrap_bulk_key(&nonce, &ct).unwrap();
         assert_eq!(unwrapped.0, orig);
     }
 
@@ -215,13 +247,12 @@ mod tests {
 
     #[test]
     fn ephemeral_kex_derives_matching_keys() {
-        let share = ShareKey::random();
         let alice = Ephemeral::generate();
         let bob = Ephemeral::generate();
         let alice_pub = alice.public_bytes();
         let bob_pub = bob.public_bytes();
-        let alice_s = alice.derive_shared_key(&bob_pub, &share);
-        let bob_s = bob.derive_shared_key(&alice_pub, &share);
+        let alice_s = alice.derive_shared_secret(&bob_pub);
+        let bob_s = bob.derive_shared_secret(&alice_pub);
         assert_eq!(alice_s.0, bob_s.0);
     }
 

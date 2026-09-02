@@ -62,35 +62,48 @@ A passive listener without `A` cannot forge a MAC that verifies. This
 authenticates the exchange without a full public-key infrastructure —
 possession of `A` is the credential.
 
-Both sides then derive:
+Both sides then derive the raw shared secret and, from it, a
+purpose-specific wrap key:
 
 ```
-raw = X25519(local_E_priv, peer_E_pub)
-S   = HKDF-SHA256(salt=A, ikm=raw, info="bitmule-session-key-v1", L=32)
+S        = X25519(local_E_priv, peer_E_pub)          # 32 bytes, non-uniform
+wrap_key = HKDF-SHA256(
+             ikm  = S,
+             salt = session_id,                       # = SHA256(A), public
+             info = b"transfer-v1 wrap-key",
+             length = 32,
+           )
 ```
 
-`raw` and both local `E_priv` are wiped immediately after `S` is
-computed. `A` stays as long as the URL is live but is not sufficient
-alone to recover `S` — the ephemerals are.
+`session_id` is public, but binding the derivation to it guarantees
+`wrap_key` is specific to THIS session AND this exact purpose. The
+info string is versioned (`transfer-v1`) so a future protocol change
+can bump it without colliding with fielded implementations.
+
+The X25519 private halves are consumed by the derivation and dropped
+immediately after `S` is computed. `S` itself sticks around only long
+enough to derive `wrap_key`, then is dropped too. `A` stays as long
+as the URL is live but is not sufficient alone to recover any of
+this — the ephemerals are.
 
 ## Bulk key exchange
 
-Sender generates `B` (32 random bytes) and wraps it under `S`:
+Sender generates `B` (32 random bytes) and wraps it under `wrap_key`:
 
 ```
-nonce    = 12 random bytes
-enc_B    = ChaCha20-Poly1305(S, nonce, plaintext=B, aad="")
+nonce = 12 random bytes
+enc_B = ChaCha20-Poly1305(wrap_key, nonce, plaintext=B, aad="")
 ```
 
 Sends `{enc_B, nonce}` over the WebSocket as a new SignalFrame variant.
-Receiver, holding `S`, unwraps:
+Receiver, holding `wrap_key`, unwraps:
 
 ```
-B = ChaCha20-Poly1305-Decrypt(S, nonce, enc_B, aad="")
+B = ChaCha20-Poly1305-Decrypt(wrap_key, nonce, enc_B, aad="")
 ```
 
-`S` is dropped (zeroized) as soon as `B` is in hand; it isn't needed
-for the bulk stream.
+`wrap_key` (and `S`) are dropped (zeroized) as soon as `B` is in hand;
+they aren't needed for the bulk stream.
 
 ## Chunk encryption
 
