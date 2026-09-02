@@ -23,7 +23,7 @@ WebRTC data channel (or the server-relay HTTP path). Spec authored + iterated
 
 | Symbol      | Bytes | Lifetime           | Source                                  | Purpose                                              |
 |-------------|-------|--------------------|-----------------------------------------|------------------------------------------------------|
-| `A`         | 32    | share URL          | initiator RNG                           | URL-shared secret. Lives in URL `#` fragment.        |
+| `A`         | 32    | share URL          | initiator RNG (recv-init) OR SHA256(data \|\| B) (send-init) | URL-shared secret. Lives in URL `#` fragment.        |
 | `session_id`| 32    | ambient            | SHA256(A)                               | Public session identifier. Server sees it.           |
 | `E_priv/pub`| 32/32 | one session        | each side RNG (fresh per session)       | Ephemeral X25519 keypair. Priv wiped after DH.       |
 | `S`         | 32    | one session        | X25519(local_E_priv, peer_E_pub)        | Raw DH shared secret. Non-uniform.                   |
@@ -45,6 +45,34 @@ restarts, the same B is reused: since the file is immutable during
 transfer, the same idx maps to the same plaintext, which produces the
 same ciphertext deterministically. No nonce-reuse-with-different-plaintext
 problem. A different file or a modified file requires a fresh B.
+
+### Sender-initiated URL commitment (optional, `send` flow only)
+
+Per Seb 2026-09-03. In sender-initiated flows (`bitmule send <path>`)
+the sender knows the file + `B` at URL-generation time, and can bind
+the URL to a specific (file, key) pair:
+
+```
+A = SHA256(data || B)     # instead of random 32 bytes
+```
+
+`A` is still what goes in the URL fragment; `session_id = SHA256(A)`
+unchanged. Receiver, on completion of a successful decrypt, computes
+the same hash and constant-time-compares against A. Mismatch → reject
+the transfer as tampered.
+
+This adds a THIRD integrity layer on top of per-chunk AEAD and chunk-
+count validation: a MITM who somehow obtains S (compromised endpoint,
+colluding party) could otherwise decrypt AND encrypt/inject valid
+ciphertext, but they cannot forge a modified `(data', B')` pair that
+hashes to the same URL — that's a SHA-256 preimage attack. Manipulation
+is caught even against S-holders.
+
+**Doesn't apply to `bitmule recv` (receiver-initiated file request):**
+the receiver generates the URL before any file exists on the sender's
+side, so no data is available to commit to. Those flows use `A = random
+32 bytes` as before, and the URL-commitment integrity layer is absent.
+Per-chunk AEAD + meta AEAD + chunk-count validation still hold.
 
 ## Session identifier
 
@@ -273,6 +301,7 @@ constraint that pushes it into "known + accepted"). Reviewed 2026-09-03.
 | 20| `#`-fragment leak via SPA third-party script | Safe    | Dedicated bitmule domain, zero third-party scripts, CI-enforced. Only mitigation available at this layer.  |
 | 21| URL leak DURING an active session            | Accepted| Any share-link scheme has this. Session in progress + URL leaks = MITM window until session ends. |
 | 22| Endpoint compromise                          | N/A     | Out of scope. Keys in RAM leak if the host is owned. Standard.       |
+| 23| MITM with S (compromised endpoint colluding) manipulates data | Safe (send-init only) | Receiver verifies URL = SHA256(data \|\| B) post-decrypt. Preimage attack required to forge. Recv-initiated flows lack this layer since no data commitment is possible at URL-gen time; per-chunk AEAD still holds against most attackers, and an S-holder in an untrusted-endpoint scenario is out of scope for those flows. |
 
 ## What this doesn't try to protect against
 

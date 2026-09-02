@@ -44,6 +44,32 @@ impl ShareKey {
         Self(buf)
     }
 
+    /// Sender-initiated commitment: A = SHA256(data || file_key). The URL
+    /// becomes a binary-identity binding of (this file, this key), which
+    /// receivers can verify post-decrypt. An attacker who somehow
+    /// obtains S and can produce a modified data' still cannot forge a
+    /// (data', file_key') pair whose SHA-256 equals the original URL —
+    /// that would require a preimage attack.
+    ///
+    /// Only applies to sender-initiated flows (`bitmule send <path>`)
+    /// where the file is known at URL-generation time. Receiver-initiated
+    /// flows (`bitmule recv`, sender uploads later) use `random()` — no
+    /// data commitment possible without knowing the file in advance.
+    pub fn from_data_commitment(data: &[u8], file_key: &BulkKey) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.update(file_key.0);
+        Self(hasher.finalize().into())
+    }
+
+    /// Receiver-side verification of the URL commitment. Called after
+    /// full decrypt succeeds. Returns true iff `SHA256(data || file_key)`
+    /// equals this ShareKey's bytes. Constant-time comparison.
+    pub fn verify_data_commitment(&self, data: &[u8], file_key: &BulkKey) -> bool {
+        let computed = Self::from_data_commitment(data, file_key);
+        constant_time_eq(&self.0, &computed.0)
+    }
+
     /// Hex-encoded, suitable for placement in the share URL's `#` fragment.
     pub fn to_hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
@@ -383,6 +409,20 @@ mod tests {
         let sid2 = a.session_id_hex();
         assert_eq!(sid1, sid2);
         assert_eq!(sid1.len(), 64);
+    }
+
+    #[test]
+    fn data_commitment_roundtrip() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        let key = BulkKey::random();
+        let sk = ShareKey::from_data_commitment(data, &key);
+        assert!(sk.verify_data_commitment(data, &key));
+        // tampering data breaks verification
+        let tampered = b"the quick brown fox jumps over the LAZY dog";
+        assert!(!sk.verify_data_commitment(tampered, &key));
+        // wrong key also breaks
+        let wrong_key = BulkKey::random();
+        assert!(!sk.verify_data_commitment(data, &wrong_key));
     }
 
     #[test]
