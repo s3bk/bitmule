@@ -588,102 +588,101 @@ fn drive_ws(
     let (raw_out, mut raw_out_rx) = mpsc::unbounded_channel::<String>();
     let (raw_in_tx, raw_in) = mpsc::unbounded_channel::<String>();
 
-    let sink = Arc::new(Mutex::new(sink));
+    let (mut sink, mut stream) = ws.split();
 
-    // Outbound pump — typed frames.
-    let sink_typed = sink.clone();
-    tokio::spawn(async move {
-        while let Some(frame) = typed_out_rx.recv().await {
-            let text = match serde_json::to_string(&frame) {
-                Ok(t) => t,
-                Err(e) => { warn!("frame encode: {e}"); continue; }
-            };
-            let mut s = sink_typed.lock().await;
-            if let Err(e) = s.send(Message::Text(text.into())).await {
-                warn!("ws send typed: {e}");
-                break;
-            }
-        }
-    });
-
-    // Outbound pump — raw strings (relay-mode framing, etc).
-    let sink_raw = sink.clone();
-    tokio::spawn(async move {
-        while let Some(text) = raw_out_rx.recv().await {
-            let mut s = sink_raw.lock().await;
-            if let Err(e) = s.send(Message::Text(text.into())).await {
-                warn!("ws send raw: {e}");
-                break;
-            }
-        }
-    });
-
-    // Inbound pump: parse + route + always mirror raw text into raw_in.
-    let typed_in_clone = typed_in_tx.clone();
-    let raw_in_clone = raw_in_tx.clone();
+    // Single select! loop: inbound stream + both outbound channels share
+    // one task, so the sink no longer needs a Mutex and teardown is one path.
     let handle = tokio::spawn(async move {
-        while let Some(msg) = stream.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => { warn!("ws recv: {e}"); break; }
-            };
-            let text = match msg {
-                Message::Text(t) => t.to_string(),
-                Message::Close(_) => break,
-                _ => continue,
-            };
-            // Every text frame flows out on raw regardless of parse.
-            let _ = raw_in_clone.send(text.clone());
-
-            let frame: SignalFrame = match serde_json::from_str(&text) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            match &frame {
-                SignalFrame::Sdp { kind, sdp } => {
-                    let desc = if kind == "offer" {
-                        RTCSessionDescription::offer(sdp.clone())
-                    } else {
-                        RTCSessionDescription::answer(sdp.clone())
+        loop {
+            tokio::select! {
+                // Outbound: typed frames.
+                maybe_frame = typed_out_rx.recv() => {
+                    let Some(frame) = maybe_frame else { break };
+                    let text = match serde_json::to_string(&frame) {
+                        Ok(t) => t,
+                        Err(e) => { warn!("frame encode: {e}"); continue; }
                     };
-                    match desc {
-                        Ok(d) => {
-                            if let Err(e) = pc_in.set_remote_description(d) {
-                                warn!("set_remote_description: {e}");
+                    if let Err(e) = sink.send(Message::Text(text.into())).await {
+                        warn!("ws send typed: {e}");
+                        break;
+                    }
+                }
+
+                // Outbound: raw strings (relay-mode framing, etc).
+                maybe_text = raw_out_rx.recv() => {
+                    let Some(text) = maybe_text else { break };
+                    if let Err(e) = sink.send(Message::Text(text.into())).await {
+                        warn!("ws send raw: {e}");
+                        break;
+                    }
+                }
+
+                // Inbound: parse + route + always mirror raw text into raw_in.
+                maybe_msg = stream.next() => {
+                    let msg = match maybe_msg {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => { warn!("ws recv: {e}"); break; }
+                        None => break,
+                    };
+                    let text = match msg {
+                        Message::Text(t) => t.to_string(),
+                        Message::Close(_) => break,
+                        _ => continue,
+                    };
+                    // Every text frame flows out on raw regardless of parse.
+                    let _ = raw_in_tx.send(text.clone());
+
+                    let frame: SignalFrame = match serde_json::from_str(&text) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    match &frame {
+                        SignalFrame::Sdp { kind, sdp } => {
+                            let desc = if kind == "offer" {
+                                RTCSessionDescription::offer(sdp.clone())
+                            } else {
+                                RTCSessionDescription::answer(sdp.clone())
+                            };
+                            match desc {
+                                Ok(d) => {
+                                    if let Err(e) = pc.set_remote_description(d) {
+                                        warn!("set_remote_description: {e}");
+                                    }
+                                }
+                                Err(e) => warn!("build sdp: {e}"),
                             }
+                            let _ = typed_in_tx.send(frame);
                         }
-                        Err(e) => warn!("build sdp: {e}"),
+                        SignalFrame::Ice { candidate } => {
+                            if let Some(c) = candidate {
+                                let mut init: RTCIceCandidateInit = match serde_json::from_value(c.clone()) {
+                                    Ok(v) => v,
+                                    Err(e) => { warn!("ice decode: {e}"); continue; }
+                                };
+                                // Firefox (and Chrome by default) obfuscates host
+                                // candidates as mDNS `.local` hostnames. webrtc-rs
+                                // doesn't resolve those, so the resulting candidate
+                                // is unusable. Resolve `.local` via the system
+                                // resolver (which honours libnss-mdns / avahi on
+                                // Linux, mDNSResponder on macOS) and rewrite the
+                                // candidate string with the resolved IP before
+                                // handing to add_ice_candidate. On resolution
+                                // failure we drop the candidate — the browser will
+                                // usually also emit a srflx candidate we can pair
+                                // with instead.
+                                if let Some(resolved) = maybe_resolve_mdns_candidate(&init.candidate).await {
+                                    init.candidate = resolved;
+                                }
+                                if let Err(e) = pc.add_remote_candidate(init) {
+                                    warn!("add_ice_candidate: {e}");
+                                }
+                            }
+                            let _ = typed_in_tx.send(frame);
+                        }
+                        _ => {
+                            let _ = typed_in_tx.send(frame);
+                        }
                     }
-                    let _ = typed_in_clone.send(frame);
-                }
-                SignalFrame::Ice { candidate } => {
-                    if let Some(c) = candidate {
-                        let mut init: RTCIceCandidateInit = match serde_json::from_value(c.clone()) {
-                            Ok(v) => v,
-                            Err(e) => { warn!("ice decode: {e}"); continue; }
-                        };
-                        // Firefox (and Chrome by default) obfuscates host
-                        // candidates as mDNS `.local` hostnames. webrtc-rs
-                        // doesn't resolve those, so the resulting candidate
-                        // is unusable. Resolve `.local` via the system
-                        // resolver (which honours libnss-mdns / avahi on
-                        // Linux, mDNSResponder on macOS) and rewrite the
-                        // candidate string with the resolved IP before
-                        // handing to add_ice_candidate. On resolution
-                        // failure we drop the candidate — the browser will
-                        // usually also emit a srflx candidate we can pair
-                        // with instead.
-                        if let Some(resolved) = maybe_resolve_mdns_candidate(&init.candidate).await {
-                            init.candidate = resolved;
-                        }
-                        if let Err(e) = pc_in.add_remote_candidate(init) {
-                            warn!("add_ice_candidate: {e}");
-                        }
-                    }
-                    let _ = typed_in_clone.send(frame);
-                }
-                _ => {
-                    let _ = typed_in_clone.send(frame);
                 }
             }
         }
