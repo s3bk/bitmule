@@ -378,11 +378,13 @@ pub(crate) async fn maybe_resolve_mdns_candidate(candidate_line: &str) -> Option
     let addr = parts[4];
     if !addr.ends_with(".local") { return None; }
 
-    // System resolver lookup with a 500ms timeout so a broken mDNS setup
-    // doesn't stall the ICE pump.
+    // System resolver lookup — avahi typically resolves .local names in
+    // ~1-3s (multicast query + response wait), longer under load, so we
+    // give it 5s before giving up. Below that we get spurious drops on
+    // healthy stacks (observed 2026-09-02 on Seb's box).
     let lookup_host = format!("{addr}:0");
     let resolved = match tokio::time::timeout(
-        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(5),
         tokio::net::lookup_host(lookup_host),
     ).await {
         Ok(Ok(mut iter)) => iter.next(),
