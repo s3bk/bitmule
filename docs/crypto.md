@@ -105,6 +105,60 @@ B = ChaCha20-Poly1305-Decrypt(wrap_key, nonce, enc_B, aad="")
 `wrap_key` (and `S`) are dropped (zeroized) as soon as `B` is in hand;
 they aren't needed for the bulk stream.
 
+## Meta frame encryption
+
+Per Seb 2026-09-03: the meta frame carries file metadata (name, size,
+chunk boundaries, compression choice, optional identity signature).
+Attackers may PLAUSIBLY know some of these fields from out-of-band
+context, so meta encryption is designed such that a known-plaintext
+meta doesn't leak S or B.
+
+```
+meta_key = HKDF-SHA256(
+             ikm  = S,
+             salt = session_id,
+             info = b"transfer-v1 meta-key",
+             length = 32,
+           )
+```
+
+`meta_key` is DISTINCT from both `wrap_key` and `B`. Deriving them
+from S with different `info` strings guarantees a break of any one
+key does not propagate to the others.
+
+```
+meta_nonce = 12 random bytes
+meta_ct    = ChaCha20-Poly1305(meta_key, meta_nonce, plaintext=meta_json, aad=session_id)
+```
+
+The AAD binds the ciphertext to this specific session — replaying
+meta from one session into another (even with the same A) fails the
+AEAD check because session_ids differ across replays. (In practice
+same-A cross-session replay isn't a real risk since ephemerals + B
+also differ, but the bound AAD is a cheap belt-and-suspenders.)
+
+### Optional meta signing
+
+If the sender has a bitmule identity keypair (Ed25519), they may
+sign the meta:
+
+```
+sig_hash = SHA256(session_id || meta_nonce || meta_ct)
+signature = Ed25519_sign(sender_identity_priv, sig_hash)
+```
+
+The signature covers the exact session + ciphertext + nonce, so an
+attacker cannot lift a signature onto a different meta or replay
+across sessions. Receiver verifies with the sender's Ed25519 public
+key (out-of-band via prior contact-add) before decrypting.
+
+Signature ships alongside meta ciphertext:
+
+```
+{"type":"meta_enc", "nonce":"<hex-24>", "ct":"<hex-var>",
+ "sig":"<hex-128>?", "signer_pub":"<hex-64>?"}
+```
+
 ## Chunk encryption
 
 Each file chunk (whatever size the transport uses — 16 KiB for WebRTC

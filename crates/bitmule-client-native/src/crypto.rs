@@ -184,6 +184,68 @@ impl SessionKey {
             .expect("32 bytes fits within HKDF-SHA256 output length");
         WrapKey(out)
     }
+
+    /// Derive a DEDICATED meta-encryption key from S. Distinct from
+    /// wrap_key and B so a break of any one key doesn't propagate to
+    /// the others. Per Seb 2026-09-03: meta encryption must guard S + B
+    /// even if the plaintext meta is known to the attacker — using a
+    /// separate derived key (belt-and-suspenders beyond AEAD's own
+    /// known-plaintext resistance) satisfies that.
+    pub fn meta_key(&self, session_id: &[u8; 32]) -> MetaKey {
+        let hkdf = Hkdf::<Sha256>::new(Some(session_id), &self.0);
+        let mut out = [0u8; 32];
+        hkdf.expand(b"transfer-v1 meta-key", &mut out)
+            .expect("32 bytes fits within HKDF-SHA256 output length");
+        MetaKey(out)
+    }
+}
+
+/// Purpose-specific 32-byte AEAD key for encrypting the meta frame.
+/// Derived from S with the "transfer-v1 meta-key" info string, so it's
+/// distinct from both wrap_key (which encrypts B) and B (which encrypts
+/// chunks). A break of any one key doesn't leak the others.
+pub struct MetaKey(pub [u8; 32]);
+impl Drop for MetaKey { fn drop(&mut self) { self.0.zeroize(); } }
+
+impl MetaKey {
+    /// Encrypt the meta JSON bytes with a fresh random nonce.
+    /// AAD is bound to `session_id` so an attacker can't replay a meta
+    /// frame from one session into another (even with the same URL A,
+    /// session_ids match but wrap keys differ — this belts + suspenders
+    /// prevents any cross-session mixing).
+    pub fn encrypt_meta(&self, session_id: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ct = cipher
+            .encrypt(&nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad: session_id })
+            .map_err(|e| anyhow!("encrypt_meta: {e}"))?;
+        Ok((nonce.to_vec(), ct))
+    }
+
+    pub fn decrypt_meta(&self, session_id: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
+        if nonce.len() != 12 { bail!("meta nonce must be 12 bytes"); }
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.0));
+        cipher
+            .decrypt(Nonce::from_slice(nonce), chacha20poly1305::aead::Payload { msg: ct, aad: session_id })
+            .map_err(|e| anyhow!("decrypt_meta: {e}"))
+    }
+
+    /// Convenience: given a sender identity's Ed25519 signing key, sign
+    /// SHA256(session_id || meta_nonce || meta_ct). Binds the signature
+    /// to the exact session + exact ciphertext + nonce, so an attacker
+    /// can't lift a signature from one meta into another session or
+    /// re-sign a mutated ciphertext.
+    ///
+    /// Receiver verifies by recomputing the same hash and calling
+    /// ed25519's `verify_strict`. Signing is OPTIONAL — anonymous
+    /// transfers work with no signature at all.
+    pub fn meta_signing_hash(session_id: &[u8; 32], nonce: &[u8], ct: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(session_id);
+        hasher.update(nonce);
+        hasher.update(ct);
+        hasher.finalize().into()
+    }
 }
 
 /// Purpose-specific 32-byte AEAD key derived from S + session_id.
@@ -329,5 +391,29 @@ mod tests {
         let hex = a.to_hex();
         let a2 = ShareKey::from_hex(&hex).unwrap();
         assert_eq!(a.0, a2.0);
+    }
+
+    #[test]
+    fn meta_encrypt_decrypt_roundtrip_binds_session() {
+        let s = SessionKey({ let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b });
+        let session_id_a = { let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b };
+        let session_id_b = { let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b };
+        let mk = s.meta_key(&session_id_a);
+        let plaintext = br#"{"type":"meta","name":"file.bin","size":42}"#;
+        let (nonce, ct) = mk.encrypt_meta(&session_id_a, plaintext).unwrap();
+        // correct session_id decrypts
+        let pt = mk.decrypt_meta(&session_id_a, &nonce, &ct).unwrap();
+        assert_eq!(pt, plaintext);
+        // wrong session_id in AAD fails
+        assert!(mk.decrypt_meta(&session_id_b, &nonce, &ct).is_err());
+    }
+
+    #[test]
+    fn wrap_and_meta_keys_are_distinct() {
+        let s = SessionKey({ let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b });
+        let sid = { let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b };
+        let w = s.wrap_key(&sid);
+        let m = s.meta_key(&sid);
+        assert_ne!(w.0, m.0);
     }
 }
