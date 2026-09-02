@@ -39,21 +39,21 @@ pub const CHUNK_BYTES: usize = 16 * 1024;
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct MetaFrame {
+pub(crate) struct MetaFrame {
     #[serde(rename = "type")]
-    ty: String,
-    name: String,
-    size: u64,
+    pub ty: String,
+    pub name: String,
+    pub size: u64,
     #[serde(rename = "chunkBytes")]
-    chunk_bytes: u32,
+    pub chunk_bytes: u32,
     #[serde(rename = "totalChunks")]
-    total_chunks: u64,
+    pub total_chunks: u64,
 }
 
 /// Reject any name that would escape `out_dir` or is otherwise unsafe on
 /// the local filesystem. Keeps only the file-name component. Returns a
 /// safe fallback if the sender's `name` degenerates to nothing.
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     let stripped = std::path::Path::new(name)
         .file_name()
         .and_then(|s| s.to_str())
