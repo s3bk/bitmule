@@ -174,7 +174,7 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".to_string());
     let mut last_pct = 0u64;
-    send_file(server, session_id.clone(), path.clone(), mode, move |sent, total, _name| {
+    send_file(server, session_id.clone(), &path, mode, move |sent, total| {
         if total == 0 { return }
         let pct = sent * 100 / total;
         if pct != last_pct {
@@ -220,7 +220,7 @@ async fn cmd_recv(
     std::io::stdout().flush().ok();
 
     let mut last_pct = 0u64;
-    let path = recv_file(server, session_id, out, mode, move |received, total, name| {
+    let path = recv_file(server, session_id, &out, mode, move |received, total, name| {
         if total == 0 { return }
         let pct = received * 100 / total;
         if pct != last_pct {

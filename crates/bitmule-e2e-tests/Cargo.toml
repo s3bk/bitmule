@@ -1,0 +1,19 @@
+[package]
+name = "bitmule-e2e-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "End-to-end tests: all combinations of CLI and web-interface sender/receiver, backed by a bitmule-server that the tests auto-start when BITMULE_SERVER is unset."
+
+[dependencies]
+
+[dev-dependencies]
+anyhow = "1"
+rand = "0.8"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thirtyfour = "0.35"
+tokio = { version = "1", features = ["full"] }
