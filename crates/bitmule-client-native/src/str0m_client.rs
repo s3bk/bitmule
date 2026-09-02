@@ -895,12 +895,16 @@ fn parse_ws_frame(msg: Option<Result<Message, tokio_tungstenite::tungstenite::Er
 /// (the peer usually also emits a srflx candidate we can pair with).
 async fn parse_ice_candidate(v: &serde_json::Value) -> Option<Candidate> {
     let line = v.get("candidate")?.as_str()?;
-    if line.is_empty() { return None; }
+    if line.is_empty() {
+        info!("remote ICE candidate: <end-of-candidates>");
+        return None;
+    }
+    info!("remote ICE candidate: {line}");
     let resolved: String = if line.split_whitespace().nth(4).map_or(false, |a| a.ends_with(".local")) {
         match crate::maybe_resolve_mdns_candidate(line).await {
-            Some(r) => r,
+            Some(r) => { info!("  → mdns resolved: {r}"); r }
             None => {
-                debug!("dropping unresolvable mdns ICE candidate");
+                info!("  → mdns resolve FAILED, dropping candidate");
                 return None;
             }
         }
@@ -908,7 +912,7 @@ async fn parse_ice_candidate(v: &serde_json::Value) -> Option<Candidate> {
         line.to_string()
     };
     match Candidate::from_sdp_string(&resolved) {
-        Ok(c) => Some(c),
-        Err(e) => { warn!("bad ice candidate: {e}"); None }
+        Ok(c) => { info!("  → added to str0m"); Some(c) }
+        Err(e) => { warn!("  → bad ice candidate: {e}"); None }
     }
 }
