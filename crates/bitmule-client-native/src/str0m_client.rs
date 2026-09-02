@@ -554,6 +554,174 @@ async fn drain_rtc_capture_data(
     }
 }
 
+// ---- top-level dispatchers (unify DC + relay per TransportMode) ---------
+
+use crate::{TransportMode, WEBRTC_FALLBACK_MS};
+
+/// Send `file_path` over a fresh session. Dispatch by TransportMode:
+/// - `Webrtc`: send_connect → send_file_over_dc.
+/// - `Relay`: open a ws, spawn a pumper task, forward to send_file_over_relay.
+/// - `Auto`: try Webrtc with `WEBRTC_FALLBACK_MS` deadline for the DC to
+///   open; on timeout or error, fall back to Relay. Progress ticks from
+///   the aborted WebRTC attempt are lost by the fallback — the relay
+///   path starts from 0 on the retry.
+pub async fn send_file(
+    server_url_http: &str,
+    session_id: SessionId,
+    file_path: &Path,
+    mode: TransportMode,
+    on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<()> {
+    match mode {
+        TransportMode::Webrtc => send_file_webrtc(server_url_http, session_id, file_path, on_progress).await,
+        TransportMode::Relay => send_file_relay(server_url_http, session_id, file_path, on_progress).await,
+        TransportMode::Auto => {
+            let dur = std::time::Duration::from_millis(WEBRTC_FALLBACK_MS);
+            // We split on_progress so the fallback retry has its own callback
+            // clone. The progress fn is FnMut so we can't clone it directly;
+            // wrap in Arc<Mutex<_>> and let each attempt call through.
+            let progress = std::sync::Arc::new(tokio::sync::Mutex::new(on_progress));
+            let webrtc_progress = progress.clone();
+            let webrtc_fut = async {
+                let mut sess = tokio::time::timeout(dur, send_connect(server_url_http, session_id.clone())).await
+                    .map_err(|_| anyhow!("webrtc DC open exceeded {} ms", WEBRTC_FALLBACK_MS))??;
+                send_file_over_dc(&mut sess, file_path, |a, b| {
+                    if let Ok(mut g) = webrtc_progress.try_lock() { g(a, b); }
+                }).await
+            };
+            match webrtc_fut.await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    warn!("webrtc path failed ({e}), falling back to relay");
+                    let relay_progress = progress.clone();
+                    send_file_relay(server_url_http, session_id, file_path, move |a, b| {
+                        if let Ok(mut g) = relay_progress.try_lock() { g(a, b); }
+                    }).await
+                }
+            }
+        }
+    }
+}
+
+/// Receive one file for `session_id`. Same dispatch shape as [`send_file`].
+pub async fn recv_file(
+    server_url_http: &str,
+    session_id: SessionId,
+    out_dir: &Path,
+    mode: TransportMode,
+    on_progress: impl FnMut(u64, u64, &str) + Send,
+) -> Result<PathBuf> {
+    match mode {
+        TransportMode::Webrtc => recv_file_webrtc(server_url_http, session_id, out_dir, on_progress).await,
+        TransportMode::Relay => recv_file_relay(server_url_http, session_id, out_dir, on_progress).await,
+        TransportMode::Auto => {
+            let dur = std::time::Duration::from_millis(WEBRTC_FALLBACK_MS);
+            let progress = std::sync::Arc::new(tokio::sync::Mutex::new(on_progress));
+            let webrtc_progress = progress.clone();
+            let webrtc_fut = async {
+                let mut sess = tokio::time::timeout(dur, recv_connect(server_url_http, session_id.clone())).await
+                    .map_err(|_| anyhow!("webrtc DC open exceeded {} ms", WEBRTC_FALLBACK_MS))??;
+                recv_file_over_dc(&mut sess, out_dir, |a, b, n| {
+                    if let Ok(mut g) = webrtc_progress.try_lock() { g(a, b, n); }
+                }).await
+            };
+            match webrtc_fut.await {
+                Ok(p) => Ok(p),
+                Err(e) => {
+                    warn!("webrtc path failed ({e}), falling back to relay");
+                    let relay_progress = progress.clone();
+                    recv_file_relay(server_url_http, session_id, out_dir, move |a, b, n| {
+                        if let Ok(mut g) = relay_progress.try_lock() { g(a, b, n); }
+                    }).await
+                }
+            }
+        }
+    }
+}
+
+// One-shot helpers per transport — avoid repeating the wire-up.
+
+async fn send_file_webrtc(
+    server_url_http: &str,
+    session_id: SessionId,
+    file_path: &Path,
+    on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<()> {
+    let mut sess = send_connect(server_url_http, session_id).await?;
+    send_file_over_dc(&mut sess, file_path, on_progress).await
+}
+
+async fn recv_file_webrtc(
+    server_url_http: &str,
+    session_id: SessionId,
+    out_dir: &Path,
+    on_progress: impl FnMut(u64, u64, &str) + Send,
+) -> Result<PathBuf> {
+    let mut sess = recv_connect(server_url_http, session_id).await?;
+    recv_file_over_dc(&mut sess, out_dir, on_progress).await
+}
+
+async fn send_file_relay(
+    server_url_http: &str,
+    session_id: SessionId,
+    file_path: &Path,
+    on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<()> {
+    let session_hex = session_id.as_hex();
+    let ws = crate::open_ws(server_url_http, &session_hex).await?;
+    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let progress = std::sync::Arc::new(tokio::sync::Mutex::new(crate::RelaySendProgress::default()));
+    let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
+    crate::send_file_over_relay(server_url_http, &session_id, file_path, out_tx, progress, on_progress).await
+}
+
+async fn recv_file_relay(
+    server_url_http: &str,
+    session_id: SessionId,
+    out_dir: &Path,
+    on_progress: impl FnMut(u64, u64, &str) + Send,
+) -> Result<PathBuf> {
+    let session_hex = session_id.as_hex();
+    let ws = crate::open_ws(server_url_http, &session_hex).await?;
+    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
+    let _ = out_tx; // relay recv only reads; sender kept alive so pumper's send half stays valid
+    crate::recv_file_over_relay(server_url_http, &session_id, out_dir, in_rx, on_progress).await
+}
+
+/// Simple ws pumper for the relay path — moves outgoing raw strings from
+/// `out_rx` onto the ws, and forwards ws text frames into `in_tx`. Runs
+/// until either side closes.
+async fn pump_relay_ws(
+    mut ws: Ws,
+    mut out_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    in_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    loop {
+        tokio::select! {
+            maybe_msg = ws.next() => {
+                match maybe_msg {
+                    Some(Ok(Message::Text(t))) => {
+                        if in_tx.send(t.to_string()).is_err() { break; }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => { warn!("relay ws recv: {e}"); break; }
+                    _ => {}
+                }
+            }
+            maybe_out = out_rx.recv() => {
+                let Some(text) = maybe_out else { break };
+                if let Err(e) = ws.send(Message::Text(text.into())).await {
+                    warn!("relay ws send: {e}");
+                    break;
+                }
+            }
+        }
+    }
+}
+
 // ---- run-loop core ------------------------------------------------------
 
 /// Drain poll_output until Timeout. Bail on ICE disconnect. Other events
