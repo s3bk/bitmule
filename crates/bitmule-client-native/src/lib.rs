@@ -1039,31 +1039,24 @@ pub async fn send_file(
         TransportMode::Auto => {}
     }
 
-    // Auto: race WebRTC negotiation vs 3s timer. Whichever fires first
-    // decides the transport. The other is cancelled cleanly.
+    // Auto: wait for the receiver's peer_hello FIRST, then race WebRTC
+    // negotiation vs 3s timer. Previously the timer started at send-start,
+    // which meant a receiver that took >3s to click the link locked us
+    // into the relay path even though WebRTC would have worked. Now the
+    // 3s cap only starts once the receiver has actually connected.
+    info!("auto: waiting for receiver peer_hello before starting webrtc negotiation");
+    loop {
+        let frame = typed_in.recv().await
+            .ok_or_else(|| anyhow!("ws closed before peer_hello"))?;
+        if matches!(frame, SignalFrame::PeerHello { .. }) { break; }
+    }
+    info!("auto: receiver connected, opening webrtc with {WEBRTC_FALLBACK_MS}ms cap");
 
-    // Handle peer_hello → offer in a task so it runs alongside the timer.
-    let typed_out_offer = typed_out.clone();
-    let pc_offer = pc.clone();
-    let offer_task = tokio::spawn(async move {
-        loop {
-            let frame = match typed_in.recv().await {
-                Some(f) => f, None => return,
-            };
-            if matches!(frame, SignalFrame::PeerHello { .. }) {
-                match pc_offer.create_offer(None).await {
-                    Ok(offer) => {
-                        if let Err(e) = pc_offer.set_local_description(offer.clone()).await {
-                            warn!("set_local: {e}"); return;
-                        }
-                        let _ = typed_out_offer.send(SignalFrame::Sdp { kind: "offer".into(), sdp: offer.sdp });
-                    }
-                    Err(e) => { warn!("create_offer: {e}"); return; }
-                }
-                return;
-            }
-        }
-    });
+    let offer = pc.create_offer(None).await
+        .map_err(|e| anyhow!("create_offer: {e}"))?;
+    pc.set_local_description(offer.clone()).await
+        .map_err(|e| anyhow!("set_local_description: {e}"))?;
+    typed_out.send(SignalFrame::Sdp { kind: "offer".into(), sdp: offer.sdp })?;
 
     let dc_ready_clone = dc_ready.clone();
     let timer = tokio::time::sleep(Duration::from_millis(WEBRTC_FALLBACK_MS));
@@ -1076,7 +1069,6 @@ pub async fn send_file(
     tokio::select! {
         _ = &mut dc_wait => {
             if dc.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
-                let _ = offer_task;
                 info!("auto: DC open, using WebRTC");
                 send_file_over_dc(dc.clone(), &file_path, move |s, t| prog_cb(s, t, &fname)).await?;
                 peer_joined_task.abort();
@@ -1084,7 +1076,7 @@ pub async fn send_file(
             }
         }
         _ = &mut timer => {
-            info!("auto: {WEBRTC_FALLBACK_MS}ms elapsed without DC; falling back to relay");
+            info!("auto: {WEBRTC_FALLBACK_MS}ms after peer arrival without DC; falling back to relay");
         }
     }
     // Fallback: relay upload. offer_task keeps running (if peer_hello
