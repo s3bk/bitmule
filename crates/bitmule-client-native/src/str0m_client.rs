@@ -43,18 +43,38 @@ pub struct LiveSession {
     pub channel_id: ChannelId,
 }
 
-/// Build a fresh Rtc + bind a UDP socket + register the socket's local
-/// addr as a host candidate.
+/// Build a fresh Rtc + bind a UDP socket + register a host candidate.
+///
+/// str0m rejects `0.0.0.0` in a Candidate::host (unspecified address is
+/// not a routable peer target). We bind on `0.0.0.0:0` so the OS gives us
+/// a port on every interface, then discover our outbound interface IP by
+/// asking the OS for the source address of a route to a public dest
+/// (we don't actually send — just query the routing table via connect).
 async fn build_rtc() -> Result<(Rtc, Arc<UdpSocket>)> {
     let socket = UdpSocket::bind("0.0.0.0:0").await.context("bind udp")?;
-    let local = socket.local_addr().context("local_addr")?;
+    let port = socket.local_addr()?.port();
+    let local_ip = discover_outbound_ip().await
+        .context("discover outbound interface IP for ICE host candidate")?;
+    let cand_addr = std::net::SocketAddr::new(local_ip, port);
     let socket = Arc::new(socket);
 
     let mut rtc = Rtc::new(Instant::now());
-    let cand = Candidate::host(local, "udp").map_err(|e| anyhow!("host candidate: {e}"))?;
+    let cand = Candidate::host(cand_addr, "udp").map_err(|e| anyhow!("host candidate: {e}"))?;
     rtc.add_local_candidate(cand);
 
     Ok((rtc, socket))
+}
+
+/// Find a routable local interface IP by opening a scratch UDP socket to
+/// a public address (Google DNS) — no bytes are sent, the connect() call
+/// just makes the OS pick the outbound interface. Falls back to
+/// 127.0.0.1 for isolated/loopback-only test environments.
+async fn discover_outbound_ip() -> Result<std::net::IpAddr> {
+    let probe = UdpSocket::bind("0.0.0.0:0").await?;
+    match probe.connect("8.8.8.8:80").await {
+        Ok(()) => Ok(probe.local_addr()?.ip()),
+        Err(_) => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+    }
 }
 
 /// Sender entry point — active side: create data channel, produce offer,
