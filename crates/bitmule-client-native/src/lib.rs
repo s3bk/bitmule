@@ -21,35 +21,24 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, sync::Arc, time::Duration};
+use webrtc::{data_channel::{DataChannel, DataChannelEvent}, peer_connection::{MediaEngine, PeerConnection, PeerConnectionBuilder, RTCConfiguration, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnection, RTCSessionDescription, Registry, register_default_interceptors}};
+use std::{net::IpAddr, path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncReadExt,
     sync::{mpsc, Mutex},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
-use webrtc::{
-    api::{
-        interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder,
-    },
-    data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel},
-    ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
-    interceptor::registry::Registry,
-    peer_connection::{
-        configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
-        RTCPeerConnection,
-    },
-};
 
 /// 16 KiB is the SCTP-safe universal message size (Firefox cap). Matches
 /// the browser side (`web/main.js` CONFIG.chunkBytes) so a native sender
 /// and a browser receiver see identical framing.
 pub const CHUNK_BYTES: usize = 16 * 1024;
 const BUFFERED_HIGH_WATER: usize = 4 * 1024 * 1024;
-const BUFFERED_LOW_WATER: usize = 1 * 1024 * 1024;
+const BUFFERED_LOW_WATER: u32 = 1 * 1024 * 1024;
 const BACKPRESSURE_POLL: Duration = Duration::from_millis(10);
 
 /// Send a file over an opened WebRTC data channel using the same wire
@@ -65,7 +54,7 @@ const BACKPRESSURE_POLL: Duration = Duration::from_millis(10);
 /// bounded latency (10ms poll) and no shared-state plumbing between the
 /// callback and this async loop.
 pub async fn send_file_over_dc(
-    dc: Arc<RTCDataChannel>,
+    dc: Arc<dyn DataChannel>,
     file_path: &Path,
     mut on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
@@ -89,7 +78,7 @@ pub async fn send_file_over_dc(
         "chunkBytes": CHUNK_BYTES,
         "totalChunks": total_chunks,
     });
-    dc.send_text(meta.to_string())
+    dc.send_text(&meta.to_string())
         .await
         .map_err(|e| anyhow!("dc send meta: {e}"))?;
 
@@ -106,27 +95,28 @@ pub async fn send_file_over_dc(
         if n == 0 {
             break;
         }
-        // Backpressure: pause sending while the SCTP send queue is above
-        // the high-water mark. Poll at BACKPRESSURE_POLL granularity;
-        // bounded to a small tail wait so the file finish is prompt.
-        while dc.buffered_amount().await > BUFFERED_HIGH_WATER {
-            tokio::time::sleep(BACKPRESSURE_POLL).await;
-        }
-        let payload = Bytes::copy_from_slice(&buf[..n]);
-        dc.send(&payload)
+        dc.writable().await?;
+
+        let payload = BytesMut::from(&buf[..n]);
+        dc.send(payload)
             .await
             .map_err(|e| anyhow!("dc send chunk: {e}"))?;
         sent += n as u64;
         on_progress(sent, size);
     }
 
-    dc.send_text(r#"{"type":"done"}"#.to_string())
+    dc.send_text(r#"{"type":"done"}"#)
         .await
         .map_err(|e| anyhow!("dc send done: {e}"))?;
 
     // Ensure the SCTP queue drains before the caller closes the DC.
-    while dc.buffered_amount().await > 0usize {
-        tokio::time::sleep(BACKPRESSURE_POLL).await;
+    dc.set_buffered_amount_low_threshold(0).await;
+    while let Some(ev) = dc.poll().await {
+        match ev {
+            DataChannelEvent::OnBufferedAmountLow => break,
+            DataChannelEvent::OnClose => break,
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -139,121 +129,74 @@ pub async fn send_file_over_dc(
 /// DC closes before `done`, returns an error and the partial file stays
 /// on disk (caller can decide whether to unlink or resume).
 pub async fn recv_file_over_dc(
-    dc: Arc<RTCDataChannel>,
+    dc: Arc<dyn DataChannel>,
     out_dir: &Path,
     mut on_progress: impl FnMut(u64, u64, &str) + Send,
 ) -> Result<std::path::PathBuf> {
-    #[derive(Debug)]
-    enum RxEvent {
-        Meta(MetaFrame),
-        Chunk(Bytes),
-        Done,
-    }
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<RxEvent>();
-    let close_notify = Arc::new(tokio::sync::Notify::new());
-
     tokio::fs::create_dir_all(out_dir)
         .await
         .with_context(|| format!("mkdir -p {}", out_dir.display()))?;
-
-    // on_message pushes events into the channel; the main task below
-    // drains them and writes to disk. Errors in the callback are logged
-    // rather than surfaced — the caller sees them via the closed channel.
-    let tx_msg = tx.clone();
-    dc.on_message(Box::new(move |msg: DataChannelMessage| {
-        let tx = tx_msg.clone();
-        Box::pin(async move {
-            if msg.is_string {
-                let text = match std::str::from_utf8(&msg.data) {
-                    Ok(s) => s.to_string(),
-                    Err(_) => return,
-                };
-                let value: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                match value.get("type").and_then(|x| x.as_str()) {
-                    Some("meta") => {
-                        if let Ok(m) = serde_json::from_value::<MetaFrame>(value) {
-                            let _ = tx.send(RxEvent::Meta(m));
-                        } else {
-                            warn!("dc meta decode failed");
-                        }
-                    }
-                    Some("done") => {
-                        let _ = tx.send(RxEvent::Done);
-                    }
-                    _ => {}
-                }
-            } else {
-                let _ = tx.send(RxEvent::Chunk(msg.data));
-            }
-        })
-    }));
-
-    let close_notify2 = close_notify.clone();
-    dc.on_close(Box::new(move || {
-        let n = close_notify2.clone();
-        Box::pin(async move {
-            n.notify_waiters();
-        })
-    }));
 
     let mut meta_opt: Option<MetaFrame> = None;
     let mut file_opt: Option<tokio::fs::File> = None;
     let mut path_opt: Option<std::path::PathBuf> = None;
     let mut received: u64 = 0;
-    let mut done = false;
 
-    loop {
-        tokio::select! {
-            biased;
-            ev = rx.recv() => {
-                let Some(ev) = ev else { break };
-                match ev {
-                    RxEvent::Meta(m) => {
-                        let name = sanitize_filename(&m.name);
-                        let path = out_dir.join(&name);
-                        let file = tokio::fs::File::create(&path)
-                            .await
-                            .with_context(|| format!("create {}", path.display()))?;
-                        on_progress(0, m.size, &m.name);
-                        file_opt = Some(file);
-                        path_opt = Some(path);
-                        meta_opt = Some(m);
-                    }
-                    RxEvent::Chunk(bytes) => {
-                        if let Some(f) = file_opt.as_mut() {
-                            use tokio::io::AsyncWriteExt;
-                            f.write_all(&bytes).await?;
-                            received += bytes.len() as u64;
-                            if let Some(m) = meta_opt.as_ref() {
-                                on_progress(received, m.size, &m.name);
+    while let Some(ev) = dc.poll().await {
+        match ev {
+            DataChannelEvent::OnMessage(msg) => {
+                if msg.is_string {
+                    let text = match std::str::from_utf8(&msg.data) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => break,
+                    };
+                    let value: serde_json::Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    match value.get("type").and_then(|x| x.as_str()) {
+                        Some("meta") => {
+                            if let Ok(m) = serde_json::from_value::<MetaFrame>(value) {
+                                let name = sanitize_filename(&m.name);
+                                let path = out_dir.join(&name);
+                                let file = tokio::fs::File::create(&path)
+                                    .await
+                                    .with_context(|| format!("create {}", path.display()))?;
+                                on_progress(0, m.size, &m.name);
+                                file_opt = Some(file);
+                                path_opt = Some(path);
+                                meta_opt = Some(m);
+                            } else {
+                                warn!("dc meta decode failed");
                             }
                         }
-                    }
-                    RxEvent::Done => {
-                        if let Some(mut f) = file_opt.take() {
-                            use tokio::io::AsyncWriteExt;
-                            f.flush().await?;
-                            f.sync_all().await?;
+                        Some("done") => {
+                            if let Some(mut f) = file_opt.take() {
+                                use tokio::io::AsyncWriteExt;
+                                f.flush().await?;
+                                f.sync_all().await?;
+                            }
+                            break;
                         }
-                        done = true;
-                        break;
+                        _ => {}
+                    }
+                } else {
+                    let bytes = msg.data;
+                    if let Some(f) = file_opt.as_mut() {
+                        use tokio::io::AsyncWriteExt;
+                        f.write_all(&bytes).await?;
+                        received += bytes.len() as u64;
+                        if let Some(m) = meta_opt.as_ref() {
+                            on_progress(received, m.size, &m.name);
+                        }
                     }
                 }
             }
-            _ = close_notify.notified() => {
-                bail!("data channel closed before done (received {received}/{} bytes)",
-                    meta_opt.as_ref().map(|m| m.size).unwrap_or(0));
-            }
+            DataChannelEvent::OnClose => break,
+            _ => {}
         }
     }
 
-    if !done {
-        bail!("data channel event stream ended without a done frame");
-    }
     path_opt.ok_or_else(|| anyhow!("no meta received before done"))
 }
 
@@ -535,8 +478,8 @@ struct MetaRelayFrame {
 pub struct LiveSession {
     pub session_id: SessionId,
     pub role: Role,
-    pub pc: Arc<RTCPeerConnection>,
-    pub dc: Arc<RTCDataChannel>,
+    pub pc: Arc<dyn PeerConnection>,
+    pub dc: Arc<dyn DataChannel>,
     _ws_task: tokio::task::JoinHandle<()>,
 }
 
@@ -594,32 +537,31 @@ async fn open_ws(server_url: &str, session_hex: &str) -> Result<Ws> {
     Ok(ws)
 }
 
-async fn build_peer_connection() -> Result<Arc<RTCPeerConnection>> {
+async fn build_peer_connection() -> Result<Arc<dyn PeerConnection>> {
     let mut me = MediaEngine::default();
     me.register_default_codecs().map_err(|e| anyhow!("register codecs: {e}"))?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut me)
-        .map_err(|e| anyhow!("register interceptors: {e}"))?;
-    let api = APIBuilder::new()
+
+    let registry = Registry::new();
+    let registry = register_default_interceptors(registry, &mut me)?;
+
+    let pc = PeerConnectionBuilder::<(IpAddr, u16)>::new()
         .with_media_engine(me)
-        .with_interceptor_registry(registry)
-        .build();
-    let cfg = RTCConfiguration {
-        ice_servers: vec![
-            RTCIceServer {
-                urls: vec![
-                    "stun:stun.l.google.com:19302".to_owned(),
-                    "stun:stun1.l.google.com:19302".to_owned(),
-                ],
-                ..Default::default()
-            },
-        ],
-        ..Default::default()
-    };
-    let pc = api
-        .new_peer_connection(cfg)
+        .with_interceptor_registry(registry)  // ← No arguments needed!
+        .with_configuration(RTCConfigurationBuilder::new()
+            .with_ice_servers(vec![
+                RTCIceServer {
+                    urls: vec![
+                        "stun:stun.l.google.com:19302".to_owned(),
+                        "stun:stun1.l.google.com:19302".to_owned(),
+                    ],
+                    ..Default::default()
+                },
+            ]).build()
+        )
+        .build()
         .await
         .map_err(|e| anyhow!("new_peer_connection: {e}"))?;
+
     Ok(Arc::new(pc))
 }
 
@@ -638,7 +580,7 @@ struct WsHandles {
 
 fn drive_ws(
     ws: Ws,
-    pc: Arc<RTCPeerConnection>,
+    mut pc: RTCPeerConnection,
     dc_ready: Arc<tokio::sync::Notify>,
 ) -> WsHandles {
     let (typed_out, mut typed_out_rx) = mpsc::unbounded_channel::<SignalFrame>();
@@ -646,7 +588,6 @@ fn drive_ws(
     let (raw_out, mut raw_out_rx) = mpsc::unbounded_channel::<String>();
     let (raw_in_tx, raw_in) = mpsc::unbounded_channel::<String>();
 
-    let (sink, mut stream) = ws.split();
     let sink = Arc::new(Mutex::new(sink));
 
     // Outbound pump — typed frames.
@@ -678,7 +619,6 @@ fn drive_ws(
     });
 
     // Inbound pump: parse + route + always mirror raw text into raw_in.
-    let pc_in = pc.clone();
     let typed_in_clone = typed_in_tx.clone();
     let raw_in_clone = raw_in_tx.clone();
     let handle = tokio::spawn(async move {
@@ -708,7 +648,7 @@ fn drive_ws(
                     };
                     match desc {
                         Ok(d) => {
-                            if let Err(e) = pc_in.set_remote_description(d).await {
+                            if let Err(e) = pc_in.set_remote_description(d) {
                                 warn!("set_remote_description: {e}");
                             }
                         }
@@ -736,7 +676,7 @@ fn drive_ws(
                         if let Some(resolved) = maybe_resolve_mdns_candidate(&init.candidate).await {
                             init.candidate = resolved;
                         }
-                        if let Err(e) = pc_in.add_ice_candidate(init).await {
+                        if let Err(e) = pc_in.add_remote_candidate(init) {
                             warn!("add_ice_candidate: {e}");
                         }
                     }
