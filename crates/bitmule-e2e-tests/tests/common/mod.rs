@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
+use tempfile::TempDir;
 use std::{
     net::TcpStream,
     path::{Path, PathBuf},
@@ -28,6 +29,7 @@ pub struct Env {
     // matters for graceful shutdown: webdriver first, then the server.
     pub _webdriver: Option<Child>,
     pub _server: Option<Child>,
+    pub data_dir: TempDir,
 }
 
 impl Env {
@@ -37,10 +39,12 @@ impl Env {
     /// - BITMULE_WEBDRIVER (e.g. `http://127.0.0.1:9515`) — skip auto-start
     ///   of chromedriver.
     pub async fn bring_up() -> Result<Self> {
+        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../web");
+        let data_dir = TempDir::new()?;
         let (server_url, server_child) = match std::env::var("BITMULE_SERVER").ok() {
             Some(url) => (url, None),
             None => {
-                let child = spawn_server(DEFAULT_SERVER_ADDR).await?;
+                let child = spawn_server(DEFAULT_SERVER_ADDR, data_dir.path(), &web_dir).await.context("spawn_server")?;
                 (format!("http://{}", DEFAULT_SERVER_ADDR), Some(child))
             }
         };
@@ -48,7 +52,7 @@ impl Env {
         let (webdriver_url, webdriver_child) = match std::env::var("BITMULE_WEBDRIVER").ok() {
             Some(url) => (url, None),
             None => {
-                let child = spawn_chromedriver(9515).await?;
+                let child = spawn_chromedriver(9515).await.context("spawn_chromedriver")?;
                 (DEFAULT_WEBDRIVER_URL.to_string(), Some(child))
             }
         };
@@ -58,11 +62,12 @@ impl Env {
             webdriver_url,
             _webdriver: webdriver_child,
             _server: server_child,
+            data_dir
         })
     }
 }
 
-async fn spawn_server(bind: &str) -> Result<Child> {
+async fn spawn_server(bind: &str, data_dir: &Path, web_dir: &Path) -> Result<Child> {
     // Build+run against the workspace binary. `cargo run -p bitmule-server`
     // is the portable form that works from any CWD when this test is run
     // via `cargo test -p bitmule-e2e-tests`.
@@ -70,7 +75,10 @@ async fn spawn_server(bind: &str) -> Result<Child> {
     cmd.args([
         "run", "--quiet", "-p", "bitmule-server", "--",
         "--bind", bind,
-    ])
+        "--data-dir"
+    ]).arg(data_dir)
+    .arg("--web-dir")
+    .arg(web_dir)
     .stdout(Stdio::null())
     .stderr(Stdio::inherit())
     .kill_on_drop(true);

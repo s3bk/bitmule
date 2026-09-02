@@ -360,7 +360,7 @@ pub(crate) enum SignalFrame {
 pub(crate) type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub(crate) async fn open_ws(server_url: &str, session_hex: &str) -> Result<Ws> {
-    let ws_url = format!("{}/ws/{}", server_url.trim_end_matches('/'), session_hex);
+    let ws_url = format!("{}/ws/{}", derive_ws_url(&server_url.trim_end_matches('/')), session_hex);
     let (ws, _resp) = connect_async(&ws_url)
         .await
         .with_context(|| format!("connect {ws_url}"))?;

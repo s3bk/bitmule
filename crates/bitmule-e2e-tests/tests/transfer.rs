@@ -31,11 +31,11 @@ async fn cli_to_cli() -> Result<()> {
     // Sender-initiated (SPA mode 2 shape): `bitmule send` generates the
     // session id + prints `<server>/#<hex>` to stdout, then blocks
     // waiting for a receiver.
-    let mut sender = spawn_cli(&env.server_url, &["send", file.to_str().unwrap()])?;
+    let mut sender = spawn_cli(&env.server_url, &["send", file.to_str().unwrap()]).context("spawn CLI 1")?;
     let hex = read_stdout_for_hex(&mut sender, std::time::Duration::from_secs(5)).await?;
 
     // Receiver joins the session with the hex the sender printed.
-    let mut receiver = spawn_cli(&env.server_url, &["recv", &hex, "--out", dst.path().to_str().unwrap()])?;
+    let mut receiver = spawn_cli(&env.server_url, &["recv", &hex, "--out", dst.path().to_str().unwrap()]).context("spawn CLI 2")?;
 
     // Both should exit cleanly once the DC has drained.
     let send_status = sender.wait().await?;
