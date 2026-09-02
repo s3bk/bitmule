@@ -19,11 +19,11 @@ if one does not exeed the limits of the next-lower subscription, that price is b
 Data packages:
   +100GB: 1€/month
   +500GB: 4€/month
-  +2TB: 10€/month
+  +2TB: 15€/month
 
 Bandwidth packages:
   + 200GB: 1€/month
-  + 500GB: 3€/month
-  + 1TB: 5€/month
+  + 500GB: 2€/month
+  + 2TB: 5€/month
 
 data & bandwidth packages that are not used can be refunded / transfered to the next month
