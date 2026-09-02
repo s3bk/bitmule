@@ -34,8 +34,15 @@ use tracing::{debug, warn};
 
 /// 16 KiB is the SCTP-safe universal message size (Firefox cap). Matches
 /// the browser side (`web/main.js` CONFIG.chunkBytes) so a native sender
-/// and a browser receiver see identical framing.
+/// and a browser receiver see identical framing over the WebRTC data
+/// channel.
 pub const CHUNK_BYTES: usize = 16 * 1024;
+
+/// 1 MiB chunks for the server-relay path. HTTP PUT per chunk carries
+/// real overhead, so relay pays for larger chunks. The receiver adapts
+/// to whatever the sender declares in the meta_relay frame's
+/// `chunkBytes` field, so this only needs to match on the sender side.
+pub const RELAY_CHUNK_BYTES: usize = 1024 * 1024;
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -111,13 +118,13 @@ pub async fn send_file_over_relay(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".to_string());
-    let total_chunks = if size == 0 { 0 } else { (size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
+    let total_chunks = if size == 0 { 0 } else { (size + RELAY_CHUNK_BYTES as u64 - 1) / RELAY_CHUNK_BYTES as u64 };
 
     let meta_json = serde_json::json!({
         "type": "meta_relay",
         "name": name,
         "size": size,
-        "chunkBytes": CHUNK_BYTES,
+        "chunkBytes": RELAY_CHUNK_BYTES,
         "totalChunks": total_chunks,
     }).to_string();
 
@@ -131,7 +138,7 @@ pub async fn send_file_over_relay(
 
     let client = reqwest::Client::new();
     let mut f = tokio::fs::File::open(file_path).await?;
-    let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut buf = vec![0u8; RELAY_CHUNK_BYTES];
     let mut idx: u32 = 0;
     let mut sent: u64 = 0;
     loop {

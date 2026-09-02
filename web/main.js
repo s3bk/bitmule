@@ -22,8 +22,12 @@ const CONFIG = {
   ],
   // 16 KiB is the SCTP-safe universal message size (Firefox cap). Chrome
   // allows larger but 16 KiB gives us portable behaviour with no
-  // fragmentation risk.
+  // fragmentation risk. Used ONLY for the WebRTC data-channel path.
   chunkBytes: 16 * 1024,
+  // Relay chunks are 1 MiB because each chunk is a separate HTTP PUT
+  // and 16 KiB × N adds crippling round-trip overhead. Receiver adapts
+  // to whatever the sender declares in meta_relay.chunkBytes.
+  relayChunkBytes: 1024 * 1024,
   // Backpressure watermarks on RTCDataChannel.bufferedAmount.
   bufferedHighWater: 4 * 1024 * 1024,
   bufferedLowWater: 1 * 1024 * 1024,
@@ -323,7 +327,7 @@ async function sendFileOverDC(dc, file, { onProgress, interruptAt } = {}) {
 // name.
 
 async function sendFileOverRelay(session, ws, file, { onProgress, progressState } = {}) {
-  const chunkBytes = CONFIG.chunkBytes;
+  const chunkBytes = CONFIG.relayChunkBytes;
   const totalChunks = Math.ceil(file.size / chunkBytes);
   const meta = {
     type: "meta_relay",
