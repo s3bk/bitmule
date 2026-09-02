@@ -14,7 +14,7 @@
 //! all-WS), file transfer over the data channel (send_file_over_dc /
 //! recv_file_over_dc need rewriting against str0m::Channel — separate pass).
 
-use std::{path::{Path, PathBuf}, sync::Arc, time::Instant};
+use std::{collections::HashMap, net::{IpAddr, SocketAddr}, path::{Path, PathBuf}, sync::Arc, time::Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
@@ -25,44 +25,91 @@ use str0m::{
     net::{Protocol, Receive},
     Candidate, Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, sync::mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::{MetaFrame, Role, SignalFrame, Ws};
 
-/// A live str0m-backed session. Owner holds the Rtc + its socket + the
-/// signaling WS. Follow-on file transfer functions borrow `&mut Self`
-/// and drive their own select! loop over the same fields.
+/// A single received UDP packet — its bytes, source, and (critically)
+/// the SPECIFIC local socket address it was delivered to. str0m's ICE
+/// agent tracks known local candidates by their bound address, so we
+/// need per-interface accuracy on the destination field or it drops
+/// the packet as "unknown interface" (observed 2026-09-02 on Seb's box).
+pub struct PoolRecv {
+    pub bytes: Vec<u8>,
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+}
+
+/// One UdpSocket per host-candidate interface, all bound to the SAME
+/// port. Recv is fan-in via a shared mpsc — per-socket recv-loop tasks
+/// forward every packet with the destination correctly set to the bound
+/// address of the socket that received it. Send routes by source IP:
+/// str0m's Transmit outputs carry `source: SocketAddr` and we dispatch
+/// to the matching socket so the outbound src-address matches the local
+/// candidate str0m thinks it's using.
+pub struct SocketPool {
+    sockets: HashMap<IpAddr, Arc<UdpSocket>>,
+    recv_rx: mpsc::UnboundedReceiver<PoolRecv>,
+    _recv_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl SocketPool {
+    /// Async recv over ALL sockets in the pool via the shared mpsc.
+    pub async fn recv(&mut self) -> Option<PoolRecv> {
+        self.recv_rx.recv().await
+    }
+
+    /// Send to `dest` from the socket bound to `source_ip`. If no socket
+    /// matches, falls back to the first available socket + logs a warning
+    /// (indicates a str0m Transmit for a source we didn't bind).
+    pub async fn send_from(&self, source: SocketAddr, dest: SocketAddr, bytes: &[u8]) -> Result<()> {
+        let sock = match self.sockets.get(&source.ip()) {
+            Some(s) => s.clone(),
+            None => {
+                warn!("no socket for source IP {} — falling back to any", source.ip());
+                self.sockets.values().next().cloned()
+                    .ok_or_else(|| anyhow!("socket pool is empty"))?
+            }
+        };
+        sock.send_to(bytes, dest).await
+            .with_context(|| format!("send_to {dest}"))?;
+        Ok(())
+    }
+
+    /// Every socket's bound address, for logging + advertising.
+    pub fn bound_addrs(&self) -> Vec<SocketAddr> {
+        self.sockets.values()
+            .filter_map(|s| s.local_addr().ok())
+            .collect()
+    }
+}
+
+/// A live str0m-backed session. Owner holds the Rtc + its socket pool +
+/// the signaling WS.
 pub struct LiveSession {
     pub session_id: SessionId,
     pub role: Role,
     pub rtc: Rtc,
-    pub socket: Arc<UdpSocket>,
+    pub pool: SocketPool,
     pub ws: Ws,
     pub channel_id: ChannelId,
 }
 
-/// Build a fresh Rtc + bind a UDP socket + register a host candidate.
+/// Build a fresh Rtc + a SocketPool with one UdpSocket per host-candidate
+/// interface. All sockets share the same port so ICE candidates all look
+/// consistent to the remote peer. Per-socket recv-loop tasks fan into a
+/// shared mpsc so the caller can select! on a single stream.
 ///
-/// str0m rejects `0.0.0.0` in a Candidate::host (unspecified address is
-/// not a routable peer target). We bind on `0.0.0.0:0` so the OS gives us
-/// a port on every interface, then discover our outbound interface IP by
-/// asking the OS for the source address of a route to a public dest
-/// (we don't actually send — just query the routing table via connect).
-async fn build_rtc() -> Result<(Rtc, Arc<UdpSocket>)> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.context("bind udp")?;
-    let port = socket.local_addr()?.port();
-    let socket = Arc::new(socket);
-
-    let mut rtc = Rtc::new(Instant::now());
-
-    // Announce ALL local interface IPs as host candidates so ICE can pair
-    // whatever the remote peer sees us as. Loopback matters for same-host
-    // CLI ↔ browser tests where the browser's own 127.0.0.1 candidate is
-    // the only one reachable back to us. Real LAN + WAN cases are covered
-    // by the outbound-interface discovery + any additional NIC IPs.
-    let mut announced: Vec<std::net::IpAddr> = Vec::new();
+/// Fixes the "Discarding STUN request on unknown interface: 0.0.0.0:port"
+/// bug (Seb 2026-09-02): binding once on 0.0.0.0 made socket.local_addr()
+/// return the unspecified address, which str0m's ICE agent didn't
+/// recognize as any known local candidate → drops. Per-IP sockets give
+/// each recv a specific, matchable destination.
+async fn build_rtc() -> Result<(Rtc, SocketPool)> {
+    // Decide which IPs to bind on.
+    let mut announced: Vec<IpAddr> = Vec::new();
     if let Ok(ip) = discover_outbound_ip().await {
         announced.push(ip);
     }
@@ -70,21 +117,77 @@ async fn build_rtc() -> Result<(Rtc, Arc<UdpSocket>)> {
         if !announced.contains(&ip) { announced.push(ip); }
     }
     if !announced.iter().any(|ip| ip.is_loopback()) {
-        announced.push(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        announced.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     }
     if announced.is_empty() {
-        // Very degenerate — fall back to loopback so we at least try.
-        announced.push(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        announced.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     }
-    for ip in announced {
-        let addr = std::net::SocketAddr::new(ip, port);
+
+    // Bind the first socket at (ip, 0) to get an OS-assigned port; then
+    // bind each subsequent socket at that SAME port on its specific IP.
+    // Linux allows same port on different specific IPs (each is a
+    // distinct 5-tuple root), unlike 0.0.0.0:port + specific:port.
+    let mut sockets: HashMap<IpAddr, Arc<UdpSocket>> = HashMap::new();
+    let mut port: Option<u16> = None;
+    for ip in &announced {
+        let bind_addr = SocketAddr::new(*ip, port.unwrap_or(0));
+        let sock = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("bind {bind_addr} failed: {e} — skipping");
+                continue;
+            }
+        };
+        if port.is_none() {
+            port = Some(sock.local_addr()?.port());
+        }
+        sockets.insert(*ip, Arc::new(sock));
+    }
+    if sockets.is_empty() {
+        bail!("could not bind any UDP socket for host candidates");
+    }
+    let port = port.expect("at least one socket bound → port set");
+
+    // Spawn one recv task per socket that forwards packets into the pool's mpsc.
+    let (recv_tx, recv_rx) = mpsc::unbounded_channel::<PoolRecv>();
+    let mut recv_tasks = Vec::new();
+    for (ip, sock) in &sockets {
+        let sock = sock.clone();
+        let tx = recv_tx.clone();
+        let dest = SocketAddr::new(*ip, port);
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match sock.recv_from(&mut buf).await {
+                    Ok((n, source)) => {
+                        let pr = PoolRecv {
+                            bytes: buf[..n].to_vec(),
+                            source,
+                            destination: dest,
+                        };
+                        if tx.send(pr).is_err() { break; }
+                    }
+                    Err(e) => {
+                        warn!("recv task for {dest} exiting: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+        recv_tasks.push(task);
+    }
+    drop(recv_tx);
+    let pool = SocketPool { sockets, recv_rx, _recv_tasks: recv_tasks };
+
+    let mut rtc = Rtc::new(Instant::now());
+    for addr in pool.bound_addrs() {
         match Candidate::host(addr, "udp") {
             Ok(c) => { rtc.add_local_candidate(c); }
             Err(e) => warn!("skipping host candidate {addr}: {e}"),
         }
     }
 
-    Ok((rtc, socket))
+    Ok((rtc, pool))
 }
 
 /// Enumerate local interface IPs by parsing `getifaddrs`-style output.
@@ -127,7 +230,7 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
     info!(session = %session_hex, "opening sender WS + Rtc");
 
     let mut ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
-    let (mut rtc, socket) = build_rtc().await?;
+    let (mut rtc, mut pool) = build_rtc().await?;
 
     // Active side: create the data channel BEFORE offer generation so its
     // m-line lands in the SDP.
@@ -136,7 +239,7 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
     let (offer, mut pending) = change
         .apply()
         .ok_or_else(|| anyhow!("sdp_api produced no offer — nothing added"))?;
-    let mut next_timeout = drain_rtc(&mut rtc, &socket).await?;
+    let mut next_timeout = drain_rtc(&mut rtc, &pool).await?;
 
     ws_send(&mut ws, &SignalFrame::Hello {
         role: Role::Sender.as_str().to_owned(),
@@ -162,7 +265,7 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
                     SignalFrame::Ice { candidate: Some(c) } => {
                         if let Some(remote) = parse_ice_candidate(&c).await {
                             rtc.add_remote_candidate(remote);
-                            next_timeout = drain_rtc_capture_open(&mut rtc, &socket, channel_id, &mut opened).await?;
+                            next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
                         }
                     }
                     SignalFrame::PeerHello { .. } if !peer_hello_seen => {
@@ -183,35 +286,34 @@ pub async fn send_connect(server_url: &str, session_id: SessionId) -> Result<Liv
                         let pending_taken = pending_holder.take().expect("pending set on entry");
                         rtc.sdp_api().accept_answer(pending_taken, ans)
                             .map_err(|e| anyhow!("accept_answer: {e}"))?;
-                        next_timeout = drain_rtc_capture_open(&mut rtc, &socket, channel_id, &mut opened).await?;
+                        next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
                     }
                     _ => {}
                 }
             }
 
-            r = socket.recv_from(&mut buf) => {
-                let (n, source) = r.context("udp recv_from")?;
-                info!("RX ← {} ({} bytes)", source, n);
-                let local = socket.local_addr().context("local_addr")?;
+            maybe_pr = pool.recv() => {
+                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
+                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
-                    source,
-                    destination: local,
-                    contents: (&buf[..n]).try_into().map_err(|_| anyhow!("packet oversize"))?,
+                    source: pr.source,
+                    destination: pr.destination,
+                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
-                next_timeout = drain_rtc_capture_open(&mut rtc, &socket, channel_id, &mut opened).await?;
+                next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
             }
 
             _ = tokio::time::sleep(dur) => {
                 rtc.handle_input(Input::Timeout(Instant::now()))
                     .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
-                next_timeout = drain_rtc_capture_open(&mut rtc, &socket, channel_id, &mut opened).await?;
+                next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
             }
         }
     }
     info!("sender data channel open");
-    Ok(LiveSession { session_id, role: Role::Sender, rtc, socket, ws, channel_id })
+    Ok(LiveSession { session_id, role: Role::Sender, rtc, pool, ws, channel_id })
 }
 
 /// Receiver entry point — passive side: send hello + peer_hello, wait
@@ -222,8 +324,8 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
     info!(session = %session_hex, "opening receiver WS + Rtc");
 
     let mut ws = crate::open_ws(server_url, &session_hex).await?;
-    let (mut rtc, socket) = build_rtc().await?;
-    let mut next_timeout = drain_rtc(&mut rtc, &socket).await?;
+    let (mut rtc, mut pool) = build_rtc().await?;
+    let mut next_timeout = drain_rtc(&mut rtc, &pool).await?;
 
     let receiver_id = SessionId::random().as_hex();
     ws_send(&mut ws, &SignalFrame::Hello {
@@ -248,7 +350,7 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
                     SignalFrame::Ice { candidate: Some(c) } => {
                         if let Some(remote) = parse_ice_candidate(&c).await {
                             rtc.add_remote_candidate(remote);
-                            next_timeout = drain_rtc_capture_id(&mut rtc, &socket, &mut opened).await?;
+                            next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
                         }
                     }
                     SignalFrame::Sdp { kind, sdp } if kind == "offer" => {
@@ -261,37 +363,36 @@ pub async fn recv_connect(server_url: &str, session_id: SessionId) -> Result<Liv
                             sdp: answer.to_sdp_string(),
                         }).await?;
                         debug!("answer sent");
-                        next_timeout = drain_rtc_capture_id(&mut rtc, &socket, &mut opened).await?;
+                        next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
                     }
                     _ => {}
                 }
             }
 
-            r = socket.recv_from(&mut buf) => {
-                let (n, source) = r.context("udp recv_from")?;
-                info!("RX ← {} ({} bytes)", source, n);
-                let local = socket.local_addr().context("local_addr")?;
+            maybe_pr = pool.recv() => {
+                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
+                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
-                    source,
-                    destination: local,
-                    contents: (&buf[..n]).try_into().map_err(|_| anyhow!("packet oversize"))?,
+                    source: pr.source,
+                    destination: pr.destination,
+                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
-                next_timeout = drain_rtc_capture_id(&mut rtc, &socket, &mut opened).await?;
+                next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
             }
 
             _ = tokio::time::sleep(dur) => {
                 rtc.handle_input(Input::Timeout(Instant::now()))
                     .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
-                next_timeout = drain_rtc_capture_id(&mut rtc, &socket, &mut opened).await?;
+                next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
             }
         }
     }
 
     let channel_id = opened.unwrap();
     info!("receiver data channel open (id={:?})", channel_id);
-    Ok(LiveSession { session_id, role: Role::Receiver, rtc, socket, ws, channel_id })
+    Ok(LiveSession { session_id, role: Role::Receiver, rtc, pool, ws, channel_id })
 }
 
 // ---- file transfer over the data channel --------------------------------
@@ -362,7 +463,7 @@ async fn channel_write_all(
     binary: bool,
     buf: &[u8],
 ) -> Result<()> {
-    let mut next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+    let mut next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
     let mut recv_buf = vec![0u8; 4096];
 
     loop {
@@ -372,7 +473,7 @@ async fn channel_write_all(
             ch.write(binary, buf).map_err(|e| anyhow!("channel write: {e}"))?
         };
         if accepted {
-            next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+            next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
             let _ = next_timeout;
             return Ok(());
         }
@@ -390,26 +491,26 @@ async fn channel_write_all(
                 if let SignalFrame::Ice { candidate: Some(c) } = frame {
                     if let Some(remote) = parse_ice_candidate(&c).await {
                         session.rtc.add_remote_candidate(remote);
-                        next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+                        next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
                     }
                 }
             }
-            r = session.socket.recv_from(&mut recv_buf) => {
-                let (n, source) = r.context("udp recv_from")?;
-                let local = session.socket.local_addr().context("local_addr")?;
+            maybe_pr = session.pool.recv() => {
+                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
+                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
-                    source,
-                    destination: local,
-                    contents: (&recv_buf[..n]).try_into().map_err(|_| anyhow!("packet oversize"))?,
+                    source: pr.source,
+                    destination: pr.destination,
+                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
-                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
             }
             _ = tokio::time::sleep(dur) => {
                 session.rtc.handle_input(Input::Timeout(Instant::now()))
                     .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
-                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
             }
         }
     }
@@ -431,7 +532,7 @@ fn channel_set_low_threshold(rtc: &mut Rtc, id: ChannelId, threshold: usize) -> 
 /// send_file_over_dc after the "done" frame so callers can drop the
 /// session cleanly without truncating the tail.
 async fn drain_until_buffer_empty(session: &mut LiveSession) -> Result<()> {
-    let mut next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+    let mut next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
     let mut recv_buf = vec![0u8; 4096];
     loop {
         let buffered = {
@@ -443,22 +544,22 @@ async fn drain_until_buffer_empty(session: &mut LiveSession) -> Result<()> {
 
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
         tokio::select! {
-            r = session.socket.recv_from(&mut recv_buf) => {
-                let (n, source) = r.context("udp recv_from")?;
-                let local = session.socket.local_addr().context("local_addr")?;
+            maybe_pr = session.pool.recv() => {
+                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
+                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
-                    source,
-                    destination: local,
-                    contents: (&recv_buf[..n]).try_into().map_err(|_| anyhow!("packet oversize"))?,
+                    source: pr.source,
+                    destination: pr.destination,
+                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
-                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
             }
             _ = tokio::time::sleep(dur) => {
                 session.rtc.handle_input(Input::Timeout(Instant::now()))
                     .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
-                next_timeout = drain_rtc(&mut session.rtc, &session.socket).await?;
+                next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
             }
         }
     }
@@ -492,7 +593,7 @@ pub async fn recv_file_over_dc(
     let mut buf = vec![0u8; 4096];
 
     let mut next_timeout = drain_rtc_capture_data(
-        &mut session.rtc, &session.socket, session.channel_id,
+        &mut session.rtc, &session.pool, session.channel_id,
         &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
     ).await?;
 
@@ -510,25 +611,25 @@ pub async fn recv_file_over_dc(
                     if let Some(remote) = parse_ice_candidate(&c).await {
                         session.rtc.add_remote_candidate(remote);
                         next_timeout = drain_rtc_capture_data(
-                            &mut session.rtc, &session.socket, session.channel_id,
+                            &mut session.rtc, &session.pool, session.channel_id,
                             &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
                         ).await?;
                     }
                 }
             }
 
-            r = session.socket.recv_from(&mut buf) => {
-                let (n, source) = r.context("udp recv_from")?;
-                let local = session.socket.local_addr().context("local_addr")?;
+            maybe_pr = session.pool.recv() => {
+                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
+                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
-                    source,
-                    destination: local,
-                    contents: (&buf[..n]).try_into().map_err(|_| anyhow!("packet oversize"))?,
+                    source: pr.source,
+                    destination: pr.destination,
+                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
                 next_timeout = drain_rtc_capture_data(
-                    &mut session.rtc, &session.socket, session.channel_id,
+                    &mut session.rtc, &session.pool, session.channel_id,
                     &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
                 ).await?;
             }
@@ -537,7 +638,7 @@ pub async fn recv_file_over_dc(
                 session.rtc.handle_input(Input::Timeout(Instant::now()))
                     .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
                 next_timeout = drain_rtc_capture_data(
-                    &mut session.rtc, &session.socket, session.channel_id,
+                    &mut session.rtc, &session.pool, session.channel_id,
                     &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
                 ).await?;
             }
@@ -558,7 +659,7 @@ pub async fn recv_file_over_dc(
 #[allow(clippy::too_many_arguments)]
 async fn drain_rtc_capture_data(
     rtc: &mut Rtc,
-    socket: &UdpSocket,
+    pool: &SocketPool,
     expected_channel: ChannelId,
     meta_opt: &mut Option<MetaFrame>,
     file_opt: &mut Option<tokio::fs::File>,
@@ -573,7 +674,7 @@ async fn drain_rtc_capture_data(
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
                 info!("TX → {} ({} bytes)", t.destination, t.contents.len());
-                socket.send_to(&t.contents, t.destination).await
+                pool.send_from(t.source, t.destination, &t.contents).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
             Output::Event(Event::ChannelData(ChannelData { id, binary, data })) if id == expected_channel => {
@@ -806,13 +907,13 @@ async fn pump_relay_ws(
 /// Drain poll_output until Timeout. Bail on ICE disconnect. Other events
 /// are logged and discarded (callers use `drain_rtc_capture_open` or
 /// `drain_rtc_capture_id` when they care about ChannelOpen specifically).
-async fn drain_rtc(rtc: &mut Rtc, socket: &UdpSocket) -> Result<Instant> {
+async fn drain_rtc(rtc: &mut Rtc, pool: &SocketPool) -> Result<Instant> {
     loop {
         match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
                 info!("TX → {} ({} bytes)", t.destination, t.contents.len());
-                socket.send_to(&t.contents, t.destination).await
+                pool.send_from(t.source, t.destination, &t.contents).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
             Output::Event(e) => handle_generic_event(&e)?,
@@ -825,7 +926,7 @@ async fn drain_rtc(rtc: &mut Rtc, socket: &UdpSocket) -> Result<Instant> {
 /// when ChannelOpen for it fires.
 async fn drain_rtc_capture_open(
     rtc: &mut Rtc,
-    socket: &UdpSocket,
+    pool: &SocketPool,
     expected: ChannelId,
     opened: &mut bool,
 ) -> Result<Instant> {
@@ -834,7 +935,7 @@ async fn drain_rtc_capture_open(
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
                 info!("TX → {} ({} bytes)", t.destination, t.contents.len());
-                socket.send_to(&t.contents, t.destination).await
+                pool.send_from(t.source, t.destination, &t.contents).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
             Output::Event(Event::ChannelOpen(id, _label)) if id == expected => {
@@ -849,7 +950,7 @@ async fn drain_rtc_capture_open(
 /// the passive side, so we discover it via the ChannelOpen event.
 async fn drain_rtc_capture_id(
     rtc: &mut Rtc,
-    socket: &UdpSocket,
+    pool: &SocketPool,
     opened: &mut Option<ChannelId>,
 ) -> Result<Instant> {
     loop {
@@ -857,7 +958,7 @@ async fn drain_rtc_capture_id(
             Output::Timeout(t) => return Ok(t),
             Output::Transmit(t) => {
                 info!("TX → {} ({} bytes)", t.destination, t.contents.len());
-                socket.send_to(&t.contents, t.destination).await
+                pool.send_from(t.source, t.destination, &t.contents).await
                     .with_context(|| format!("send_to {}", t.destination))?;
             }
             Output::Event(Event::ChannelOpen(id, _label)) => {
