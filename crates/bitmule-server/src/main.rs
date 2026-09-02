@@ -32,8 +32,8 @@ struct Args {
     data_dir: PathBuf,
 
     /// Retention for undelivered chunks. Older chunks are evicted.
-    #[arg(long, default_value_t = 72)]
-    retention_hours: u64,
+    #[arg(long, default_value_t = 10)]
+    retention_minutes: u64,
 
     /// Hard upper bound on total ciphertext bytes stored across all sessions.
     /// When exceeded, the maintenance loop evicts oldest chunks first until
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     // disk-cap eviction opportunistically after each pass.
     tokio::spawn(maintenance_loop(
         store.clone(),
-        args.retention_hours,
+        args.retention_minutes,
         args.max_disk_bytes,
     ));
 
@@ -108,12 +108,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn maintenance_loop(
     store: Arc<dyn ChunkStore>,
-    retention_hours: u64,
+    retention_retention_minutes: u64,
     max_disk_bytes: u64,
 ) {
     let gc_period = Duration::from_secs(60);
     let evict_period = Duration::from_secs(600);
-    let retention = Duration::from_secs(retention_hours * 3600);
+    let retention = Duration::from_secs(retention_retention_minutes * 60);
     let mut last_evict = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(gc_period).await;
