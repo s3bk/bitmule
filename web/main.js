@@ -598,6 +598,7 @@ function startSendSession(files) {
           progressState: session.relayProgress,
         });
         els.sessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
+        document.body.dataset.transferStatus = 'complete';
         els.cancelBtn.textContent = "Send another";
         els.cancelBtn.classList.add("done");
       } catch (err) {
@@ -686,6 +687,7 @@ function startSendSession(files) {
             try {
               await sendFileOverDC(dc, file, opts);
               els.sessionState.textContent = `sent ${file.name} (${fmtSize(file.size)})`;
+              document.body.dataset.transferStatus = 'complete';
               // Flip the cancel button into a "Send another" affordance —
               // same click handler tears the session down and returns
               // the drop-zone.
@@ -837,6 +839,7 @@ function startRecvSession(sessionHex) {
     if (recvSession !== session) return;
     const suffix = via ? ` (via ${via})` : "";
     els.recvState.textContent = `received ${name} (${fmtSize(size)})${suffix}`;
+    document.body.dataset.transferStatus = 'complete';
     const url = URL.createObjectURL(blob);
     els.recvDownload.hidden = false;
     els.recvDownload.innerHTML = "";
@@ -985,6 +988,7 @@ function startRequestSession() {
     if (requestSession !== session) return;
     const suffix = via ? ` (via ${via})` : "";
     els.requestState.textContent = `received ${name} (${fmtSize(size)})${suffix}`;
+    document.body.dataset.transferStatus = 'complete';
     const url = URL.createObjectURL(blob);
     els.requestDownload.hidden = false;
     els.requestDownload.innerHTML = "";
@@ -1144,6 +1148,7 @@ function startInvitedSendSession(sessionHex, files) {
           progressState: session.relayProgress,
         });
         els.invitedSessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
+        document.body.dataset.transferStatus = 'complete';
         els.invitedCancel.textContent = "Send another";
         els.invitedCancel.classList.add("done");
       } catch (err) {
@@ -1190,6 +1195,7 @@ function startInvitedSendSession(sessionHex, files) {
                 },
               });
               els.invitedSessionState.textContent = `sent ${file.name} (${fmtSize(file.size)})`;
+              document.body.dataset.transferStatus = 'complete';
               els.invitedCancel.textContent = "Send another";
               els.invitedCancel.classList.add("done");
             } catch (err) {

@@ -125,11 +125,10 @@ async fn cli_to_web() -> Result<()> {
     let url = format!("{}/#{}", env.server_url, hex);
     driver.goto(&url).await?;
 
-    // Wait for the sender to complete + Chrome to finish the download.
-    // Selector for "transfer complete" in the SPA is still open — for
-    // now: poll `dl` for a file to appear (Chrome writes .crdownload
-    // during transit + renames to final on completion).
-    let final_path = wait_for_final_download(dl.path(), std::time::Duration::from_secs(60)).await?;
+    // SPA signals completion by setting `body[data-transfer-status="complete"]`
+    // at every send/recv terminal site (added to web/main.js 2026-09-02).
+    driver_wait_transfer_complete(&driver, std::time::Duration::from_secs(60)).await?;
+    let final_path = wait_for_final_download(dl.path(), std::time::Duration::from_secs(5)).await?;
     assert_eq!(sha256_file(&final_path)?, want_hash);
 
     sender.wait().await?;
@@ -168,12 +167,31 @@ async fn web_to_web() -> Result<()> {
     let receiver = WebDriver::new(&env.webdriver_url, recv_caps).await?;
     receiver.goto(&href).await?;
 
-    let final_path = wait_for_final_download(dl.path(), std::time::Duration::from_secs(60)).await?;
+    // SPA signals completion by setting `body[data-transfer-status="complete"]`
+    // at every send/recv terminal site (added to web/main.js 2026-09-02).
+    driver_wait_transfer_complete(&receiver, std::time::Duration::from_secs(60)).await?;
+    let final_path = wait_for_final_download(dl.path(), std::time::Duration::from_secs(5)).await?;
     assert_eq!(sha256_file(&final_path)?, want_hash);
 
     sender.quit().await?;
     receiver.quit().await?;
     Ok(())
+}
+
+/// Poll the WebDriver's page for `body[data-transfer-status="complete"]`,
+/// which the SPA sets at every send/recv terminal site.
+async fn driver_wait_transfer_complete(driver: &WebDriver, timeout: std::time::Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let done: String = driver
+            .execute("return document.body.dataset.transferStatus || '';", vec![])
+            .await
+            .map(|r| r.convert::<String>().unwrap_or_default())
+            .unwrap_or_default();
+        if done == "complete" { return Ok(()); }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Err(anyhow!("body[data-transfer-status='complete'] never fired within {:?}", timeout))
 }
 
 /// Poll `dir` for the first file whose name doesn't end in `.crdownload`
