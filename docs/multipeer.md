@@ -235,6 +235,16 @@ modes. Or `Multi` becomes a separate CLI flag orthogonal to transport.
 
 4. **DC channel names**: currently str0m opens `"bitmule"`. Per-peer sessions all opening a channel named `"bitmule"` on their own Rtc — no collision since each Rtc is a separate PeerConnection. Ok.
 
-5. **str0m + N Rtc instances share the same SocketPool?** Or does each peer's Rtc get its own port set? Sharing the pool means one incoming UDP packet has to be dispatched to the right Rtc by ICE state matching. str0m might not support that directly. Cleaner: per-peer Rtc + per-peer SocketPool (own port range). More expensive on socket count but simple. Worth checking str0m docs / examples before committing.
+5. **str0m + N Rtc instances share the same SocketPool?** ✅ CONFIRMED
+   (str0m 0.23.1 examples/chat.rs + `Rtc::accepts()` docstring at
+   src/lib.rs:1873): shared UDP socket + per-peer Rtc is the SUPPORTED
+   pattern. Demux: iterate `rtcs.iter_mut()`, call `.accepts(&input)`,
+   hand the input to the first that returns true. `accepts()` matches
+   the nominated ICE candidate first (fast path), then falls back to
+   STUN ufrag/password matching for handshake packets, then checks all
+   remote candidates. `Input::Timeout` always returns true (fanout to
+   all Rtcs). So our SocketPool.recv() → for-each-peer-Rtc-accepts loop
+   is exactly what str0m expects. Cost is O(N) per packet, but N is
+   small (few tens of peers max), so fine.
 
 Once these are settled I can code M2b + M3 in a series of tight pushes.
