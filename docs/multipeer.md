@@ -174,24 +174,36 @@ is a lot cheaper than 1024 separate reads.
 
 ## `--complete` early exit predicate
 
-Sender exits once the **UNION** of all peers' covered ranges spans
-`0..total_chunks`. It does NOT wait for any single peer to have the full
-set. The mental model is "the data is out of the sender's hands," not
-"one receiver has finished."
+Sender stays alive until **at least one peer has fully received the file**
+(covered set = `0..total_chunks` for that peer). Peers may disconnect and
+reconnect during the transfer — sender rides that out and keeps serving.
+The mental model is "get the file to A destination," not "exit after N
+minutes."
 
-Parent computes the union on demand by iterating `peers.values()` and
-merging each peer's `covered` set (each held under its own Arc<Mutex>>
-by the per-peer task). When `union.len() == total_chunks`, parent:
-1. Signals all peer tasks to shut down.
-2. Awaits their exit.
-3. Returns Ok(()) from cmd_send.
+Per-peer `covered` sets live on `PeerHandle` (shared `Arc<Mutex<HashSet<u64>>>`
+with the task). Parent checks each peer's covered set on peer-task-exit
+or on receiving a `recv_done` frame from a peer:
 
-Consequence: with N receivers each requesting disjoint ranges, sender
-exits when the last hole is filled — could be before any single receiver
-has finished. Those receivers may still be missing individual chunks;
-they're expected to fetch them from each other in a future
-peer-to-peer swap layer (out of scope for M2/M3 but the design leaves
-the door open).
+- Peer emits `recv_done` on its DC when it has assembled all
+  `total_chunks` locally.
+- Sender's per-peer task forwards this to parent (via covered_tx or a
+  separate done channel).
+- Parent iterates `peers.values()`; if any peer's covered set contains
+  `0..total_chunks`, parent signals all tasks to shut down and returns
+  Ok(()) from cmd_send.
+
+Reconnect handling: receiver persists partial-file state on disk. On
+reconnect (new WS + new receiver_id from sender's perspective), receiver
+emits `request_ranges` for only the chunks it's missing. The reconnected
+session is a fresh PeerHandle to the sender — no cross-session state
+merge needed on the sender side. If the reconnected session ends up
+covering the remaining ranges, THAT session's covered set completes
+`0..total_chunks` and sender exits normally.
+
+Consequence: sender is resilient to peer flakiness. If a peer is at 90%
+and drops, it can reconnect and pick up from chunk 900, request_ranges
+its way to 100%, then send recv_done. Sender exits only when that
+end-state is reached (or --multi never exits).
 
 ## `--multi` never-exit
 
