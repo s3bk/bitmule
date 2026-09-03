@@ -182,7 +182,41 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                             None => r.fan_to_receivers(&s),
                         }
                     }
-                    Role::Receiver => r.route_to_sender(&s),
+                    Role::Receiver => {
+                        // Anti-spoof: if the receiver populated
+                        // `from_receiver_id`, it must match the id they
+                        // registered with. Prevents receiver A from
+                        // impersonating receiver B on the sender's
+                        // per-peer dispatch. Absent field = backward-compat
+                        // (single-receiver stack, sender doesn't
+                        // disambiguate).
+                        let claimed = serde_json::from_str::<serde_json::Value>(&s)
+                            .ok()
+                            .and_then(|v| v.get("from_receiver_id")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string()));
+                        if let Some(claim) = claimed.as_deref() {
+                            let actual = receiver_id.as_ref().map(|r| r.as_hex());
+                            match actual.as_deref() {
+                                Some(a) if a == claim => { /* verified */ }
+                                Some(a) => {
+                                    tracing::warn!(
+                                        "dropping receiver frame: claimed from_receiver_id={} != actual={}",
+                                        claim, a
+                                    );
+                                    continue;
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "dropping receiver frame with from_receiver_id={} — receiver has no registered id",
+                                        claim
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        r.route_to_sender(&s);
+                    }
                 }
             }
             Message::Close(_) => break,
