@@ -276,6 +276,8 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let mut ephemeral_holder = Some(local_ephemeral);
     let mut wrap_key: Option<WrapKey> = None;
     let mut meta_key: Option<MetaKey> = None;
+    let mut bulk_key: Option<BulkKey> = None;
+    let mut key_wrap_sent = false;
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
     let mut peer_hello_seen = false;
@@ -361,13 +363,29 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                 next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
             }
         }
+
+        // Sender-side: as soon as wrap_key is derived, generate B, wrap it,
+        // and send the KeyWrap over WS. Receiver decrypts + stores B.
+        if wrap_key.is_some() && !key_wrap_sent {
+            let b = BulkKey::random();
+            let wk = wrap_key.as_ref().unwrap();
+            let (nonce, ct) = wk.wrap_bulk_key(&b)?;
+            ws_send(&mut ws, &SignalFrame::KeyWrap {
+                enc_b_hex: hex_encode(&ct),
+                nonce_hex: hex_encode(&nonce),
+            }).await?;
+            bulk_key = Some(b);
+            key_wrap_sent = true;
+            info!("bulk key generated + wrapped + sent");
+        }
     }
     info!("sender data channel open");
     let wrap_key = wrap_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
     let meta_key = meta_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
+    let bulk_key = bulk_key.ok_or_else(|| anyhow!("DC opened before bulk key was generated"))?;
     Ok(LiveSession {
         session_id, role: Role::Sender, rtc, pool, ws, channel_id,
-        wrap_key, meta_key, bulk_key: None, share_key,
+        wrap_key, meta_key, bulk_key: Some(bulk_key), share_key,
     })
 }
 
@@ -402,12 +420,13 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let mut ephemeral_holder = Some(local_ephemeral);
     let mut wrap_key: Option<WrapKey> = None;
     let mut meta_key: Option<MetaKey> = None;
+    let mut bulk_key: Option<BulkKey> = None;
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
     let mut opened: Option<ChannelId> = None;
     let mut buf = vec![0u8; 4096];
 
-    while opened.is_none() {
+    while opened.is_none() || bulk_key.is_none() {
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
 
         tokio::select! {
@@ -453,6 +472,14 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                         meta_key = Some(s.meta_key(&session_id_bytes));
                         info!("KEX complete — wrap_key + meta_key derived");
                     }
+                    SignalFrame::KeyWrap { enc_b_hex, nonce_hex } => {
+                        let wk = wrap_key.as_ref()
+                            .ok_or_else(|| anyhow!("KeyWrap arrived before KEX complete"))?;
+                        let nonce = hex_decode_var(&nonce_hex)?;
+                        let ct = hex_decode_var(&enc_b_hex)?;
+                        bulk_key = Some(wk.unwrap_bulk_key(&nonce, &ct)?);
+                        info!("bulk key received + unwrapped");
+                    }
                     _ => {}
                 }
             }
@@ -480,11 +507,12 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
 
     let channel_id = opened.unwrap();
     info!("receiver data channel open (id={:?})", channel_id);
-    let wrap_key = wrap_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
-    let meta_key = meta_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
+    let wrap_key = wrap_key.ok_or_else(|| anyhow!("exited handshake loop without KEX complete"))?;
+    let meta_key = meta_key.ok_or_else(|| anyhow!("exited handshake loop without KEX complete"))?;
+    let bulk_key = bulk_key.ok_or_else(|| anyhow!("exited handshake loop without bulk key"))?;
     Ok(LiveSession {
         session_id, role: Role::Receiver, rtc, pool, ws, channel_id,
-        wrap_key, meta_key, bulk_key: None, share_key,
+        wrap_key, meta_key, bulk_key: Some(bulk_key), share_key,
     })
 }
 
@@ -1143,6 +1171,16 @@ fn hex_decode_fixed<const N: usize>(s: &str) -> Result<[u8; N]> {
         out[i] = u8::from_str_radix(byte_str, 16).map_err(|_| anyhow!("bad hex byte at {i}"))?;
     }
     Ok(out)
+}
+
+fn hex_decode_var(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        bail!("odd-length hex string");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect()
 }
 
 fn constant_time_eq_bytes<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {

@@ -5,7 +5,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use bitmule_client_native::{recv_file, send_file, TransportMode};
-use bitmule_core::SessionId;
 use clap::{Parser, Subcommand};
 use qrcode::{render::unicode, QrCode};
 use std::path::PathBuf;
