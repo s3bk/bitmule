@@ -166,7 +166,22 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                 let s = t.to_string();
                 let mut r = room.lock().await;
                 match role {
-                    Role::Sender => r.fan_to_receivers(&s),
+                    Role::Sender => {
+                        // Multi-peer routing (M1): a sender-originated frame
+                        // may carry a top-level `to_receiver_id` string. If
+                        // present, route to that receiver only. If absent,
+                        // fan to all receivers (backward-compat with the
+                        // single-receiver stack).
+                        let target = serde_json::from_str::<serde_json::Value>(&s)
+                            .ok()
+                            .and_then(|v| v.get("to_receiver_id")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string()));
+                        match target.as_deref().and_then(|s| ReceiverId::from_hex(s).ok()) {
+                            Some(rid) => r.route_to_receiver(&rid, &s),
+                            None => r.fan_to_receivers(&s),
+                        }
+                    }
                     Role::Receiver => r.route_to_sender(&s),
                 }
             }

@@ -57,4 +57,13 @@ impl Room {
             let _ = entry.sink.send(frame.to_string());
         }
     }
+
+    /// Route a sender-originated frame to exactly one receiver (by id).
+    /// Silently drops if the receiver isn't registered — sender may be
+    /// racing a receiver-departed notification.
+    pub fn route_to_receiver(&self, rid: &ReceiverId, frame: &str) {
+        if let Some(entry) = self.receivers.get(rid) {
+            let _ = entry.sink.send(frame.to_string());
+        }
+    }
 }
