@@ -937,7 +937,7 @@ pub async fn recv_file(
             }
             Ok(path)
         }
-        TransportMode::Relay => recv_file_relay(server_url_http, share_key, out_dir, on_progress).await,
+        TransportMode::Relay => recv_file_relay(server_url_http, share_key, expected_signature, out_dir, on_progress).await,
         TransportMode::Auto => {
             let dur = std::time::Duration::from_millis(WEBRTC_FALLBACK_MS);
             let progress = std::sync::Arc::new(tokio::sync::Mutex::new(on_progress));
@@ -959,7 +959,7 @@ pub async fn recv_file(
                 Err(e) => {
                     warn!("webrtc path failed ({e}), falling back to relay");
                     let relay_progress = progress.clone();
-                    recv_file_relay(server_url_http, share_key, out_dir, move |a, b, n| {
+                    recv_file_relay(server_url_http, share_key, expected_signature, out_dir, move |a, b, n| {
                         if let Ok(mut g) = relay_progress.try_lock() { g(a, b, n); }
                     }).await
                 }
@@ -1012,18 +1012,21 @@ async fn send_file_webrtc(
 async fn send_file_relay(
     server_url_http: &str,
     share_key: ShareKey,
-    _bulk_key: BulkKey,
+    bulk_key: BulkKey,
     file_path: &Path,
     on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
-    // TODO: relay path currently uses its own crypto scheme in send_file_over_relay
-    // (crate::send_file_over_relay). Threading the pre-generated bulk_key through
-    // there is a follow-up push — for now the bulk_key parameter is accepted for
-    // signature compatibility but not used on the relay path. WebRTC path uses it.
     let session_hex = share_key.session_id_hex();
     let session_id = SessionId::from_hex(&session_hex)
         .map_err(|e| anyhow!("session_id from hex: {e}"))?;
-    let ws = crate::open_ws(server_url_http, &session_hex).await?;
+    let mut ws = crate::open_ws(server_url_http, &session_hex).await?;
+    // Sync bulk_key with receiver via KEX+KeyWrap over the same WS, BEFORE
+    // dropping into the relay pump. The returned bulk_key is our own
+    // pre-generated one — kept for future chunk encryption (Push B2).
+    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
+    let _bulk = handshake_bulk_key_over_ws(
+        &mut ws, Role::Sender, &share_key, &session_id_bytes, Some(bulk_key),
+    ).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let progress = std::sync::Arc::new(tokio::sync::Mutex::new(crate::RelaySendProgress::default()));
@@ -1034,18 +1037,30 @@ async fn send_file_relay(
 async fn recv_file_relay(
     server_url_http: &str,
     share_key: ShareKey,
+    expected_signature: Option<[u8; 32]>,
     out_dir: &Path,
     on_progress: impl FnMut(u64, u64, &str) + Send,
 ) -> Result<PathBuf> {
     let session_hex = share_key.session_id_hex();
     let session_id = SessionId::from_hex(&session_hex)
         .map_err(|e| anyhow!("session_id from hex: {e}"))?;
-    let ws = crate::open_ws(server_url_http, &session_hex).await?;
+    let mut ws = crate::open_ws(server_url_http, &session_hex).await?;
+    // Run KEX+KeyWrap over the WS to receive the bulk_key from the sender.
+    // Do this BEFORE the pump takes over the ws so KEX frames don't race
+    // chunk_relay frames.
+    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
+    let bulk_key = handshake_bulk_key_over_ws(
+        &mut ws, Role::Receiver, &share_key, &session_id_bytes, None,
+    ).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
     let _ = out_tx; // relay recv only reads; sender kept alive so pumper's send half stays valid
-    crate::recv_file_over_relay(server_url_http, &session_id, out_dir, in_rx, on_progress).await
+    let path = crate::recv_file_over_relay(server_url_http, &session_id, out_dir, in_rx, on_progress).await?;
+    if let Some(sig) = expected_signature {
+        verify_transferred_signature(&path, &sig, &bulk_key).await?;
+    }
+    Ok(path)
 }
 
 /// Simple ws pumper for the relay path — moves outgoing raw strings from
@@ -1158,6 +1173,102 @@ fn handle_generic_event(e: &Event) -> Result<()> {
 }
 
 // ---- helpers ------------------------------------------------------------
+
+/// Run the KEX + KeyWrap subset of the connect handshake directly on `ws`.
+/// Used by the relay-only path (which doesn't set up WebRTC) so both sides
+/// still end up with a shared `BulkKey` — receiver can then verify the URL
+/// signature commitment against the assembled file post-transfer, and a
+/// compromised relay server cannot substitute a different plaintext without
+/// invalidating `SHA256(data || bulk_key)`.
+///
+/// Must be called BEFORE spawning any pump task on the same `ws` — this
+/// helper drives the socket directly during handshake so KEX frames don't
+/// race with chunk_relay frames.
+///
+/// - Sender: pass `sender_bulk = Some(pre_generated_bulk_key)`; the helper
+///   wraps it under the derived wrap_key and sends `KeyWrap` over the WS.
+/// - Receiver: pass `sender_bulk = None`; the helper waits for `KeyWrap`
+///   and returns the unwrapped bulk key.
+pub(crate) async fn handshake_bulk_key_over_ws(
+    ws: &mut Ws,
+    role: Role,
+    share_key: &ShareKey,
+    session_id_bytes: &[u8; 32],
+    sender_bulk: Option<BulkKey>,
+) -> Result<BulkKey> {
+    use futures_util::{SinkExt, StreamExt};
+    // Local ephemeral, MAC'd with share_key so the peer can authenticate us.
+    let local_ephemeral = Ephemeral::generate();
+    let local_pub = local_ephemeral.public_bytes();
+    let local_mac = share_key.mac_ephemeral_pub(&local_pub);
+    ws_send(ws, &SignalFrame::KexPub {
+        pub_hex: hex_encode(&local_pub),
+        mac_hex: hex_encode(&local_mac),
+    }).await?;
+
+    let mut ephemeral_holder = Some(local_ephemeral);
+    let mut wrap_key: Option<WrapKey> = None;
+    let mut bulk_key: Option<BulkKey> = None;
+    let mut key_wrap_sent = false;
+
+    loop {
+        // Sender is done as soon as KeyWrap is sent; receiver as soon as
+        // KeyWrap is unwrapped.
+        match role {
+            Role::Sender if key_wrap_sent => {
+                return Ok(sender_bulk
+                    .ok_or_else(|| anyhow!("sender bulk key vanished after send"))?);
+            }
+            Role::Receiver => {
+                if let Some(b) = bulk_key.take() { return Ok(b); }
+            }
+            _ => {}
+        }
+
+        let msg = ws.next().await;
+        let frame = match parse_ws_frame(msg)? {
+            Some(f) => f,
+            None => continue,
+        };
+        match frame {
+            SignalFrame::KexPub { pub_hex, mac_hex } => {
+                if wrap_key.is_some() {
+                    warn!("duplicate KexPub during relay handshake — ignoring");
+                    continue;
+                }
+                let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
+                let expected_mac = share_key.mac_ephemeral_pub(&peer_pub);
+                if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                    bail!("relay-handshake KexPub MAC verify failed — peer does not know share key");
+                }
+                let eph = ephemeral_holder.take()
+                    .ok_or_else(|| anyhow!("local ephemeral gone before peer KexPub arrived"))?;
+                let s = eph.derive_shared_secret(&peer_pub)?;
+                let wk = s.wrap_key(session_id_bytes);
+                if let Role::Sender = role {
+                    let b = sender_bulk.as_ref()
+                        .ok_or_else(|| anyhow!("sender called handshake without sender_bulk"))?;
+                    let (nonce, ct) = wk.wrap_bulk_key(b)?;
+                    ws_send(ws, &SignalFrame::KeyWrap {
+                        enc_b_hex: hex_encode(&ct),
+                        nonce_hex: hex_encode(&nonce),
+                    }).await?;
+                    key_wrap_sent = true;
+                }
+                wrap_key = Some(wk);
+            }
+            SignalFrame::KeyWrap { enc_b_hex, nonce_hex } => {
+                let wk = wrap_key.as_ref()
+                    .ok_or_else(|| anyhow!("KeyWrap arrived before KEX complete"))?;
+                let nonce = hex_decode_var(&nonce_hex)?;
+                let ct = hex_decode_var(&enc_b_hex)?;
+                bulk_key = Some(wk.unwrap_bulk_key(&nonce, &ct)?);
+            }
+            _ => { /* ignore other signaling frames during handshake */ }
+        }
+    }
+}
 
 async fn ws_send(ws: &mut Ws, frame: &SignalFrame) -> Result<()> {
     let text = serde_json::to_string(frame).context("frame encode")?;
