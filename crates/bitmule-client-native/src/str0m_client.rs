@@ -262,6 +262,7 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
     ws_send(&mut ws, &SignalFrame::Hello {
         role: Role::Sender.as_str().to_owned(),
         receiver_id: None,
+        wire_version: Some(crate::WIRE_VERSION),
     }).await?;
 
     // Crypto handshake — send our ephemeral immediately, wait for peer's
@@ -302,7 +303,23 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
                             next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
                         }
                     }
-                    SignalFrame::PeerHello { .. } if !peer_hello_seen => {
+                    SignalFrame::PeerHello { wire_version, .. } if !peer_hello_seen => {
+                        // Refuse the session if the peer speaks a different
+                        // wire protocol version — the alternative is a
+                        // silent mid-transfer decode failure that reads as
+                        // "corrupted file." Better to bail cleanly here
+                        // with an "update your client" message.
+                        match wire_version {
+                            Some(v) if v == crate::WIRE_VERSION => { /* ok */ }
+                            Some(v) => bail!(
+                                "peer speaks wire version {v}, we speak {}. Update the older client.",
+                                crate::WIRE_VERSION
+                            ),
+                            None => bail!(
+                                "peer did not advertise a wire version — it's running a pre-v{} client. Update the peer's bitmule.",
+                                crate::WIRE_VERSION
+                            ),
+                        }
                         peer_hello_seen = true;
                         let offer = offer_holder.take().expect("offer set on entry");
                         let offer_sdp = offer.to_sdp_string();
@@ -409,8 +426,9 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     ws_send(&mut ws, &SignalFrame::Hello {
         role: Role::Receiver.as_str().to_owned(),
         receiver_id: Some(receiver_id.clone()),
+        wire_version: Some(crate::WIRE_VERSION),
     }).await?;
-    ws_send(&mut ws, &SignalFrame::PeerHello { receiver_id: Some(receiver_id) }).await?;
+    ws_send(&mut ws, &SignalFrame::PeerHello { receiver_id: Some(receiver_id), wire_version: Some(crate::WIRE_VERSION) }).await?;
 
     // Crypto handshake — same symmetric KEX as send_connect.
     let local_ephemeral = Ephemeral::generate();
@@ -548,7 +566,7 @@ pub async fn send_file_over_dc(
         .unwrap_or_else(|| "file.bin".to_string());
     let total_chunks = if size == 0 { 0 } else { (size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
 
-    let meta_json = serde_json::json!({
+    let meta_plain = serde_json::json!({
         "type": "meta",
         "name": name,
         "size": size,
@@ -556,19 +574,39 @@ pub async fn send_file_over_dc(
         "totalChunks": total_chunks,
     }).to_string();
 
-    // Set the flow-control threshold once, then send meta as a text frame.
+    // Encrypt meta under meta_key with session_id as AAD (binds this meta to
+    // this session). Wire framing: {"type":"meta_enc","nonce_hex":"..","ct_hex":".."}.
+    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session.session_id.as_hex())?;
+    let (meta_nonce, meta_ct) = session.meta_key.encrypt_meta(&session_id_bytes, meta_plain.as_bytes())?;
+    let meta_enc_frame = serde_json::json!({
+        "type": "meta_enc",
+        "nonce_hex": hex_encode(&meta_nonce),
+        "ct_hex": hex_encode(&meta_ct),
+    }).to_string();
+
+    let bulk_key = session.bulk_key.as_ref()
+        .ok_or_else(|| anyhow!("bulk_key missing at chunk-encrypt time — KEX handshake incomplete"))?
+        .clone();
+
+    // Set the flow-control threshold once, then send the encrypted meta as a text frame.
     channel_set_low_threshold(&mut session.rtc, session.channel_id, BUFFERED_LOW_THRESHOLD)?;
-    channel_write_all(session, false, meta_json.as_bytes()).await?;
+    channel_write_all(session, false, meta_enc_frame.as_bytes()).await?;
 
     let mut f = tokio::fs::File::open(file_path).await
         .with_context(|| format!("open {}", file_path.display()))?;
     let mut sent: u64 = 0;
     let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut idx: u64 = 0;
     loop {
         let n = f.read(&mut buf).await?;
         if n == 0 { break; }
-        channel_write_all(session, true, &buf[..n]).await?;
+        // AEAD-encrypt this chunk under bulk_key with a deterministic
+        // nonce derived from idx. Receiver tracks its own idx counter so
+        // the nonce doesn't need to ride on the wire.
+        let ct = bulk_key.encrypt_chunk(idx, &buf[..n])?;
+        channel_write_all(session, true, &ct).await?;
         sent += n as u64;
+        idx += 1;
         on_progress(sent, size);
     }
 
@@ -715,10 +753,16 @@ pub async fn recv_file_over_dc(
     let mut received: u64 = 0;
     let mut done = false;
     let mut buf = vec![0u8; 4096];
+    let mut recv_idx: u64 = 0;
+    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session.session_id.as_hex())?;
+    let bulk_key = session.bulk_key.as_ref()
+        .ok_or_else(|| anyhow!("bulk_key missing at chunk-decrypt time — KEX handshake incomplete"))?
+        .clone();
 
     let mut next_timeout = drain_rtc_capture_data(
         &mut session.rtc, &session.pool, session.channel_id,
         &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
+        &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
     ).await?;
 
     while !done {
@@ -737,6 +781,7 @@ pub async fn recv_file_over_dc(
                         next_timeout = drain_rtc_capture_data(
                             &mut session.rtc, &session.pool, session.channel_id,
                             &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
+                            &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
                         ).await?;
                     }
                 }
@@ -755,6 +800,7 @@ pub async fn recv_file_over_dc(
                 next_timeout = drain_rtc_capture_data(
                     &mut session.rtc, &session.pool, session.channel_id,
                     &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
+                    &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
                 ).await?;
             }
 
@@ -764,6 +810,7 @@ pub async fn recv_file_over_dc(
                 next_timeout = drain_rtc_capture_data(
                     &mut session.rtc, &session.pool, session.channel_id,
                     &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
+                    &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
                 ).await?;
             }
         }
@@ -792,6 +839,10 @@ async fn drain_rtc_capture_data(
     done: &mut bool,
     on_progress: &mut (dyn FnMut(u64, u64, &str) + Send),
     out_dir: &Path,
+    bulk_key: &BulkKey,
+    meta_key: &MetaKey,
+    session_id_bytes: &[u8; 32],
+    recv_idx: &mut u64,
 ) -> Result<Instant> {
     loop {
         match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
@@ -804,8 +855,14 @@ async fn drain_rtc_capture_data(
             Output::Event(Event::ChannelData(ChannelData { id, binary, data })) if id == expected_channel => {
                 if binary {
                     if let Some(f) = file_opt.as_mut() {
-                        f.write_all(&data).await.context("write chunk")?;
-                        *received += data.len() as u64;
+                        // Decrypt this chunk with idx-derived nonce. SCTP is
+                        // ordered so incrementing recv_idx per binary frame
+                        // matches the sender's send-side idx exactly.
+                        let plain = bulk_key.decrypt_chunk(*recv_idx, &data)
+                            .with_context(|| format!("decrypt_chunk idx={}", *recv_idx))?;
+                        f.write_all(&plain).await.context("write chunk")?;
+                        *received += plain.len() as u64;
+                        *recv_idx += 1;
                         if let Some(m) = meta_opt.as_ref() {
                             on_progress(*received, m.size, &m.name);
                         }
@@ -813,7 +870,7 @@ async fn drain_rtc_capture_data(
                         warn!("binary chunk arrived before meta — dropping {} bytes", data.len());
                     }
                 } else {
-                    // Text control frame: meta or done.
+                    // Text control frame: meta_enc or done.
                     let text = match std::str::from_utf8(&data) {
                         Ok(s) => s,
                         Err(_) => { warn!("non-utf8 text frame"); continue; }
@@ -823,8 +880,23 @@ async fn drain_rtc_capture_data(
                         Err(_) => { warn!("bad text frame: {text}"); continue; }
                     };
                     match val.get("type").and_then(|x| x.as_str()) {
-                        Some("meta") => {
-                            match serde_json::from_value::<MetaFrame>(val) {
+                        Some("meta_enc") => {
+                            // Decrypt with meta_key, then parse inner MetaFrame.
+                            let nonce_hex = val.get("nonce_hex").and_then(|x| x.as_str()).unwrap_or("");
+                            let ct_hex = val.get("ct_hex").and_then(|x| x.as_str()).unwrap_or("");
+                            let nonce = match hex_decode_var(nonce_hex) {
+                                Ok(n) => n,
+                                Err(e) => { warn!("meta_enc nonce hex: {e}"); continue }
+                            };
+                            let ct = match hex_decode_var(ct_hex) {
+                                Ok(c) => c,
+                                Err(e) => { warn!("meta_enc ct hex: {e}"); continue }
+                            };
+                            let plain = match meta_key.decrypt_meta(session_id_bytes, &nonce, &ct) {
+                                Ok(p) => p,
+                                Err(e) => { warn!("meta_enc decrypt: {e}"); continue }
+                            };
+                            match serde_json::from_slice::<MetaFrame>(&plain) {
                                 Ok(m) => {
                                     let name = crate::sanitize_filename(&m.name);
                                     let path = out_dir.join(&name);
@@ -835,7 +907,7 @@ async fn drain_rtc_capture_data(
                                     *path_opt = Some(path);
                                     *meta_opt = Some(m);
                                 }
-                                Err(e) => warn!("meta decode: {e}"),
+                                Err(e) => warn!("meta decode after decrypt: {e}"),
                             }
                         }
                         Some("done") => { *done = true; }
@@ -1024,7 +1096,7 @@ async fn send_file_relay(
     // dropping into the relay pump. The returned bulk_key is our own
     // pre-generated one — kept for future chunk encryption (Push B2).
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
-    let _bulk = handshake_bulk_key_over_ws(
+    let (_bulk, _meta) = handshake_bulk_key_over_ws(
         &mut ws, Role::Sender, &share_key, &session_id_bytes, Some(bulk_key),
     ).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1049,7 +1121,7 @@ async fn recv_file_relay(
     // Do this BEFORE the pump takes over the ws so KEX frames don't race
     // chunk_relay frames.
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
-    let bulk_key = handshake_bulk_key_over_ws(
+    let (bulk_key, _meta_key) = handshake_bulk_key_over_ws(
         &mut ws, Role::Receiver, &share_key, &session_id_bytes, None,
     ).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1195,7 +1267,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
     share_key: &ShareKey,
     session_id_bytes: &[u8; 32],
     sender_bulk: Option<BulkKey>,
-) -> Result<BulkKey> {
+) -> Result<(BulkKey, MetaKey)> {
     use futures_util::{SinkExt, StreamExt};
     // Local ephemeral, MAC'd with share_key so the peer can authenticate us.
     let local_ephemeral = Ephemeral::generate();
@@ -1208,6 +1280,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
 
     let mut ephemeral_holder = Some(local_ephemeral);
     let mut wrap_key: Option<WrapKey> = None;
+    let mut meta_key_opt: Option<MetaKey> = None;
     let mut bulk_key: Option<BulkKey> = None;
     let mut key_wrap_sent = false;
 
@@ -1216,11 +1289,15 @@ pub(crate) async fn handshake_bulk_key_over_ws(
         // KeyWrap is unwrapped.
         match role {
             Role::Sender if key_wrap_sent => {
-                return Ok(sender_bulk
-                    .ok_or_else(|| anyhow!("sender bulk key vanished after send"))?);
+                let mk = meta_key_opt.take()
+                    .ok_or_else(|| anyhow!("meta_key not derived on sender path"))?;
+                let bk = sender_bulk.ok_or_else(|| anyhow!("sender bulk key vanished after send"))?;
+                return Ok((bk, mk));
             }
             Role::Receiver => {
-                if let Some(b) = bulk_key.take() { return Ok(b); }
+                if let (Some(b), Some(mk)) = (bulk_key.take(), meta_key_opt.take()) {
+                    return Ok((b, mk));
+                }
             }
             _ => {}
         }
@@ -1246,6 +1323,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
                     .ok_or_else(|| anyhow!("local ephemeral gone before peer KexPub arrived"))?;
                 let s = eph.derive_shared_secret(&peer_pub)?;
                 let wk = s.wrap_key(session_id_bytes);
+                let mk = s.meta_key(session_id_bytes);
                 if let Role::Sender = role {
                     let b = sender_bulk.as_ref()
                         .ok_or_else(|| anyhow!("sender called handshake without sender_bulk"))?;
@@ -1257,6 +1335,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
                     key_wrap_sent = true;
                 }
                 wrap_key = Some(wk);
+                meta_key_opt = Some(mk);
             }
             SignalFrame::KeyWrap { enc_b_hex, nonce_hex } => {
                 let wk = wrap_key.as_ref()

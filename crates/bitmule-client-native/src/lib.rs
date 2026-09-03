@@ -337,6 +337,19 @@ impl Role {
     }
 }
 
+/// Wire-protocol version this client speaks. Bumped whenever the on-wire
+/// format changes in a way that would fail silently. Both sides advertise
+/// this in `SignalFrame::Hello.wire_version` and refuse the session if
+/// they don't match. `None` on the incoming side means "peer is an older
+/// client that didn't send a version" — treated as a mismatch too, so the
+/// error message tells the user to update.
+///
+/// History:
+///   1 — pre-crypto plaintext meta + chunks (deprecated)
+///   2 — AEAD meta (`meta_enc`) + AEAD-per-chunk (idx-derived nonce);
+///       KEX+KeyWrap over WS; ShareLink URL fragment
+pub const WIRE_VERSION: u32 = 2;
+
 /// Wire frames on the signaling WebSocket. Mirrors what `web/main.js` sends.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -345,10 +358,21 @@ pub(crate) enum SignalFrame {
         role: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         receiver_id: Option<String>,
+        /// Wire-protocol version. See [`WIRE_VERSION`]. Absent when
+        /// deserializing a Hello from a pre-v2 client — the receiver
+        /// rejects the session with "please update your client".
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        wire_version: Option<u32>,
     },
     PeerHello {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         receiver_id: Option<String>,
+        /// Wire-protocol version of the OTHER side, as observed by the
+        /// signaling server when it paired us. Server copies from the
+        /// peer's `Hello.wire_version` into this field. Client bails when
+        /// version mismatches ours.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        wire_version: Option<u32>,
     },
     Sdp {
         kind: String, // "offer" | "answer"
