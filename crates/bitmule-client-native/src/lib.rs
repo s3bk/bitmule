@@ -367,6 +367,11 @@ pub(crate) enum SignalFrame {
     PeerHello {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         receiver_id: Option<String>,
+        /// Server-injected role of the peer being announced ("sender" or
+        /// "receiver"). Present when server relays a peer_hello notification,
+        /// absent on the receiver-sent PeerHello that kicks the SDP handshake.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        role: Option<String>,
         /// Wire-protocol version of the OTHER side, as observed by the
         /// signaling server when it paired us. Server copies from the
         /// peer's `Hello.wire_version` into this field. Client bails when

@@ -23,11 +23,20 @@ pub enum Role {
     Receiver,
 }
 
+/// A registered peer: sink for outbound frames + the wire-protocol version
+/// they advertised in their Hello (used to send `peer_hello` notifications
+/// with the counterpart's version so mismatched clients can bail cleanly).
+#[derive(Clone)]
+pub struct PeerEntry {
+    pub sink: PeerSink,
+    pub wire_version: Option<u32>,
+}
+
 /// One session's live signaling state.
 #[derive(Default)]
 pub struct Room {
-    pub sender: Option<PeerSink>,
-    pub receivers: HashMap<ReceiverId, PeerSink>,
+    pub sender: Option<PeerEntry>,
+    pub receivers: HashMap<ReceiverId, PeerEntry>,
 }
 
 impl Room {
@@ -39,13 +48,13 @@ impl Room {
     /// Silently drops sinks whose receive half has been closed.
     pub fn fan_to_receivers(&mut self, frame: &str) {
         self.receivers
-            .retain(|_, sink| sink.send(frame.to_string()).is_ok());
+            .retain(|_, entry| entry.sink.send(frame.to_string()).is_ok());
     }
 
     /// Route a receiver-originated frame to the sender if present.
     pub fn route_to_sender(&self, frame: &str) {
-        if let Some(sink) = &self.sender {
-            let _ = sink.send(frame.to_string());
+        if let Some(entry) = &self.sender {
+            let _ = entry.sink.send(frame.to_string());
         }
     }
 }

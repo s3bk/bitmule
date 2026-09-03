@@ -13,7 +13,7 @@
 //! all ride the same relay.
 
 use crate::{
-    room::{PeerSink, Role},
+    room::{PeerEntry, PeerSink, Role},
     state::AppState,
 };
 use axum::{
@@ -35,6 +35,11 @@ enum HelloFrame {
         role: String,
         #[serde(default)]
         receiver_id: Option<ReceiverId>,
+        /// Client wire-protocol version. Server stores per peer and includes
+        /// in `peer_hello` notifications so the counterpart can detect
+        /// version mismatch and prompt an update.
+        #[serde(default)]
+        wire_version: Option<u32>,
     },
 }
 
@@ -58,7 +63,7 @@ pub async fn ws_handler(
 
 async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionId) {
     // Wait for the initial hello frame.
-    let (role, receiver_id) = match read_hello(&mut socket).await {
+    let (role, receiver_id, wire_version) = match read_hello(&mut socket).await {
         Some(v) => v,
         None => {
             let _ = socket.close().await;
@@ -69,11 +74,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
     let room = state.room(session).await;
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Register into the room. After registering, notify the OTHER role
-    // that a new peer joined — the incumbent uses this to re-emit its
-    // peer_hello (or otherwise re-kick handshake) so a peer_hello that
-    // was sent before the counterpart existed isn't lost forever.
-    let notify_frame: Option<(Role, String)>;
+    // Register into the room. After registering, notify each side of the
+    // OTHER'S wire_version via `peer_hello` frames so a client can bail
+    // cleanly on version mismatch. `to_incumbent` tells the already-present
+    // peer about the newcomer; `to_newcomer` tells the newcomer about the
+    // incumbent (needed on our side because the newcomer's own registration
+    // ran after the incumbent's already-sent frames drained).
+    let self_entry = PeerEntry { sink: tx.clone(), wire_version };
+    let (to_incumbent, to_newcomer_frames): (Option<(Role, String)>, Vec<String>);
     {
         let mut r = room.lock().await;
         match role {
@@ -82,15 +90,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                     let _ = socket.close().await;
                     return;
                 }
-                r.sender = Some(tx.clone());
-                notify_frame = if r.receivers.is_empty() {
+                // Newcomer is sender; incumbents are all receivers.
+                let incumbent_frames: Vec<String> = r.receivers.values()
+                    .map(|entry| build_peer_hello("receiver", entry.wire_version))
+                    .collect();
+                r.sender = Some(self_entry.clone());
+                to_incumbent = if r.receivers.is_empty() {
                     None
                 } else {
                     Some((
                         Role::Receiver,
-                        r#"{"type":"peer_joined","role":"sender"}"#.to_string(),
+                        build_peer_hello("sender", wire_version),
                     ))
                 };
+                to_newcomer_frames = incumbent_frames;
             }
             Role::Receiver => {
                 let rid = match receiver_id {
@@ -100,29 +113,38 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                         return;
                     }
                 };
-                r.receivers.insert(rid, tx.clone());
-                notify_frame = if r.sender.is_some() {
+                // Newcomer is receiver; incumbent is at most one sender.
+                let incumbent_frames: Vec<String> = r.sender.as_ref()
+                    .map(|entry| vec![build_peer_hello("sender", entry.wire_version)])
+                    .unwrap_or_default();
+                r.receivers.insert(rid, self_entry.clone());
+                to_incumbent = if r.sender.is_some() {
                     Some((
                         Role::Sender,
-                        r#"{"type":"peer_joined","role":"receiver"}"#.to_string(),
+                        build_peer_hello("receiver", wire_version),
                     ))
                 } else {
                     None
                 };
+                to_newcomer_frames = incumbent_frames;
             }
         }
     }
-    if let Some((target, frame)) = notify_frame {
+    // Fire notifications AFTER releasing the room lock so we don't hold it
+    // across the send-half sink calls.
+    if let Some((target, frame)) = to_incumbent {
         let r = room.lock().await;
         match target {
             Role::Sender => r.route_to_sender(&frame),
             Role::Receiver => {
-                // fan_to_receivers is &mut; take a fresh mut lock
                 drop(r);
                 let mut r2 = room.lock().await;
                 r2.fan_to_receivers(&frame);
             }
         }
+    }
+    for frame in to_newcomer_frames {
+        let _ = tx.send(frame);
     }
 
     let (mut sink, mut stream) = socket.split();
@@ -171,24 +193,35 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
     out.abort();
 }
 
-async fn read_hello(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>)> {
+async fn read_hello(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, Option<u32>)> {
     while let Some(msg) = socket.next().await {
         match msg.ok()? {
             Message::Text(t) => {
                 let parsed: HelloFrame = serde_json::from_str(&t).ok()?;
-                let HelloFrame::Hello { role, receiver_id } = parsed;
+                let HelloFrame::Hello { role, receiver_id, wire_version } = parsed;
                 let role = match role.as_str() {
                     "sender" => Role::Sender,
                     "receiver" => Role::Receiver,
                     _ => return None,
                 };
-                return Some((role, receiver_id));
+                return Some((role, receiver_id, wire_version));
             }
             Message::Close(_) => return None,
             _ => continue,
         }
     }
     None
+}
+
+/// Build a peer_hello notification frame. Wraps counterpart's role +
+/// wire_version so the recipient can bail on version mismatch. Kept as a
+/// helper so the two call sites (incumbent-notified, newcomer-notified)
+/// stay in sync.
+fn build_peer_hello(peer_role: &str, wire_version: Option<u32>) -> String {
+    match wire_version {
+        Some(v) => format!(r#"{{"type":"peer_hello","role":"{peer_role}","wire_version":{v}}}"#),
+        None => format!(r#"{{"type":"peer_hello","role":"{peer_role}"}}"#),
+    }
 }
 
 // Tag-along: PeerSink is re-exported for cross-module type reference in

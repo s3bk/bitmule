@@ -428,7 +428,7 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
         receiver_id: Some(receiver_id.clone()),
         wire_version: Some(crate::WIRE_VERSION),
     }).await?;
-    ws_send(&mut ws, &SignalFrame::PeerHello { receiver_id: Some(receiver_id), wire_version: Some(crate::WIRE_VERSION) }).await?;
+    ws_send(&mut ws, &SignalFrame::PeerHello { receiver_id: Some(receiver_id), role: None, wire_version: Some(crate::WIRE_VERSION) }).await?;
 
     // Crypto handshake — same symmetric KEX as send_connect.
     let local_ephemeral = Ephemeral::generate();
@@ -461,6 +461,22 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                         if let Some(remote) = parse_ice_candidate(&c).await {
                             rtc.add_remote_candidate(remote);
                             next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
+                        }
+                    }
+                    SignalFrame::PeerHello { wire_version, .. } => {
+                        // Server-injected peer_hello carrying the sender's
+                        // wire_version. Bail on mismatch — the alternative
+                        // is a silent decode failure mid-transfer.
+                        match wire_version {
+                            Some(v) if v == crate::WIRE_VERSION => { /* ok */ }
+                            Some(v) => bail!(
+                                "peer speaks wire version {v}, we speak {}. Update the older client.",
+                                crate::WIRE_VERSION
+                            ),
+                            None => bail!(
+                                "peer did not advertise a wire version — running a pre-v{} client. Update the peer's bitmule.",
+                                crate::WIRE_VERSION
+                            ),
                         }
                     }
                     SignalFrame::Sdp { kind, sdp } if kind == "offer" => {
