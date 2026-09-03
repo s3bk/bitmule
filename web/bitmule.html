@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="green">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bitmule</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+
+  /* ============================================================
+     COLOR VARIABLES — named by function, not by hue.
+     Every theme below sets the same set of names; nothing in the
+     rest of the stylesheet ever references a raw color value.
+     ============================================================ */
+  :root,
+  html[data-theme="green"]{
+    --color-bg:            #10201F;  /* page background */
+    --color-surface:       #16302E;  /* card / panel background */
+    --color-surface-alt:   #1B3937;  /* secondary panel background (e.g. crypto cards) */
+    --color-border:        rgba(232, 230, 222, 0.14); /* hairline / subtle divider */
+    --color-border-strong: rgba(232, 230, 222, 0.28); /* header rule, stronger divider */
+    --color-text:          #EAE6DA;  /* primary text */
+    --color-text-muted:    #9FB0AC;  /* secondary text */
+    --color-text-faint:    #6E8681;  /* tertiary / label text */
+    --color-accent:        #D89A47;  /* primary accent — prices, wordmark, emphasis */
+    --color-accent-dim:    #9A6E37;  /* primary accent, subdued (borders) */
+    --color-accent-wash:   rgba(216, 154, 71, 0.08); /* primary accent, translucent fill */
+    --color-accent-2:      #6FBBAF;  /* secondary accent — links, crypto highlights */
+  }
+
+  html[data-theme="bw"]{
+    --color-bg:            #FFFFFF;
+    --color-surface:       #F4F4F3;
+    --color-surface-alt:   #EBEBE9;
+    --color-border:        rgba(17, 17, 17, 0.14);
+    --color-border-strong: rgba(17, 17, 17, 0.32);
+    --color-text:          #111111;
+    --color-text-muted:    #545454;
+    --color-text-faint:    #8A8A8A;
+    --color-accent:        #000000;
+    --color-accent-dim:    #4A4A4A;
+    --color-accent-wash:   rgba(0, 0, 0, 0.05);
+    --color-accent-2:      #6E6E6E;
+  }
+
+  html[data-theme="beige"]{
+    --color-bg:            #E8DCC3;
+    --color-surface:       #E0D0AE;
+    --color-surface-alt:   #D6C39B;
+    --color-border:        rgba(59, 42, 20, 0.18);
+    --color-border-strong: rgba(59, 42, 20, 0.34);
+    --color-text:          #2B1E12;
+    --color-text-muted:    #5C4831;
+    --color-text-faint:    #8A7455;
+    --color-accent:        #7A3B1E;
+    --color-accent-dim:    #5C2C15;
+    --color-accent-wash:   rgba(122, 59, 30, 0.09);
+    --color-accent-2:      #55613F;
+  }
+
+  html[data-theme="purple"]{
+    --color-bg:            #150A24;
+    --color-surface:       #201238;
+    --color-surface-alt:   #2A1848;
+    --color-border:        rgba(216, 190, 255, 0.15);
+    --color-border-strong: rgba(216, 190, 255, 0.30);
+    --color-text:          #EEE6FB;
+    --color-text-muted:    #B5A4D9;
+    --color-text-faint:    #8072A8;
+    --color-accent:        #BB8CF7;
+    --color-accent-dim:    #7C4FB0;
+    --color-accent-wash:   rgba(187, 140, 247, 0.10);
+    --color-accent-2:      #46E0C8;
+  }
+
+  /* ============================================================
+     base
+     ============================================================ */
+  *{box-sizing:border-box;margin:0;padding:0;min-width:0;}
+  html{transition:background-color .25s ease;}
+  html,body{background:var(--color-bg);color:var(--color-text);font-family:'Inter', sans-serif;}
+  body{
+    display:flex;
+    flex-direction:column;
+    min-height:100vh;
+    padding:24px clamp(16px,4vw,64px) 40px;
+    transition:background-color .25s ease, color .25s ease;
+  }
+  ::-webkit-scrollbar{width:8px;height:8px;}
+  ::-webkit-scrollbar-thumb{background:var(--color-border-strong);border-radius:4px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  a{color:var(--color-accent-2);}
+
+  .wrap{max-width:920px;width:100%;margin:0 auto;display:flex;flex-direction:column;}
+
+  /* header */
+  header{
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    flex-wrap:wrap;
+    gap:14px 20px;
+    border-bottom:1px solid var(--color-border-strong);
+    padding-bottom:16px;
+    margin-bottom:34px;
+  }
+  .wordmark{
+    font-family:'Newsreader', serif;
+    font-size:clamp(26px,3.6vw,34px);
+    font-weight:500;
+    letter-spacing:-0.01em;
+    color:var(--color-text);
+    line-height:1.1;
+  }
+  .wordmark span{color:var(--color-accent);}
+  .tagline{
+    font-size:13px;
+    color:var(--color-text-muted);
+    font-family:'Newsreader', serif;
+    font-style:italic;
+  }
+  .logo {
+    width: 250px;
+    height: 250px;
+    margin: auto;
+    background-size: contain;
+  }
+
+  html[data-theme="bw"] .logo {
+    background-image: url("icons/icon_bw_500.webp");
+    mix-blend-mode: multiply;
+  }
+
+html[data-theme="beige"] .logo {
+    background-image: url("icons/icon_bw_500.webp");
+    mix-blend-mode: multiply;
+}
+  html[data-theme="purple"] .logo {
+    background-image: url("icons/icon_bw_500.webp");
+    mix-blend-mode: plus-lighter;
+    filter: invert(1);
+  }
+  html[data-theme="green"] .logo {
+    background-image: url("icons/icon_color.webp");
+  }
+
+  /* theme chooser */
+  .theme-chooser{
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+    align-items:flex-end;
+  }
+  .theme-chooser .label{
+    font-size:10.5px;
+    color:var(--color-text-faint);
+  }
+  .theme-options{display:flex;gap:6px;}
+  .theme-btn{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    background:var(--color-surface);
+    border:1px solid var(--color-border);
+    border-radius:20px;
+    padding:5px 10px 5px 6px;
+    font-family:'Inter', sans-serif;
+    font-size:11px;
+    color:var(--color-text-muted);
+    cursor:pointer;
+    transition:border-color .15s ease, color .15s ease;
+  }
+  .theme-btn:hover{color:var(--color-text);border-color:var(--color-border-strong);}
+  .theme-btn.active{color:var(--color-text);border-color:var(--color-accent);}
+  .swatch{
+    width:13px;height:13px;border-radius:50%;
+    border:1px solid rgba(0,0,0,0.15);
+    flex-shrink:0;
+  }
+  .swatch.sw-green{background:linear-gradient(135deg,#10201F 50%,#D89A47 50%);}
+  .swatch.sw-bw{background:linear-gradient(135deg,#FFFFFF 50%,#111111 50%);}
+  .swatch.sw-beige{background:linear-gradient(135deg,#E8DCC3 50%,#7A3B1E 50%);}
+  .swatch.sw-purple{background:linear-gradient(135deg,#150A24 50%,#BB8CF7 50%);}
+
+  /* section rhythm */
+  section.page-section{
+    padding:26px 0;
+    border-bottom:1px solid var(--color-border);
+    display:flex;
+    flex-direction:column;
+    gap:14px;
+  }
+  section.page-section:last-of-type{border-bottom:none;padding-bottom:0;}
+  .section-head{
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+    text-align:left;
+  }
+  h2{
+    font-family:'Newsreader', serif;
+    font-size:clamp(19px,2.4vw,23px);
+    font-weight:600;
+    color:var(--color-text);
+    text-align:left;
+  }
+  .section-note{
+    font-family:'Newsreader', serif;
+    font-style:italic;
+    font-size:12.5px;
+    color:var(--color-text-faint);
+    text-align:left;
+  }
+  .lede{
+    font-family:'Newsreader', serif;
+    font-size:15.5px;
+    line-height:1.6;
+    color:var(--color-text-muted);
+    max-width:70ch;
+  }
+  .lede b{color:var(--color-text);font-weight:600;}
+
+  /* card grid */
+  .grid{display:grid;gap:14px;}
+  .grid.cols-2{grid-template-columns:repeat(auto-fit, minmax(260px,1fr));}
+  .grid.cols-3{grid-template-columns:repeat(auto-fit, minmax(210px,1fr));}
+  .block{
+    background:var(--color-surface);
+    border:1px solid var(--color-border);
+    border-radius:3px;
+    padding:14px 16px;
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+    text-align:left;
+  }
+  .block.alt{background:var(--color-surface-alt);}
+  .block-title{
+    font-family:'Newsreader', serif;
+    font-size:14.5px;
+    font-weight:600;
+    color:var(--color-text);
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:8px;
+    flex-wrap:wrap;
+  }
+  .block-title small{
+    font-family:'Inter', sans-serif;
+    font-size:10px;
+    font-weight:400;
+    color:var(--color-text-faint);
+    white-space:nowrap;
+  }
+
+  ul{list-style:none;display:flex;flex-direction:column;gap:6px;}
+  li{
+    font-size:12.5px;
+    color:var(--color-text-muted);
+    line-height:1.55;
+    padding-left:12px;
+    position:relative;
+  }
+  li::before{content:"–";position:absolute;left:0;top:0;color:var(--color-text-faint);}
+  li b{color:var(--color-text);font-weight:500;}
+  li .accent2{color:var(--color-accent-2);font-weight:500;}
+
+  /* platform table */
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  td{padding:7px 0;vertical-align:baseline;border-bottom:1px solid var(--color-border);}
+  tr:last-child td{border-bottom:none;}
+  td.name{color:var(--color-text);}
+  td.price{color:var(--color-accent);text-align:right;white-space:nowrap;font-weight:600;}
+  td.note{color:var(--color-text-faint);font-size:11px;text-align:right;padding-left:12px;}
+
+  /* pro tier cards */
+  .tiers{display:flex;gap:14px;flex-wrap:wrap;}
+  .tier{
+    flex:1 1 260px;
+    border:1px solid var(--color-border);
+    border-radius:3px;
+    padding:14px 16px;
+    display:flex;
+    flex-direction:row;
+    align-items:center;
+    justify-content:space-between;
+    gap:16px;
+    background:var(--color-surface);
+    text-align:left;
+  }
+  .tier.ext{border-color:var(--color-accent-dim);background:var(--color-accent-wash);}
+  .tier-what{display:flex;flex-direction:column;gap:3px;}
+  .tier-name{font-size:11.5px;color:var(--color-text-muted);}
+  .tier-spec{font-size:12.5px;color:var(--color-text);}
+  .tier-price{
+    font-family:'Newsreader', serif;
+    font-size:24px;
+    font-weight:600;
+    color:var(--color-text);
+    line-height:1.1;
+    text-align:right;
+    white-space:nowrap;
+    flex-shrink:0;
+  }
+  .tier-price sub{font-family:'Inter', sans-serif;font-size:10.5px;color:var(--color-text-faint);}
+
+  .overage{
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    flex-wrap:wrap;
+    font-size:11px;
+    color:var(--color-text-faint);
+    border-top:1px dashed var(--color-border);
+    padding-top:10px;
+    margin-top:2px;
+  }
+  .overage b{color:var(--color-accent-2);font-weight:600;}
+
+  .cipher-strip{
+    font-size:11px;
+    color:var(--color-accent-2);
+    display:flex;
+    gap:12px;
+    flex-wrap:wrap;
+    align-items:center;
+  }
+  .cipher-strip b{color:var(--color-text);font-weight:600;}
+  .dot{color:var(--color-text-faint);}
+
+  .accepted-tag{
+    display:inline-block;
+    font-size:9.5px;
+    color:var(--color-accent);
+    border:1px solid var(--color-accent-dim);
+    border-radius:2px;
+    padding:0 5px;
+    margin-left:6px;
+    vertical-align:1px;
+  }
+
+  footer{
+    padding-top:22px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    flex-wrap:wrap;
+    gap:6px 16px;
+    font-size:11px;
+    color:var(--color-text-faint);
+    text-align:left;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <div class="wordmark">bit<span>mule</span></div>
+      <div class="tagline">Carries your files. Never reads what it's carrying.</div>
+    </div>
+    <div class="theme-chooser">
+      <div class="label">theme</div>
+      <div class="theme-options" id="theme-options">
+        <button class="theme-btn active" data-theme-btn="green"><span class="swatch sw-green"></span>Green</button>
+        <button class="theme-btn" data-theme-btn="bw"><span class="swatch sw-bw"></span>Black &amp; white</button>
+        <button class="theme-btn" data-theme-btn="beige"><span class="swatch sw-beige"></span>Beige</button>
+        <button class="theme-btn" data-theme-btn="purple"><span class="swatch sw-purple"></span>Purple</button>
+      </div>
+    </div>
+  </header>
+  <div class="logo"></div>
+  <!-- WHAT IS IT -->
+  <section class="page-section">
+    <div class="section-head"><h2>What is it?</h2></div>
+    <p class="lede">
+      <b>bitmule</b> is an end-to-end encrypted file transfer tool. Send something directly, peer-to-peer,
+      for free — or subscribe to hosted uploads and a hosted inbox so you can send and receive without
+      either device staying online. Desktop, CLI, web and mobile all speak the same protocol, and the
+      server is built to never see what's inside your files, encrypted or not.
+    </p>
+  </section>
+
+  <!-- PRIVACY AND SECURITY -->
+  <section class="page-section">
+    <div class="section-head"><h2>Privacy and security</h2></div>
+    <div class="grid cols-2">
+      <div class="block">
+        <div class="block-title">How it's protected</div>
+        <ul>
+          <li>End-to-end encryption in <b>two layers</b> — files are compressed, padded and encrypted before they ever leave your device.</li>
+          <li>The server never sees your key. For direct shares, the decryption key lives in a piece of the link itself that's never sent anywhere.</li>
+          <li>Optional password protection layered on top of the link-based key, for an extra step when you want one.</li>
+          <li>Identifying metadata — EXIF and similar — is stripped automatically before encryption.</li>
+        </ul>
+      </div>
+      <div class="block">
+        <div class="block-title">What we deliberately don't do</div>
+        <ul>
+          <li>No server-side virus scanning.</li>
+          <li>No link previews or thumbnails.</li>
+          <li>No watermarking.</li>
+          <li>No content-based audit trails.</li>
+          <li>All of these would require seeing inside your files — and by design, we can't.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- SUPPORTED PLATFORMS AND PRICES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Supported platforms <span style="font-family:'Newsreader',serif;font-style:italic;font-weight:400;font-size:15px;color:var(--color-text-faint);">(and prices)</span></h2></div>
+    <table>
+      <tr><td class="name">Desktop app</td><td class="price">free</td><td class="note">open source</td></tr>
+      <tr><td class="name">CLI</td><td class="price">free</td><td class="note">open source, scriptable</td></tr>
+      <tr><td class="name">Web app</td><td class="price">free</td><td class="note">no sign-up for direct (P2P) sharing</td></tr>
+      <tr><td class="name">Android app</td><td class="price">5€</td><td class="note">one-time purchase</td></tr>
+      <tr><td class="name">iOS app</td><td class="price">10€</td><td class="note">one-time purchase</td></tr>
+    </table>
+    <p class="lede" style="font-size:12.5px;">Pro services (hosted uploads and hosted inbox) work identically across every platform above.</p>
+  </section>
+
+  <!-- FREE FEATURES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Free features</h2></div>
+    <div class="grid cols-2">
+      <div class="block">
+        <div class="block-title">Direct sharing <small>P2P</small></div>
+        <ul>
+          <li>Share files and folders instantly via a link — the recipient's browser or app starts downloading automatically.</li>
+          <li><b>No account</b> needed to send or receive.</li>
+          <li>Works across desktop, CLI and web today.</li>
+        </ul>
+      </div>
+      <div class="block">
+        <div class="block-title">Desktop, CLI &amp; web</div>
+        <ul>
+          <li>Full-featured, no paywall — desktop and CLI are open source; the web app needs no install.</li>
+          <li>The web app doesn't do background sync or auto-upload — a browser limitation, not a pricing one.</li>
+          <li>Mobile apps add native convenience (share-sheet, background sync, camera roll, push) for a small one-time fee, but do nothing the web app can't already do.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- PAID FEATURES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Paid features</h2></div>
+    <div class="grid cols-3">
+      <div class="block">
+        <div class="block-title">Hosted uploads</div>
+        <ul>
+          <li>Upload once, get a <b>persistent link</b> that works any time — your device doesn't need to stay online.</li>
+          <li>Unique per-recipient links, individually revocable, or a shared link with a download cap.</li>
+          <li>Mix both on the same upload.</li>
+          <li>Default 7-day expiry, adjustable account-wide or per upload.</li>
+          <li>A single-use link is only spent once the download <b>completes</b> successfully.</li>
+        </ul>
+      </div>
+      <div class="block">
+        <div class="block-title">Hosted inbox</div>
+        <ul>
+          <li>Let anyone send you files without your device being online.</li>
+          <li>One-time upload links via app, CLI or <span class="accent2">REST API</span>.</li>
+          <li><b>Standing upload access</b> for regular contacts, with configurable storage and file-count limits.</li>
+          <li>Uploads encrypt directly to your identity; only your private key opens them.</li>
+          <li>Batch links and webhooks for events, classes, vendor lists, or your own automation.</li>
+        </ul>
+      </div>
+      <div class="block">
+        <div class="block-title">Trust &amp; contacts</div>
+        <ul>
+          <li>Add a contact by public key or fingerprint, or import by username with a fingerprint confirmation step.</li>
+          <li>Optional multi-device key sync, or keep a key on one device for maximum control.</li>
+          <li><b>Key rotation</b> is self-signed by the old key — contacts update automatically, in-flight links still resolve.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- PRICING FOR PAID FEATURES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Pricing for paid features</h2></div>
+    <div class="tiers">
+      <div class="tier">
+        <div class="tier-what">
+          <div class="tier-name">Basic</div>
+          <div class="tier-spec">100GB storage · 500GB bandwidth</div>
+        </div>
+        <div class="tier-price">4€<sub>/mo</sub></div>
+      </div>
+      <div class="tier ext">
+        <div class="tier-what">
+          <div class="tier-name">Extended</div>
+          <div class="tier-spec">500GB storage · 2TB bandwidth</div>
+        </div>
+        <div class="tier-price">10€<sub>/mo</sub></div>
+      </div>
+    </div>
+    <ul>
+      <li>Identity verification (payment + email, at minimum) is required for both tiers — abuse mitigation, not a trial gate.</li>
+      <li>Billed at Extended but usage stays within Basic's caps for a period → <b>auto-downgraded</b> to the Basic price for that period.</li>
+      <li>Under 20% of your billed tier's caps (peak storage and summed bandwidth) → cancel for a <b>full refund</b> on that period. Trial insurance, not a recurring rebate.</li>
+    </ul>
+    <div class="overage">
+      <span>overage, flat &amp; metered: storage <b>0.006€/GB·mo</b></span>
+      <span>bandwidth <b>0.0025€/GB</b></span>
+      <span>no packs to buy, nothing to roll over</span>
+    </div>
+  </section>
+
+  <!-- CRYPTO DETAILS -->
+  <section class="page-section">
+    <div class="section-head">
+      <h2>Crypto details</h2>
+      <span class="section-note">for those who care — spec v1, reviewed 2026-09-03</span>
+    </div>
+    <div class="cipher-strip">
+      <span><b>AES-256-GCM</b> bulk cipher</span>
+      <span class="dot">/</span>
+      <span><b>X25519</b> ephemeral exchange</span>
+      <span class="dot">/</span>
+      <span><b>forward secrecy</b> by design</span>
+      <span class="dot">/</span>
+      <span>fails closed, never to plaintext</span>
+    </div>
+    <div class="grid cols-3">
+      <div class="block alt">
+        <div class="block-title">Key exchange</div>
+        <ul>
+          <li>Fresh <b>X25519</b> keypair per session; DH secret HKDF-split into independent wrap and meta keys.</li>
+          <li>Ephemeral privates are wiped right after use, so a leaked link later can't reconstruct a past session's key.</li>
+        </ul>
+      </div>
+      <div class="block alt">
+        <div class="block-title">Bulk transfer</div>
+        <ul>
+          <li>Bulk stream key <span class="accent2">B</span> is fresh per file, chunk-indexed nonces, AEAD on every chunk.</li>
+          <li>Missing chunk at close-out → transfer <b>rejected</b>, not silently corrupted.</li>
+        </ul>
+      </div>
+      <div class="block alt">
+        <div class="block-title">Failure mode</div>
+        <ul>
+          <li>No plaintext fallback — a failed key exchange errors the transfer instead of downgrading.<span class="accepted-tag">fail closed</span></li>
+          <li>Optional Ed25519 signature proves sender identity without breaking anonymous sends.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>bitmule — a mule for your bits. It carries the crate; it never asks what's inside.</span>
+    <span>Have a feature request, or found something that doesn't work as described? <a href="#">Tell us</a>.</span>
+  </footer>
+
+</div>
+
+<script>
+  var buttons = document.querySelectorAll('[data-theme-btn]');
+  buttons.forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var theme = btn.getAttribute('data-theme-btn');
+      document.documentElement.setAttribute('data-theme', theme);
+      buttons.forEach(function(b){ b.classList.remove('active'); });
+      btn.classList.add('active');
+    });
+  });
+</script>
+
+</body>
+</html>
