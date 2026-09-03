@@ -35,7 +35,11 @@ struct SenderState {
     mode: ServeMode,             // Complete | Multi
     ws: Ws,                      // single WS for all signaling
     peers: HashMap<ReceiverId, PeerHandle>,
-    completed_covered: HashSet<u64>, // for --complete predicate: chunks any peer has requested
+    // NOTE: no served_union field — the truth about "what has been served"
+    // lives per-peer on the PeerHandle/PeerSession (see below). The
+    // --complete exit predicate iterates peers.values() and unions their
+    // covered sets on demand. That way there's a single source of truth
+    // per peer, no parent-side aggregate to keep in sync.
 }
 ```
 
@@ -47,9 +51,12 @@ struct PeerHandle {
     // Task handle; task itself owns Rtc + pool + wrap_key + meta_key
     // and its dedicated DC channel_id.
     task: JoinHandle<Result<()>>,
-    // Cross-task command channel: parent tells task to shut down, task
-    // reports covered-ranges back for --complete predicate.
-    covered_tx: mpsc::UnboundedSender<CoveredNote>,
+    // Covered set for THIS peer, shared with the task via Arc<Mutex<...>>.
+    // Task appends after each chunk is served; parent reads to compute
+    // union for the --complete exit predicate. Also readable for progress
+    // reporting per peer.
+    covered: Arc<Mutex<HashSet<u64>>>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 // Owned inside the per-peer task's scope:
@@ -60,6 +67,7 @@ struct PeerSession {
     channel_id: ChannelId,
     wrap_key: WrapKey,   // per-peer, from own ephemeral X25519
     meta_key: MetaKey,   // per-peer
+    covered: Arc<Mutex<HashSet<u64>>>,  // same Arc as PeerHandle.covered
     // bulk_key shared from parent (Arc<BulkKey>)
 }
 ```
@@ -171,9 +179,9 @@ Sender exits once the **UNION** of all peers' covered ranges spans
 set. The mental model is "the data is out of the sender's hands," not
 "one receiver has finished."
 
-Parent tracks a single `HashSet<u64>` (or better, a bitmap) of every
-chunk that any peer has requested and been served. When
-`covered_union.len() == total_chunks`, parent:
+Parent computes the union on demand by iterating `peers.values()` and
+merging each peer's `covered` set (each held under its own Arc<Mutex>>
+by the per-peer task). When `union.len() == total_chunks`, parent:
 1. Signals all peer tasks to shut down.
 2. Awaits their exit.
 3. Returns Ok(()) from cmd_send.
