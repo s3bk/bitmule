@@ -1379,6 +1379,67 @@ async fn ws_send(ws: &mut Ws, frame: &SignalFrame) -> Result<()> {
     Ok(())
 }
 
+/// Send a frame with an optional `to_receiver_id` routing tag injected at
+/// the JSON top level. Server (Phase M1) forwards to only that receiver.
+/// `None` = fan-to-all (backward-compat with the single-receiver stack).
+#[allow(dead_code)]
+async fn ws_send_targeted(
+    ws: &mut Ws,
+    frame: &SignalFrame,
+    to_receiver_id: Option<&str>,
+) -> Result<()> {
+    let mut v = serde_json::to_value(frame).context("frame encode")?;
+    if let (Some(rid), Some(obj)) = (to_receiver_id, v.as_object_mut()) {
+        obj.insert("to_receiver_id".to_string(), serde_json::Value::String(rid.to_string()));
+    }
+    let text = serde_json::to_string(&v).context("frame reencode")?;
+    ws.send(Message::Text(text.into())).await.context("ws send")?;
+    Ok(())
+}
+
+/// Send a frame from a receiver, tagging it with `from_receiver_id` at the
+/// JSON top level so the sender's per-peer dispatch can route it. Server
+/// (Phase M1b) verifies the tag matches the receiver's registered id.
+#[allow(dead_code)]
+async fn ws_send_from(
+    ws: &mut Ws,
+    frame: &SignalFrame,
+    from_receiver_id: &str,
+) -> Result<()> {
+    let mut v = serde_json::to_value(frame).context("frame encode")?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "from_receiver_id".to_string(),
+            serde_json::Value::String(from_receiver_id.to_string()),
+        );
+    }
+    let text = serde_json::to_string(&v).context("frame reencode")?;
+    ws.send(Message::Text(text.into())).await.context("ws send")?;
+    Ok(())
+}
+
+/// Same shape as `parse_ws_frame`, but ALSO extracts the top-level
+/// `from_receiver_id` (if present) alongside the parsed SignalFrame. Used
+/// by the sender's per-peer dispatch to route an incoming answer / ICE /
+/// KexPub / KeyWrap to the right per-peer task.
+#[allow(dead_code)]
+fn parse_ws_frame_with_from_id(
+    msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+) -> Result<Option<(SignalFrame, Option<String>)>> {
+    let text = match msg {
+        Some(Ok(Message::Text(t))) => t.to_string(),
+        Some(Ok(Message::Close(_))) | None => bail!("ws closed pre-channel-open"),
+        Some(Err(e)) => bail!("ws recv: {e}"),
+        _ => return Ok(None),
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(None);
+    };
+    let from = v.get("from_receiver_id").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let frame: Option<SignalFrame> = serde_json::from_value(v).ok();
+    Ok(frame.map(|f| (f, from)))
+}
+
 /// Decode a single tungstenite result into an optional SignalFrame.
 /// Returns Ok(None) for non-text frames + parse failures (silent skip),
 /// bails on stream close or transport error (both mean the session is
