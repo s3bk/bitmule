@@ -1,0 +1,10 @@
+[package]
+name = "bitmule-gtk4"
+edition = "2024"
+
+[dependencies]
+gtk4 = "0.11.4"
+glib = "0.22.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = "0.11" # Example for Url
+url = "*"
