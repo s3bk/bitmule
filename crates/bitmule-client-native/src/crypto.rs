@@ -107,6 +107,78 @@ impl Drop for ShareKey {
     fn drop(&mut self) { self.0.zeroize(); }
 }
 
+/// URL-fragment payload: 32-byte `share_key` (URL secret, drives session_id
+/// + KEX MAC) followed by 32-byte `signature` (data commitment = SHA256(data
+/// || bulk_key)). Encoded as base64url (no padding) in the URL fragment.
+///
+/// Layout is `share_key || signature`, decoded by taking the first 32 bytes
+/// as share_key and the remainder as signature — share_key size is fixed so
+/// no length prefix is needed.
+#[derive(Clone)]
+pub struct ShareLink {
+    pub share_key: ShareKey,
+    pub signature: [u8; 32],
+}
+
+impl ShareLink {
+    pub fn new(share_key: ShareKey, signature: [u8; 32]) -> Self {
+        Self { share_key, signature }
+    }
+
+    /// Base64url-no-pad encoding of `share_key || signature` (64 bytes → 86 chars).
+    pub fn to_b64_url(&self) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&self.share_key.0);
+        buf[32..].copy_from_slice(&self.signature);
+        URL_SAFE_NO_PAD.encode(buf)
+    }
+
+    pub fn from_b64_url(s: &str) -> Result<Self> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let raw = URL_SAFE_NO_PAD.decode(s.as_bytes())
+            .context("share link is not valid base64url")?;
+        if raw.len() != 64 {
+            bail!("share link must decode to 64 bytes, got {}", raw.len());
+        }
+        let mut sk = [0u8; 32];
+        let mut sig = [0u8; 32];
+        sk.copy_from_slice(&raw[..32]);
+        sig.copy_from_slice(&raw[32..]);
+        Ok(Self { share_key: ShareKey(sk), signature: sig })
+    }
+
+    /// Convenience: verify that this link's signature commits to `data` under
+    /// `bulk_key`. Constant-time.
+    pub fn verify_signature(&self, data: &[u8], bulk_key: &BulkKey) -> bool {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.update(bulk_key.0);
+        let computed: [u8; 32] = hasher.finalize().into();
+        constant_time_eq(&self.signature, &computed)
+    }
+}
+
+/// Streaming SHA256(data || bulk_key.0) — for sender-side commitment
+/// generation without loading the whole file into memory. Feed the file
+/// contents through `update`, then call `finalize` with the bulk key.
+pub struct CommitmentHasher {
+    inner: Sha256,
+}
+
+impl Default for CommitmentHasher {
+    fn default() -> Self { Self::new() }
+}
+
+impl CommitmentHasher {
+    pub fn new() -> Self { Self { inner: Sha256::new() } }
+    pub fn update(&mut self, chunk: &[u8]) { self.inner.update(chunk); }
+    pub fn finalize(mut self, bulk_key: &BulkKey) -> [u8; 32] {
+        self.inner.update(bulk_key.0);
+        self.inner.finalize().into()
+    }
+}
+
 /// Local half of the ephemeral X25519 pair, consumed on `derive_shared_key`.
 /// Wraps `EphemeralSecret` from `x25519-dalek` so callers can't accidentally
 /// use it twice — the derivation call moves the secret in.
@@ -455,5 +527,50 @@ mod tests {
         let w = s.wrap_key(&sid);
         let m = s.meta_key(&sid);
         assert_ne!(w.0, m.0);
+    }
+
+    #[test]
+    fn share_link_b64_roundtrip() {
+        let sk = ShareKey::random();
+        let sig = { let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b };
+        let link = ShareLink::new(sk.clone(), sig);
+        let s = link.to_b64_url();
+        assert_eq!(s.len(), 86); // base64url-no-pad of 64 bytes
+        let link2 = ShareLink::from_b64_url(&s).unwrap();
+        assert_eq!(link2.share_key.0, sk.0);
+        assert_eq!(link2.signature, sig);
+    }
+
+    #[test]
+    fn share_link_bad_length_rejects() {
+        // 63 raw bytes → decodes but wrong length
+        let short = "A".repeat(84);
+        assert!(ShareLink::from_b64_url(&short).is_err());
+        // garbage
+        assert!(ShareLink::from_b64_url("!!!").is_err());
+    }
+
+    #[test]
+    fn commitment_hasher_matches_one_shot_and_verify() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        let key = BulkKey::random();
+        // one-shot via existing helper
+        let one_shot = ShareKey::from_data_commitment(data, &key);
+        // streaming
+        let mut h = CommitmentHasher::new();
+        h.update(&data[..10]);
+        h.update(&data[10..25]);
+        h.update(&data[25..]);
+        let sig = h.finalize(&key);
+        assert_eq!(sig, one_shot.0);
+        // and ShareLink::verify_signature agrees
+        let link = ShareLink::new(ShareKey::random(), sig);
+        assert!(link.verify_signature(data, &key));
+        // tampered data fails
+        let tampered = b"the quick brown fox jumps over the LAZY dog";
+        assert!(!link.verify_signature(tampered, &key));
+        // wrong key fails
+        let wrong = BulkKey::random();
+        assert!(!link.verify_signature(data, &wrong));
     }
 }

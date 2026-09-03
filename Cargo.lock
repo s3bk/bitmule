@@ -509,6 +509,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "base64",
  "bitmule-core",
  "bytes",
  "futures-util",
