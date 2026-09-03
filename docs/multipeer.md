@@ -166,15 +166,24 @@ is a lot cheaper than 1024 separate reads.
 
 ## `--complete` early exit predicate
 
-Parent tracks `Vec<HashSet<u64>>` — one covered set per active peer.
-When any peer's set reaches full coverage, parent:
-1. Signals all peer tasks to shut down (via their command channels).
+Sender exits once the **UNION** of all peers' covered ranges spans
+`0..total_chunks`. It does NOT wait for any single peer to have the full
+set. The mental model is "the data is out of the sender's hands," not
+"one receiver has finished."
+
+Parent tracks a single `HashSet<u64>` (or better, a bitmap) of every
+chunk that any peer has requested and been served. When
+`covered_union.len() == total_chunks`, parent:
+1. Signals all peer tasks to shut down.
 2. Awaits their exit.
 3. Returns Ok(()) from cmd_send.
 
-This means "one receiver got the whole file" = sender exits, matching
-the current one-shot UX. Extra peers who joined mid-flight are dropped
-without receiving completion — their responsibility to retry.
+Consequence: with N receivers each requesting disjoint ranges, sender
+exits when the last hole is filled — could be before any single receiver
+has finished. Those receivers may still be missing individual chunks;
+they're expected to fetch them from each other in a future
+peer-to-peer swap layer (out of scope for M2/M3 but the design leaves
+the door open).
 
 ## `--multi` never-exit
 
