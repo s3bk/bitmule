@@ -1112,14 +1112,18 @@ async fn send_file_relay(
     // dropping into the relay pump. The returned bulk_key is our own
     // pre-generated one — kept for future chunk encryption (Push B2).
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
-    let (_bulk, _meta) = handshake_bulk_key_over_ws(
+    let (bulk, meta) = handshake_bulk_key_over_ws(
         &mut ws, Role::Sender, &share_key, &session_id_bytes, Some(bulk_key),
     ).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let progress = std::sync::Arc::new(tokio::sync::Mutex::new(crate::RelaySendProgress::default()));
     let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
-    crate::send_file_over_relay(server_url_http, &session_id, file_path, out_tx, progress, on_progress).await
+    crate::send_file_over_relay(
+        server_url_http, &session_id, file_path, out_tx, progress,
+        &bulk, &meta, &session_id_bytes,
+        on_progress,
+    ).await
 }
 
 async fn recv_file_relay(
@@ -1137,14 +1141,18 @@ async fn recv_file_relay(
     // Do this BEFORE the pump takes over the ws so KEX frames don't race
     // chunk_relay frames.
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
-    let (bulk_key, _meta_key) = handshake_bulk_key_over_ws(
+    let (bulk_key, meta_key) = handshake_bulk_key_over_ws(
         &mut ws, Role::Receiver, &share_key, &session_id_bytes, None,
     ).await?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
     let _ = out_tx; // relay recv only reads; sender kept alive so pumper's send half stays valid
-    let path = crate::recv_file_over_relay(server_url_http, &session_id, out_dir, in_rx, on_progress).await?;
+    let path = crate::recv_file_over_relay(
+        server_url_http, &session_id, out_dir, in_rx,
+        &bulk_key, &meta_key, &session_id_bytes,
+        on_progress,
+    ).await?;
     if let Some(sig) = expected_signature {
         verify_transferred_signature(&path, &sig, &bulk_key).await?;
     }

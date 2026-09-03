@@ -105,6 +105,9 @@ pub async fn send_file_over_relay(
     file_path: &Path,
     out_json_tx: mpsc::UnboundedSender<String>,
     progress: Arc<Mutex<RelaySendProgress>>,
+    bulk_key: &crate::crypto::BulkKey,
+    meta_key: &crate::crypto::MetaKey,
+    session_id_bytes: &[u8; 32],
     mut on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
     let http_base = server_url_http.trim_end_matches('/').to_string();
@@ -122,21 +125,28 @@ pub async fn send_file_over_relay(
         .unwrap_or_else(|| "file.bin".to_string());
     let total_chunks = if size == 0 { 0 } else { (size + RELAY_CHUNK_BYTES as u64 - 1) / RELAY_CHUNK_BYTES as u64 };
 
-    let meta_json = serde_json::json!({
+    // Inner plaintext meta (encrypted under meta_key before hitting the wire).
+    let meta_plain = serde_json::json!({
         "type": "meta_relay",
         "name": name,
         "size": size,
         "chunkBytes": RELAY_CHUNK_BYTES,
         "totalChunks": total_chunks,
     }).to_string();
+    let (meta_nonce, meta_ct) = meta_key.encrypt_meta(session_id_bytes, meta_plain.as_bytes())?;
+    let meta_enc_frame = serde_json::json!({
+        "type": "meta_relay_enc",
+        "nonce_hex": hex_bytes(&meta_nonce),
+        "ct_hex": hex_bytes(&meta_ct),
+    }).to_string();
 
     {
         let mut p = progress.lock().await;
-        p.meta_frame = Some(meta_json.clone());
+        p.meta_frame = Some(meta_enc_frame.clone());
         p.sent_idxs.clear();
         p.done = false;
     }
-    let _ = out_json_tx.send(meta_json);
+    let _ = out_json_tx.send(meta_enc_frame);
 
     let client = reqwest::Client::new();
     let mut f = tokio::fs::File::open(file_path).await?;
@@ -146,12 +156,15 @@ pub async fn send_file_over_relay(
     loop {
         let n = f.read(&mut buf).await?;
         if n == 0 { break; }
+        // AEAD-encrypt with idx-derived nonce. Server stores ciphertext.
+        let ct = bulk_key.encrypt_chunk(idx as u64, &buf[..n])?;
+        let ct_len = ct.len();
         let url = format!("{http_base}/session/{session_hex}/chunk/{idx}");
-        let body = Bytes::copy_from_slice(&buf[..n]);
+        let body = Bytes::from(ct);
         let resp = client
             .put(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header(reqwest::header::CONTENT_LENGTH, n)
+            .header(reqwest::header::CONTENT_LENGTH, ct_len)
             .body(body)
             .send()
             .await
@@ -168,6 +181,7 @@ pub async fn send_file_over_relay(
             let mut p = progress.lock().await;
             p.sent_idxs.push(idx);
         }
+        // Progress in PLAINTEXT bytes so ratio matches meta.size on both sides.
         sent += n as u64;
         on_progress(sent, size);
         idx += 1;
@@ -180,6 +194,18 @@ pub async fn send_file_over_relay(
         p.done = true;
     }
     Ok(())
+}
+
+/// Local hex helper (no anyhow ceremony; used in this module only).
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_bytes_decode(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 { bail!("odd-length hex string"); }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i+2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect()
 }
 
 /// Given a snapshot of RelaySendProgress (typically stored in the
@@ -218,6 +244,9 @@ pub async fn recv_file_over_relay(
     session_id: &SessionId,
     out_dir: &Path,
     mut in_json_rx: mpsc::UnboundedReceiver<String>,
+    bulk_key: &crate::crypto::BulkKey,
+    meta_key: &crate::crypto::MetaKey,
+    session_id_bytes: &[u8; 32],
     mut on_progress: impl FnMut(u64, u64, &str) + Send,
 ) -> Result<std::path::PathBuf> {
     let http_base = server_url_http.trim_end_matches('/').to_string();
@@ -226,12 +255,13 @@ pub async fn recv_file_over_relay(
 
     let client = reqwest::Client::new();
     let mut meta_opt: Option<MetaRelayFrame> = None;
-    // chunks[idx] = Some(bytes) or None. Allocated once meta arrives.
+    // chunks[idx] = Some(PLAINTEXT bytes) or None. Ciphertext is decrypted
+    // as it arrives so the final assembly step is a straight write.
     let mut chunks: Vec<Option<Bytes>> = Vec::new();
     let mut filled: u64 = 0;
-    let mut received_bytes: u64 = 0;
+    let mut received_plain_bytes: u64 = 0;
 
-    async fn fetch_chunk(
+    async fn fetch_chunk_ct(
         client: &reqwest::Client,
         http_base: &str,
         session_hex: &str,
@@ -250,10 +280,24 @@ pub async fn recv_file_over_relay(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         let Some(ty) = value.get("type").and_then(|x| x.as_str()) else { continue };
         match ty {
-            "meta_relay" => {
-                let m: MetaRelayFrame = match serde_json::from_value(value) {
+            "meta_relay_enc" => {
+                let nonce_hex = value.get("nonce_hex").and_then(|x| x.as_str()).unwrap_or("");
+                let ct_hex = value.get("ct_hex").and_then(|x| x.as_str()).unwrap_or("");
+                let nonce = match hex_bytes_decode(nonce_hex) {
                     Ok(v) => v,
-                    Err(e) => { warn!("meta_relay decode: {e}"); continue }
+                    Err(e) => { warn!("meta_relay_enc nonce hex: {e}"); continue }
+                };
+                let ct = match hex_bytes_decode(ct_hex) {
+                    Ok(v) => v,
+                    Err(e) => { warn!("meta_relay_enc ct hex: {e}"); continue }
+                };
+                let plain = match meta_key.decrypt_meta(session_id_bytes, &nonce, &ct) {
+                    Ok(p) => p,
+                    Err(e) => { warn!("meta_relay_enc decrypt: {e}"); continue }
+                };
+                let m: MetaRelayFrame = match serde_json::from_slice(&plain) {
+                    Ok(v) => v,
+                    Err(e) => { warn!("meta_relay decode after decrypt: {e}"); continue }
                 };
                 if chunks.is_empty() {
                     chunks = vec![None; m.total_chunks as usize];
@@ -266,12 +310,14 @@ pub async fn recv_file_over_relay(
                 let idx_u32 = idx as u32;
                 if (idx_u32 as usize) >= chunks.len() { continue }
                 if chunks[idx_u32 as usize].is_some() { continue }
-                let bytes = fetch_chunk(&client, &http_base, &session_hex, idx_u32).await?;
-                received_bytes += bytes.len() as u64;
-                chunks[idx_u32 as usize] = Some(bytes);
+                let ct = fetch_chunk_ct(&client, &http_base, &session_hex, idx_u32).await?;
+                let plain = bulk_key.decrypt_chunk(idx as u64, &ct)
+                    .with_context(|| format!("decrypt relay chunk {idx_u32}"))?;
+                received_plain_bytes += plain.len() as u64;
+                chunks[idx_u32 as usize] = Some(Bytes::from(plain));
                 filled += 1;
                 if let Some(m) = meta_opt.as_ref() {
-                    on_progress(received_bytes, m.size, &m.name);
+                    on_progress(received_plain_bytes, m.size, &m.name);
                 }
             }
             "relay_done" => {
@@ -280,9 +326,11 @@ pub async fn recv_file_over_relay(
                 // finalize. Sender may have raced ahead of notifications.
                 for i in 0..(m.total_chunks as usize) {
                     if chunks[i].is_none() {
-                        let b = fetch_chunk(&client, &http_base, &session_hex, i as u32).await?;
-                        received_bytes += b.len() as u64;
-                        chunks[i] = Some(b);
+                        let ct = fetch_chunk_ct(&client, &http_base, &session_hex, i as u32).await?;
+                        let plain = bulk_key.decrypt_chunk(i as u64, &ct)
+                            .with_context(|| format!("decrypt relay backfill chunk {i}"))?;
+                        received_plain_bytes += plain.len() as u64;
+                        chunks[i] = Some(Bytes::from(plain));
                         filled += 1;
                     }
                 }
@@ -300,7 +348,7 @@ pub async fn recv_file_over_relay(
                 }
                 f.flush().await?;
                 f.sync_all().await?;
-                on_progress(received_bytes, m.size, &m.name);
+                on_progress(received_plain_bytes, m.size, &m.name);
                 return Ok(path);
             }
             _ => {}
