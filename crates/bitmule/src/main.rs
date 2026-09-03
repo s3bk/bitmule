@@ -4,10 +4,12 @@
 //! SPA client (which is `bitmule-client-wasm` compiled from bitmule-core).
 
 use anyhow::{anyhow, Context, Result};
+use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
 use bitmule_client_native::{recv_file, send_file, TransportMode};
 use clap::{Parser, Subcommand};
 use qrcode::{render::unicode, QrCode};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 
 mod identity;
 
@@ -135,7 +137,10 @@ async fn main() -> Result<()> {
     }
 }
 
-fn extract_session_hex(input: &str) -> Option<String> {
+/// Extract the URL fragment from a share URL or accept the fragment
+/// directly. Returns None only when there's nothing after the `#` (or the
+/// argument is not a URL and not itself a plausible fragment).
+fn extract_link_fragment(input: &str) -> Option<String> {
     let s = input.trim();
     let candidate = if s.starts_with("http://") || s.starts_with("https://") {
         s.rsplit('#').next().unwrap_or(s).to_string()
@@ -143,11 +148,23 @@ fn extract_session_hex(input: &str) -> Option<String> {
         s.to_string()
     };
     let trimmed = candidate.trim().to_string();
-    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(trimmed.to_ascii_lowercase())
-    } else {
-        None
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// Stream `path` through SHA256 and fold in `bulk_key` to produce the
+/// 32-byte URL commitment. Reads in 64 KiB chunks — the file is not held
+/// in memory.
+async fn commit_file(path: &Path, bulk_key: &BulkKey) -> Result<[u8; 32]> {
+    let mut f = tokio::fs::File::open(path).await
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = CommitmentHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
     }
+    Ok(hasher.finalize(bulk_key))
 }
 
 async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()> {
@@ -156,15 +173,19 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()
     if !meta.is_file() {
         return Err(anyhow!("{} must be a regular file", path.display()));
     }
-    // ShareKey random for now — file-hash commitment (A = SHA256(data || B))
-    // lands in a follow-up push. URL secret is 32 bytes hex-encoded.
-    let share_key = bitmule_client_native::crypto::ShareKey::random();
+    // Mint share_key (URL secret) + bulk_key (file-encryption key) up front.
+    // Then hash the file with the bulk_key to produce the URL signature
+    // commitment. The share URL fragment = base64url(share_key || signature).
+    let share_key = ShareKey::random();
+    let bulk_key = BulkKey::random();
     let session_hex = share_key.session_id_hex();
-    let share_hex = share_key.to_hex();
+    eprintln!("computing file commitment…");
+    let signature = commit_file(&path, &bulk_key).await?;
+    let link = ShareLink::new(share_key.clone(), signature);
     let share = format!(
         "{}/#{}",
         server.trim_end_matches('/'),
-        share_hex
+        link.to_b64_url()
     );
     println!("session: {}", session_hex);
     println!("share:   {share}");
@@ -177,7 +198,7 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".to_string());
     let mut last_pct = 0u64;
-    send_file(server, share_key, &path, mode, move |sent, total| {
+    send_file(server, share_key, bulk_key, &path, mode, move |sent, total| {
         if total == 0 { return }
         let pct = sent * 100 / total;
         if pct != last_pct {
@@ -197,18 +218,30 @@ async fn cmd_recv(
     out: PathBuf,
     mode: TransportMode,
 ) -> Result<()> {
-    let share_key = match session_arg.as_ref() {
+    // Parsing precedence: (1) full ShareLink b64 URL fragment (86 chars) —
+    // send-initiated flow with a real signature; (2) legacy 64-char hex —
+    // temporary receiver-initiated flow, no signature to verify; (3) nothing
+    // — mint a fresh share_key for receiver-initiated flow.
+    let (share_key, expected_signature) = match session_arg.as_ref() {
         Some(raw) => {
-            let hex = extract_session_hex(raw)
-                .ok_or_else(|| anyhow!("couldn't extract 64-hex share key from {raw:?}"))?;
-            bitmule_client_native::crypto::ShareKey::from_hex(&hex)
-                .map_err(|e| anyhow!("bad share key: {e}"))?
+            let frag = extract_link_fragment(raw)
+                .ok_or_else(|| anyhow!("couldn't extract share fragment from {raw:?}"))?;
+            if let Ok(link) = ShareLink::from_b64_url(&frag) {
+                (link.share_key, Some(link.signature))
+            } else if frag.len() == 64 && frag.chars().all(|c| c.is_ascii_hexdigit()) {
+                (ShareKey::from_hex(&frag).map_err(|e| anyhow!("bad share key hex: {e}"))?, None)
+            } else {
+                return Err(anyhow!("share fragment {frag:?} is neither an 86-char b64 ShareLink nor a 64-char hex share_key"));
+            }
         }
-        None => bitmule_client_native::crypto::ShareKey::random(),
+        None => (ShareKey::random(), None),
     };
     let session_hex = share_key.session_id_hex();
 
     if session_arg.is_none() {
+        // Receiver-initiated flow — no file to commit to yet, so print the
+        // legacy hex form. Sender-initiated flow will re-encode with real
+        // signature on the send side.
         let share = format!(
             "{}/send#{}",
             server.trim_end_matches('/'),
@@ -216,16 +249,18 @@ async fn cmd_recv(
         );
         println!("share this link with the sender:");
         println!("  {share}");
+        println!("(receiver-initiated: no URL signature commitment on this flow yet)");
         println!();
     }
-    println!("session: {}", session_hex);
-    println!("mode:    {}", mode_label(mode));
+    println!("session:   {}", session_hex);
+    println!("mode:      {}", mode_label(mode));
+    println!("signature: {}", if expected_signature.is_some() { "present (will verify post-transfer)" } else { "none (skipped)" });
     println!("waiting for transfer…");
     use std::io::Write;
     std::io::stdout().flush().ok();
 
     let mut last_pct = 0u64;
-    let path = recv_file(server, share_key, &out, mode, move |received, total, name| {
+    let path = recv_file(server, share_key, expected_signature, &out, mode, move |received, total, name| {
         if total == 0 { return }
         let pct = received * 100 / total;
         if pct != last_pct {
@@ -235,7 +270,11 @@ async fn cmd_recv(
         }
     }).await?;
     eprintln!();
-    println!("received: {}", path.display());
+    if expected_signature.is_some() {
+        println!("received (signature verified): {}", path.display());
+    } else {
+        println!("received: {}", path.display());
+    }
     Ok(())
 }
 

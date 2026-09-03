@@ -378,6 +378,7 @@ impl WrapKey {
 }
 
 /// Bulk stream key B. Fresh per transfer, wiped on drop.
+#[derive(Clone)]
 pub struct BulkKey(pub [u8; 32]);
 impl Drop for BulkKey { fn drop(&mut self) { self.0.zeroize(); } }
 
