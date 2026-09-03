@@ -22,6 +22,7 @@
 pub mod str0m_client;
 pub mod crypto;
 pub mod pipeline;
+pub mod multipeer;
 pub use str0m_client::{LiveSession, recv_file, send_file};
 
 use anyhow::{anyhow, bail, Context, Result};
