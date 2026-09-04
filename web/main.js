@@ -1104,17 +1104,22 @@ function startRecvSession(sessionHex, fragment) {
     session.relayArmed = true;
     session.webrtcFailed = true;
     console.info(`relay armed (${reason}) — replaying ${session.relayPrearmBuffer.length} buffered frames`);
-    els.recvState.textContent = `WebRTC not usable (${reason}) — falling back to relay`;
+    els.recvState.textContent = `WebRTC failed (${reason}) — falling back to relay`;
     for (const buffered of session.relayPrearmBuffer) {
       try { relayRecv.onWsFrame(buffered); }
       catch (e) { console.warn("relay replay failed:", e); }
     }
     session.relayPrearmBuffer = null;
   };
-  const WEBRTC_TIMEOUT_MS = 8000;
-  setTimeout(() => {
-    if (!session.webrtcOk) armRelay(`no direct channel in ${WEBRTC_TIMEOUT_MS}ms`);
-  }, WEBRTC_TIMEOUT_MS);
+  // NO timeout. Arm only when we have positive evidence WebRTC failed
+  // AND a sender is present on the WS session. Signals we watch:
+  //   - server peer_hello with role:"sender" → sender exists.
+  //   - ICE connection state transitions to `failed` after WebRTC
+  //     negotiation actually started (per W3C spec, `failed` is the
+  //     terminal ICE state — no retry from here).
+  //   - `disconnected` alone is NOT a failure (ICE can recover). We
+  //     don't arm on it; wait for `failed` proper.
+  session.senderPresent = false;
 
   session.peer = createPeer({
     role: "receiver",
@@ -1129,12 +1134,12 @@ function startRecvSession(sessionHex, fragment) {
     onMessage: recvOnMessage,
     onState: (s) => {
       console.info("receiver pc state:", s);
-      // "dc-closed" comes from bindDataChannel; pc failure states
-      // (failed/disconnected) also trip relay arm. If WebRTC has
-      // already succeeded (webrtcOk) we ignore — the transfer is
-      // in flight over DC and we don't want relay double-processing.
-      if (!session.webrtcOk && (s === "failed" || s === "disconnected" || s === "dc-closed")) {
-        armRelay(`pc state: ${s}`);
+      // ICE `failed` = terminal per spec, retry impossible. Arm relay
+      // ONLY if a sender is actually present (otherwise we're just
+      // sitting on an empty session with nothing to fail over to).
+      // Once webrtcOk is true, ignore state changes — we're mid-transfer.
+      if (!session.webrtcOk && session.senderPresent && s === "failed") {
+        armRelay(`ICE state: ${s}`);
       }
     },
   });
@@ -1181,6 +1186,13 @@ function startRecvSession(sessionHex, fragment) {
       frame = JSON.parse(ev.data);
     } catch {
       return;
+    }
+    // Server relays this to us when a sender registers on the same
+    // session. Marks "peer connected on WS" — the precondition for
+    // arming the relay fallback later if ICE ends up in `failed`.
+    if (frame.type === "peer_hello" && frame.role === "sender") {
+      session.senderPresent = true;
+      console.info("sender present on ws session — WebRTC negotiation window open");
     }
     if (frame.type === "sdp" || frame.type === "ice") {
       try {
