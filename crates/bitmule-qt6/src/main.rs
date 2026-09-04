@@ -134,6 +134,9 @@ struct UploaderApi {
     active_share_urls: Arc<Mutex<Vec<String>>>,
     /// Queue of clipboard-detected bitmule URLs.
     fetch_queue_urls: Arc<Mutex<Vec<String>>>,
+    /// Internal store for recv transfers. Rendered to `recv_transfers`
+    /// as JSON strings on every mutation.
+    recv_state: Arc<Mutex<Vec<RecvTransferState>>>,
 
     // Invokable methods from QML
     add_files: qt_method!(fn(&mut self, urls: QVariantList)),
@@ -154,6 +157,21 @@ struct UploaderApi {
     /// QML should call this from Component.onCompleted so the UI shows
     /// the saved option state on launch.
     init_from_qml: qt_method!(fn(&mut self)),
+
+    // ---- receive side ----
+    /// JSON-string list, one per active or completed receive. Each entry:
+    /// `{ "url": String, "name": String, "progress": 0..1, "status":
+    /// "connecting"|"receiving"|"complete"|"error", "path": String|null,
+    /// "error": String|null }`. QML delegate `JSON.parse(modelData)`.
+    recv_transfers: qt_property!(QStringList; NOTIFY recv_transfers_changed),
+    recv_transfers_changed: qt_signal!(),
+    /// Add a bitmule share URL to the receive queue. Kicks off a
+    /// background download; per-transfer state lands on `recv_transfers`.
+    add_recv_url: qt_method!(fn(&mut self, url: QString)),
+    /// Remove a transfer entry from the list (does not delete the file).
+    drop_recv_transfer: qt_method!(fn(&mut self, url: QString)),
+    /// Open the receiver's out dir in the system file manager.
+    open_recv_dir: qt_method!(fn(&mut self)),
 }
 
 impl UploaderApi {
@@ -271,6 +289,146 @@ impl UploaderApi {
         }
     }
 
+    fn add_recv_url(&mut self, url: QString) {
+        let u = url.to_string();
+        let u_trim = u.trim().to_string();
+        if !u_trim.starts_with(BITMULE_URL_PREFIX) {
+            self.push_recv_transfer(RecvTransferState {
+                url: u_trim,
+                name: String::new(),
+                progress: 0.0,
+                status: "error".into(),
+                path: None,
+                error: Some("URL doesn't start with https://bitmule.qdat.net/#".into()),
+            });
+            return;
+        }
+        // Dedup: don't add the same URL twice if it's already in progress.
+        if let Ok(g) = self.recv_state.lock() {
+            if g.iter().any(|s| s.url == u_trim && s.status != "error") { return; }
+        }
+        self.push_recv_transfer(RecvTransferState {
+            url: u_trim.clone(),
+            name: String::new(),
+            progress: 0.0,
+            status: "connecting".into(),
+            path: None,
+            error: None,
+        });
+        self.spawn_recv_task(u_trim);
+    }
+
+    fn drop_recv_transfer(&mut self, url: QString) {
+        let u = url.to_string();
+        if let Ok(mut g) = self.recv_state.lock() {
+            g.retain(|s| s.url != u);
+        }
+        self.refresh_recv_transfers();
+    }
+
+    fn open_recv_dir(&mut self) {
+        let d = recv_out_dir();
+        let _ = std::fs::create_dir_all(&d);
+        let _ = open::that(&d);
+    }
+
+    fn push_recv_transfer(&mut self, s: RecvTransferState) {
+        if let Ok(mut g) = self.recv_state.lock() {
+            g.push(s);
+        }
+        self.refresh_recv_transfers();
+    }
+
+    fn refresh_recv_transfers(&mut self) {
+        let snap: Vec<QString> = match self.recv_state.lock() {
+            Ok(g) => g.iter().map(|s| QString::from(
+                serde_json::to_string(s).unwrap_or_else(|_| "{}".into())
+            )).collect(),
+            Err(_) => Vec::new(),
+        };
+        self.recv_transfers = QStringList::from(snap);
+        self.recv_transfers_changed();
+    }
+
+    fn spawn_recv_task(&mut self, url: String) {
+        let qpointer = QPointer::from(&*self);
+        let state = self.recv_state.clone();
+        qmetaobject::future::execute_async(async move {
+            let out_dir = recv_out_dir();
+            let _ = std::fs::create_dir_all(&out_dir);
+            let (server, fragment) = match split_share_url(&url) {
+                Some(v) => v,
+                None => {
+                    update_recv_state(&state, &url, |s| {
+                        s.status = "error".into();
+                        s.error = Some("couldn't split URL into server + fragment".into());
+                    });
+                    refresh_from_bg(&qpointer, &state);
+                    return;
+                }
+            };
+            let (share_key, expected_sig) = match parse_fragment(&fragment) {
+                Some(v) => v,
+                None => {
+                    update_recv_state(&state, &url, |s| {
+                        s.status = "error".into();
+                        s.error = Some("couldn't parse URL fragment as ShareLink".into());
+                    });
+                    refresh_from_bg(&qpointer, &state);
+                    return;
+                }
+            };
+            update_recv_state(&state, &url, |s| { s.status = "receiving".into(); });
+            refresh_from_bg(&qpointer, &state);
+            let state_cb = state.clone();
+            let url_cb = url.clone();
+            let qpointer_cb = qpointer.clone();
+            let last_pct = Arc::new(Mutex::new(0u8));
+            let result = bitmule_client_native::recv_file(
+                &server,
+                share_key,
+                expected_sig,
+                &out_dir,
+                bitmule_client_native::TransportMode::Webrtc,
+                move |received, total, name| {
+                    let pct = if total > 0 {
+                        ((received as f64 / total as f64) * 100.0).floor() as u8
+                    } else { 0 };
+                    // Coalesce progress writes at 1% granularity.
+                    let mut lp = last_pct.lock().unwrap();
+                    if pct == *lp { return; }
+                    *lp = pct;
+                    drop(lp);
+                    let name_s = name.to_string();
+                    let prog = if total > 0 { received as f64 / total as f64 } else { 0.0 };
+                    update_recv_state(&state_cb, &url_cb, |s| {
+                        s.name = name_s;
+                        s.progress = prog;
+                    });
+                    refresh_from_bg(&qpointer_cb, &state_cb);
+                },
+            ).await;
+            match result {
+                Ok(path) => {
+                    let name_s = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    update_recv_state(&state, &url, |s| {
+                        s.status = "complete".into();
+                        s.progress = 1.0;
+                        s.name = name_s;
+                        s.path = Some(path.to_string_lossy().into_owned());
+                    });
+                }
+                Err(e) => {
+                    update_recv_state(&state, &url, |s| {
+                        s.status = "error".into();
+                        s.error = Some(format!("{e:#}"));
+                    });
+                }
+            }
+            refresh_from_bg(&qpointer, &state);
+        });
+    }
+
     fn spawn_clipboard_watcher(&mut self) {
         let qpointer = QPointer::from(&*self);
         let active_urls = self.active_share_urls.clone();
@@ -321,6 +479,74 @@ impl UploaderApi {
                 }
             }
         });
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct RecvTransferState {
+    url: String,
+    name: String,
+    /// 0.0..=1.0
+    progress: f64,
+    /// "connecting" | "receiving" | "complete" | "error"
+    status: String,
+    /// Absolute filesystem path once complete; None while in-flight.
+    path: Option<String>,
+    /// Human-readable error when status == "error".
+    error: Option<String>,
+}
+
+/// Where recv_file writes downloads. Follows the same
+/// XDG_DOWNLOAD_DIR / $HOME/Downloads convention as most Linux apps.
+fn recv_out_dir() -> PathBuf {
+    if let Ok(x) = std::env::var("XDG_DOWNLOAD_DIR") {
+        return PathBuf::from(x).join("bitmule");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join("Downloads").join("bitmule")
+}
+
+fn split_share_url(url: &str) -> Option<(String, String)> {
+    let hash_at = url.find('#')?;
+    let (before, after) = url.split_at(hash_at);
+    let server = before.trim_end_matches('/').to_string();
+    let fragment = after.trim_start_matches('#').to_string();
+    if server.is_empty() || fragment.is_empty() { return None; }
+    Some((server, fragment))
+}
+
+fn parse_fragment(fragment: &str)
+    -> Option<(bitmule_crypto::ShareKey, Option<[u8; 32]>)>
+{
+    let link = bitmule_crypto::ShareLink::from_b64_url(fragment).ok()?;
+    Some((link.share_key, Some(link.signature)))
+}
+
+fn update_recv_state<F: FnOnce(&mut RecvTransferState)>(
+    state: &Arc<Mutex<Vec<RecvTransferState>>>,
+    url: &str,
+    f: F,
+) {
+    if let Ok(mut g) = state.lock() {
+        for s in g.iter_mut() {
+            if s.url == url { f(s); return; }
+        }
+    }
+}
+
+fn refresh_from_bg(
+    qpointer: &QPointer<UploaderApi>,
+    state: &Arc<Mutex<Vec<RecvTransferState>>>,
+) {
+    let snap: Vec<QString> = match state.lock() {
+        Ok(g) => g.iter().map(|s| QString::from(
+            serde_json::to_string(s).unwrap_or_else(|_| "{}".into())
+        )).collect(),
+        Err(_) => Vec::new(),
+    };
+    if let Some(mut api) = qpointer.as_pinned() {
+        api.borrow_mut().recv_transfers = QStringList::from(snap);
+        api.borrow_mut().recv_transfers_changed();
     }
 }
 
