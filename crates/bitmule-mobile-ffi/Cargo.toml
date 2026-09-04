@@ -1,0 +1,46 @@
+[package]
+name = "bitmule-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Shared FFI crate targeting both Android (Kotlin bindings) and iOS
+# (Swift bindings) via UniFFI. Wraps bitmule-client-native + bitmule-crypto
+# behind a stable UDL-defined interface so the mobile shells never depend
+# directly on internal crate boundaries.
+#
+# Build targets (per README):
+#   cargo ndk -t aarch64-linux-android -t armv7-linux-androideabi \
+#             -t x86_64-linux-android -o ../../bitmule-android/app/src/main/jniLibs \
+#             build --release -p bitmule-mobile-ffi
+#   cargo run --features=uniffi/cli --bin uniffi-bindgen generate \
+#             --library ../target/aarch64-linux-android/release/libbitmule_mobile_ffi.so \
+#             --language kotlin --out-dir ../../bitmule-android/app/src/main/java
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "bitmule_mobile_ffi"
+
+[dependencies]
+bitmule-client-native = { path = "../bitmule-client-native" }
+bitmule-crypto = { path = "../bitmule-crypto" }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uniffi = { version = "0.28", features = ["tokio"] }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[features]
+default = []
+# `cli` gates the `uniffi-bindgen` binary so ordinary builds don't pull
+# in the whole clap machinery.
+cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["cli"]

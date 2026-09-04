@@ -1,0 +1,57 @@
+namespace bitmule_mobile_ffi {
+  // Semver of this FFI surface. Bump on any breaking change so the
+  // Kotlin / Swift shell can bail fast on mismatched .so vs bindings.
+  string ffi_version();
+};
+
+// A share URL parsed into its component parts. Mirrors the fragment
+// format the web client produces and the native receiver accepts.
+dictionary ParsedShareUrl {
+  string server;
+  string fragment;
+};
+
+// Errors surface as first-class variants over the FFI so the mobile
+// shells get typed catches instead of stringly-typed error paths.
+[Error]
+interface BitmuleError {
+  InvalidUrl(string reason);
+  InvalidFragment(string reason);
+  Network(string reason);
+  Transport(string reason);
+  Verify(string reason);
+  Io(string reason);
+  Unknown(string reason);
+};
+
+// Progress callbacks fire from a background tokio task; the mobile
+// shell must marshal them onto the UI thread. Kotlin: Coroutine on
+// Dispatchers.Main. Swift: DispatchQueue.main.async.
+callback interface ProgressListener {
+  void on_progress(u64 received, u64 total, string name);
+};
+
+// Result of a completed receive. Contains the final on-disk path
+// (relative to the caller-supplied out_dir) plus the transferred
+// file's declared size. The mobile shell uses `path` to hand the
+// file off via FileProvider (Android) / UIActivityViewController (iOS).
+dictionary RecvOutcome {
+  string path;
+  u64 size;
+  string name;
+};
+
+// The primary receive entrypoint. Parses the URL, negotiates WebRTC
+// against the signaling server, streams + decrypts chunks into
+// `out_dir`, verifies the transferred signature, and returns the
+// final file path.
+[Async]
+namespace bitmule_mobile_ffi_recv {
+  [Throws=BitmuleError]
+  RecvOutcome recv_file(string url, string out_dir, ProgressListener on_progress);
+
+  // Pure-function URL splitter for the paste-and-preview flow so the
+  // shell can validate a link before committing to a full recv.
+  [Throws=BitmuleError]
+  ParsedShareUrl parse_share_url(string url);
+};

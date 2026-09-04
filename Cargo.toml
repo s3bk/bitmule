@@ -12,6 +12,7 @@ members = [
     "crates/bitmule-e2e-tests",
     "crates/bitmule-qt6",
     "crates/bitmule-gtk4",
+    "crates/bitmule-mobile-ffi",
 ]
 
 [workspace.package]
