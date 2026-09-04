@@ -63,27 +63,33 @@ fun BitmuleApp(
 private fun SendPane() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var pickedName by remember { mutableStateOf<String?>(null) }
-    var pickedPath by remember { mutableStateOf<String?>(null) }
+    // Materialized files: display name + cache path per picked URI.
+    // Rust FFI needs real filesystem paths, so every SAF pick is
+    // copied to app-scoped cache first.
+    var pickedNames by remember { mutableStateOf<List<String>>(emptyList()) }
+    var pickedPaths by remember { mutableStateOf<List<String>>(emptyList()) }
     var status by remember { mutableStateOf("idle") }        // idle | sending | complete | error
     var shareUrl by remember { mutableStateOf<String?>(null) }
     var qrBytes by remember { mutableStateOf<ByteArray?>(null) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
     var multiSend by remember { mutableStateOf(false) }
 
-    // SAF picker — returns a content:// URI that we must copy to a
-    // real file path (the Rust core needs a filesystem path, not
-    // a Uri).  Copy runs on Dispatchers.IO in the launcher callback.
+    // Multi-file SAF picker — returns a list of content:// URIs.
+    // Each Uri is copied to a private cache file on Dispatchers.IO
+    // so the Rust core has a filesystem path per selected file.
+    // F4 does NOT yet accept directory picks (SAF's OpenDocumentTree
+    // returns a tree Uri that needs DocumentFile traversal + copy —
+    // deferred to a follow-up).
     val picker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        contract = ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris: List<Uri> ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
         scope.launch {
-            val (name, path) = withContext(Dispatchers.IO) {
-                copyPickedUriToCache(context, uri)
+            val entries = withContext(Dispatchers.IO) {
+                uris.map { copyPickedUriToCache(context, it) }
             }
-            pickedName = name
-            pickedPath = path
+            pickedNames = entries.map { it.first }
+            pickedPaths = entries.map { it.second }
         }
     }
 
@@ -99,7 +105,13 @@ private fun SendPane() {
             modifier = Modifier.fillMaxWidth(),
             onClick = { picker.launch(arrayOf("*/*")) },
         ) {
-            Text(pickedName?.let { "Pick file — currently: $it" } ?: "Pick file")
+            Text(
+                when {
+                    pickedNames.isEmpty() -> "Pick file(s)"
+                    pickedNames.size == 1 -> "Pick file(s) — currently: ${pickedNames[0]}"
+                    else -> "Pick file(s) — currently: ${pickedNames.size} files (${pickedNames[0]} + ${pickedNames.size - 1} more)"
+                }
+            )
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -108,10 +120,11 @@ private fun SendPane() {
         }
 
         Button(
-            enabled = pickedPath != null && status != "sending",
+            enabled = pickedPaths.isNotEmpty() && status != "sending",
             modifier = Modifier.fillMaxWidth(),
             onClick = {
-                val path = pickedPath ?: return@Button
+                val paths = pickedPaths
+                if (paths.isEmpty()) return@Button
                 scope.launch {
                     status = "sending"
                     shareUrl = null
@@ -121,7 +134,7 @@ private fun SendPane() {
                         withContext(Dispatchers.IO) {
                             uniffi.bitmule_mobile_ffi.sendFile(
                                 server = DEFAULT_SERVER,
-                                filePath = path,
+                                filePaths = paths,
                                 multi = multiSend,
                                 onUrl = object : uniffi.bitmule_mobile_ffi.UrlListener {
                                     override fun onUrl(
@@ -226,6 +239,11 @@ private fun ReceivePane(
     var status by remember { mutableStateOf<String>("idle") }
     var progress by remember { mutableStateOf(0f) }
     var completedFile by remember { mutableStateOf<File?>(null) }
+    // `true` when the completed transfer was a zip-store bundle
+    // already unpacked into a directory by the FFI. Share intent
+    // switches to ACTION_SEND_MULTIPLE listing the dir's files.
+    var completedIsBundle by remember { mutableStateOf(false) }
+    var completedName by remember { mutableStateOf<String?>(null) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     // Auto-kick if we got launched via VIEW intent.
@@ -283,6 +301,8 @@ private fun ReceivePane(
                             )
                         }
                         completedFile = File(outcome.path)
+                        completedIsBundle = outcome.isBundle
+                        completedName = outcome.name
                         status = "complete"
                         progress = 1f
                     } catch (e: Throwable) {
@@ -305,24 +325,50 @@ private fun ReceivePane(
         errorMsg?.let { Text("error: $it", color = MaterialTheme.colorScheme.error) }
 
         completedFile?.let { file ->
-            Text("✓ ${file.name}")
+            Text("✓ ${completedName ?: file.name}")
             Text(file.absolutePath, style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = {
-                    // FileProvider URI so other apps can read the file
-                    // without a broad storage permission.
-                    val uri = FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.fileprovider",
-                        file,
-                    )
-                    val send = Intent(Intent.ACTION_SEND).apply {
-                        type = context.contentResolver.getType(uri) ?: "*/*"
-                        putExtra(Intent.EXTRA_STREAM, uri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    if (completedIsBundle && file.isDirectory) {
+                        // Bundle: multi-share every extracted file via
+                        // ACTION_SEND_MULTIPLE. FileProvider grants a
+                        // per-uri read scope; the receiver app picks
+                        // which files to save.
+                        val uris = file.listFiles()?.filter { it.isFile }?.map { child ->
+                            FileProvider.getUriForFile(
+                                context,
+                                "${context.packageName}.fileprovider",
+                                child,
+                            )
+                        } ?: emptyList()
+                        if (uris.isNotEmpty()) {
+                            val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                type = "*/*"
+                                putParcelableArrayListExtra(
+                                    Intent.EXTRA_STREAM,
+                                    ArrayList(uris),
+                                )
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(
+                                Intent.createChooser(send, "Share ${uris.size} file(s)")
+                            )
+                        }
+                    } else {
+                        // Single file: standard FileProvider + ACTION_SEND.
+                        val uri = FileProvider.getUriForFile(
+                            context,
+                            "${context.packageName}.fileprovider",
+                            file,
+                        )
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = context.contentResolver.getType(uri) ?: "*/*"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(Intent.createChooser(send, "Share ${file.name}"))
                     }
-                    context.startActivity(Intent.createChooser(send, "Share ${file.name}"))
-                }) { Text("Share") }
+                }) { Text(if (completedIsBundle) "Share files" else "Share") }
             }
         }
     }

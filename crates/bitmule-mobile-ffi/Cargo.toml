@@ -32,6 +32,7 @@ tracing = { workspace = true }
 uniffi = { version = "0.32", features = ["tokio"] }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+walkdir = { workspace = true }
 
 [build-dependencies]
 uniffi = { version = "0.32", features = ["build"] }

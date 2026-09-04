@@ -30,7 +30,10 @@ pub fn ffi_version() -> String {
     // Semver of the FFI SURFACE (not the crate as a whole). Bump on
     // any UDL change so the shell can fail fast on binary/binding
     // mismatch after an OTA update.
-    "0.2.0".to_string()
+    // 0.3.0 (F4): send_file takes `sequence<string>` file_paths + auto
+    // bundles; RecvOutcome gains `is_bundle` and auto-unpacks
+    // container="zip-store" transfers into a directory before return.
+    "0.3.0".to_string()
 }
 
 #[derive(Debug, Error)]
@@ -81,6 +84,12 @@ pub struct RecvOutcome {
     pub path: String,
     pub size: u64,
     pub name: String,
+    /// `true` when the transfer was a `container="zip-store"` bundle
+    /// and the FFI has already extracted it into a directory at
+    /// `path`. `false` for single-file transfers (also the fallback
+    /// when unpack fails — `path` then points at the raw zip so the
+    /// caller can still hand the bytes off).
+    pub is_bundle: bool,
 }
 
 pub struct SendOutcome {
@@ -137,47 +146,120 @@ pub async fn recv_file(
     )
     .await
     .map_err(BitmuleError::from)?;
-    // F4 will consume `outcome.container` on the Kotlin/Swift side to
-    // unpack multi-file zip bundles; for now the native FFI still hands
-    // the raw file path across to the caller.
+
+    // If the sender flagged `container="zip-store"`, unpack it here
+    // and hand the caller the directory. Extraction failure isn't
+    // fatal — we fall back to returning the raw zip so the shell
+    // can still show / share the bytes.
+    if outcome.container.as_deref() == Some("zip-store") {
+        let unpack_dir = bitmule_client_native::container::unpack_dir_for(&outcome.path);
+        match bitmule_client_native::container::unpack_zip_store(&outcome.path, &unpack_dir).await {
+            Ok(entries) => {
+                let _ = std::fs::remove_file(&outcome.path);
+                let size = dir_size_recursive(&unpack_dir);
+                let stem = unpack_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "bundle".to_string());
+                let name = format!(
+                    "{stem} ({entries} file{})",
+                    if entries == 1 { "" } else { "s" }
+                );
+                return Ok(RecvOutcome {
+                    path: unpack_dir.to_string_lossy().into_owned(),
+                    size,
+                    name,
+                    is_bundle: true,
+                });
+            }
+            Err(_e) => {
+                // fall through to the single-file shape below
+            }
+        }
+    }
+
     let final_path = outcome.path;
     let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
     let name = final_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Ok(RecvOutcome { path: final_path.to_string_lossy().into_owned(), size, name })
+    Ok(RecvOutcome {
+        path: final_path.to_string_lossy().into_owned(),
+        size,
+        name,
+        is_bundle: false,
+    })
+}
+
+/// Sum of regular-file byte lengths under `dir`, best-effort — walk
+/// errors are ignored so the size stays a report, not a failure mode.
+fn dir_size_recursive(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            if let Ok(md) = entry.metadata() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total
 }
 
 pub async fn send_file(
     server: String,
-    file_path: String,
+    file_paths: Vec<String>,
     multi: bool,
     on_url: Arc<dyn UrlListener>,
 ) -> Result<SendOutcome, BitmuleError> {
-    let path = PathBuf::from(&file_path);
-    let meta = tokio::fs::metadata(&path).await.map_err(|e| BitmuleError::Io {
-        reason: format!("stat {}: {e}", path.display()),
-    })?;
-    if !meta.is_file() {
+    if file_paths.is_empty() {
         return Err(BitmuleError::Io {
-            reason: format!("{} must be a regular file", path.display()),
+            reason: "no file paths given".into(),
         });
     }
-    let file_size = meta.len();
-    let file_name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file.bin".to_string());
+    let paths: Vec<PathBuf> = file_paths.iter().map(PathBuf::from).collect();
+    for p in &paths {
+        let md = tokio::fs::metadata(p).await.map_err(|e| BitmuleError::Io {
+            reason: format!("stat {}: {e}", p.display()),
+        })?;
+        if !md.is_file() {
+            return Err(BitmuleError::Io {
+                reason: format!("{} must be a regular file (dir picking not yet supported on FFI)", p.display()),
+            });
+        }
+    }
 
-    // Mint share_key + bulk_key up front. Hash the file with the
-    // bulk_key to produce the URL signature commitment. Share URL
-    // fragment = base64url(share_key || signature). Mirrors the
-    // desktop-CLI `prepare_and_spawn_send` in crates/bitmule/src/main.rs.
+    // Bundling decision mirrors the CLI/Qt6: 1 path = stream as-is,
+    // N>=2 = build a store-mode zip on the fly and flag the meta so
+    // the receiver auto-unpacks. Zip guard is held in scope until
+    // send_file_multi returns (single task, no spawn — FFI's send
+    // fn returns to the caller when the transfer completes).
+    let (send_path, _zip_guard, container, file_name) = if paths.len() == 1 {
+        let p = paths[0].clone();
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file.bin".to_string());
+        (p, None, None, name)
+    } else {
+        let (tmp, disp) = bitmule_client_native::container::build_zip_bundle(&paths)
+            .await
+            .map_err(BitmuleError::from)?;
+        (tmp.path().to_path_buf(), Some(tmp), Some("zip-store".to_string()), disp)
+    };
+    let file_size = tokio::fs::metadata(&send_path).await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Mint share_key + bulk_key up front. Hash the send file (raw
+    // single file OR the just-built bundle) with the bulk_key to
+    // produce the URL signature commitment. Share URL fragment =
+    // base64url(share_key || signature). Mirrors the desktop-CLI
+    // `prepare_and_spawn_send` in crates/bitmule/src/main.rs.
     let share_key = ShareKey::random();
     let bulk_key = BulkKey::random();
     let session_hex = share_key.session_id_hex();
-    let signature = commit_file(&path, &bulk_key).await?;
+    let signature = commit_file(&send_path, &bulk_key).await?;
     let link = ShareLink::new(share_key.clone(), signature);
     let share_url = format!(
         "{}/#{}",
@@ -191,15 +273,12 @@ pub async fn send_file(
     on_url.on_url(share_url.clone(), session_hex.clone(), file_name, file_size);
 
     let mode = if multi { ServeMode::Multi } else { ServeMode::Complete };
-    // FFI send only accepts a single file path today — multi-file/dir
-    // bundling belongs in the Kotlin/Swift caller (F4 Android + iOS
-    // pickers zip on their side). None here = single-file wire path.
     send_file_multi(
         server.trim_end_matches('/'),
         share_key,
         bulk_key,
-        path,
-        None,
+        send_path,
+        container,
         mode,
     )
     .await

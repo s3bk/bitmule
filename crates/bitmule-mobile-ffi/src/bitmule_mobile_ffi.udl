@@ -20,8 +20,14 @@ namespace bitmule_mobile_ffi {
   // `multi=false` = ServeMode::Complete (exits after first receiver
   // completes). `multi=true` = ServeMode::Multi (keeps the URL live
   // for additional receivers until the caller cancels).
+  //
+  // `file_paths`: 1 file → streams as-is; N>=2 files → bundled into
+  // an on-the-fly store-mode zip and shipped with a container flag
+  // so the receiver auto-unpacks. Directory paths are NOT yet
+  // accepted on the FFI (SAF picker on Android returns individual
+  // file URIs; directory-tree pick is a follow-up).
   [Throws=BitmuleError, Async]
-  SendOutcome send_file(string server, string file_path, boolean multi, UrlListener on_url);
+  SendOutcome send_file(string server, sequence<string> file_paths, boolean multi, UrlListener on_url);
 
   // PNG bytes for a QR-code render of `text`. Pure function; shell
   // decodes with BitmapFactory (Android) / UIImage (iOS).
@@ -64,14 +70,21 @@ interface UrlListener {
   void on_url(string url, string session_hex, string file_name, u64 file_size);
 };
 
-// Result of a completed receive. Contains the final on-disk path
-// (relative to the caller-supplied out_dir) plus the transferred
-// file's declared size. The mobile shell uses `path` to hand the
-// file off via FileProvider (Android) / UIActivityViewController (iOS).
+// Result of a completed receive. `path` is the file the caller
+// should hand off — either the received single file, OR (when
+// `is_bundle` is true) a freshly-created directory into which
+// the received zip-store bundle was unpacked. The bundle zip
+// itself is unlinked after successful extraction; on extraction
+// failure it stays and `is_bundle` is `false` so the caller can
+// share the raw bytes.
+//
+// The mobile shell uses `path` for FileProvider (single file) or
+// ACTION_SEND_MULTIPLE (bundle dir contents).
 dictionary RecvOutcome {
   string path;
   u64 size;
   string name;
+  boolean is_bundle;
 };
 
 // Result of a completed send. `share_url` matches what fired via
