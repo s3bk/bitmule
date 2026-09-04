@@ -26,12 +26,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a file. Auto mode: WebRTC first, falls back to server relay
-    /// after 3s if the data channel hasn't opened. --webrtc / --relay
-    /// force a single transport.
+    /// Send file(s) or a directory. Auto mode: WebRTC first, falls back
+    /// to server relay after 3s if the data channel hasn't opened.
+    /// --webrtc / --relay force a single transport.
+    ///
+    /// Multiple paths OR a directory path → the sender bundles them
+    /// into a store-mode zip (no compression) on the fly and flags the
+    /// meta so the receiver unpacks. A single file path streams as-is.
     Send {
-        /// Path to the file to send.
-        path: PathBuf,
+        /// Path(s) to file(s) or a directory to send.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
         /// Force WebRTC only (no relay fallback).
         #[arg(long, conflicts_with = "relay")]
         webrtc: bool,
@@ -129,8 +134,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Send { path, webrtc, relay, multi } => {
-            cmd_send(&cli.server, path, resolve_mode(webrtc, relay), multi).await
+        Command::Send { paths, webrtc, relay, multi } => {
+            cmd_send(&cli.server, paths, resolve_mode(webrtc, relay), multi).await
         }
         Command::Recv { session, out, webrtc, relay } => {
             // Infer the server from the share URL when possible so the
@@ -237,7 +242,7 @@ pub struct SendSpawn {
 /// yet); pass a no-op closure when unused.
 pub async fn prepare_and_spawn_send<F>(
     server: String,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     mode: TransportMode,
     multi: bool,
     on_progress: F,
@@ -245,15 +250,41 @@ pub async fn prepare_and_spawn_send<F>(
 where
     F: FnMut(u64, u64) + Send + 'static,
 {
-    let meta = tokio::fs::metadata(&path).await
-        .with_context(|| format!("stat {}", path.display()))?;
-    if !meta.is_file() {
-        return Err(anyhow!("{} must be a regular file", path.display()));
+    if paths.is_empty() {
+        return Err(anyhow!("no paths given"));
     }
-    let file_size = meta.len();
-    let file_name = path.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file.bin".to_string());
+
+    // Decide single-file vs bundle. Single existing file, one path → legacy
+    // shape (container=None). Directory OR more than one path → build a
+    // store-mode zip on the fly, container=Some("zip-store"), receiver
+    // unpacks. The zip temp file is held alive by moving its guard into
+    // the spawn closure so it survives the whole transfer and unlinks on
+    // task exit.
+    let (send_path, zip_guard, container, file_name) = if paths.len() == 1 {
+        let p = &paths[0];
+        let meta = tokio::fs::metadata(p).await
+            .with_context(|| format!("stat {}", p.display()))?;
+        if meta.is_file() {
+            let name = p.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file.bin".to_string());
+            (p.clone(), None, None, name)
+        } else if meta.is_dir() {
+            let (zip_file, disp) = build_zip_bundle(&paths).await?;
+            let path = zip_file.path().to_path_buf();
+            (path, Some(zip_file), Some("zip-store".to_string()), disp)
+        } else {
+            return Err(anyhow!("{} is neither a regular file nor a directory", p.display()));
+        }
+    } else {
+        let (zip_file, disp) = build_zip_bundle(&paths).await?;
+        let path = zip_file.path().to_path_buf();
+        (path, Some(zip_file), Some("zip-store".to_string()), disp)
+    };
+
+    let file_size = tokio::fs::metadata(&send_path).await
+        .with_context(|| format!("stat {}", send_path.display()))?
+        .len();
 
     // Mint share_key (URL secret) + bulk_key (file-encryption key) up front.
     // Then hash the file with the bulk_key to produce the URL signature
@@ -261,7 +292,7 @@ where
     let share_key = ShareKey::random();
     let bulk_key = BulkKey::random();
     let session_hex = share_key.session_id_hex();
-    let signature = commit_file(&path, &bulk_key).await?;
+    let signature = commit_file(&send_path, &bulk_key).await?;
     let link = ShareLink::new(share_key.clone(), signature);
     let share_url = format!(
         "{}/#{}",
@@ -280,15 +311,17 @@ where
     //                    process exit; late receivers fetch from retained
     //                    server chunks (natural multipeer-over-relay)
     let handle = tokio::spawn(async move {
+        let _zip_guard = zip_guard; // hold NamedTempFile until send completes
+        let container_ref = container.as_deref();
         match (multi, mode) {
             (_, TransportMode::Relay) => {
-                send_file_relay(&server, share_key, bulk_key, &path, on_progress).await
+                send_file_relay(&server, share_key, bulk_key, &send_path, container_ref, on_progress).await
             }
             (false, TransportMode::Webrtc) => {
-                send_file_multi(&server, share_key, bulk_key, path, ServeMode::Complete).await
+                send_file_multi(&server, share_key, bulk_key, send_path, container.clone(), ServeMode::Complete).await
             }
             (true, TransportMode::Webrtc) => {
-                send_file_multi(&server, share_key, bulk_key, path, ServeMode::Multi).await
+                send_file_multi(&server, share_key, bulk_key, send_path, container.clone(), ServeMode::Multi).await
             }
         }
     });
@@ -296,13 +329,117 @@ where
     Ok(SendSpawn { session_hex, share_url, file_name, file_size, handle })
 }
 
-async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool) -> Result<()> {
-    // Precompute the progress callback so the closure's `name_for_progress`
-    // captures the file name string exactly once (cheap clone before
-    // ownership of `path` moves into `prepare_and_spawn_send`).
-    let name_for_progress = path.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file.bin".to_string());
+/// Build a store-mode (level-0, no compression) zip bundle from `paths`.
+/// Returns the `NamedTempFile` guard (kept alive by caller to survive
+/// the transfer; `Drop` unlinks) and a display name for user output.
+///
+/// Directory entries are walked recursively; each file is written under
+/// the directory's basename to preserve the top-level container name.
+/// File entries are stored under their basename.
+///
+/// Store mode is chosen because bitmule compresses on the wire via zstd
+/// downstream — layering deflate here would waste CPU on already-random
+/// data (the AEAD-encrypted chunks) once compression lands.
+async fn build_zip_bundle(paths: &[PathBuf]) -> Result<(tempfile::NamedTempFile, String)> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+
+    let display_name = if paths.len() == 1 && paths[0].is_dir() {
+        let base = paths[0].file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "bundle".to_string());
+        format!("{base}.zip")
+    } else if paths.len() == 1 {
+        let stem = paths[0].file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "bundle".to_string());
+        format!("{stem}.zip")
+    } else {
+        let stem = paths[0].file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "bundle".to_string());
+        format!("{stem}-and-{}-more.zip", paths.len() - 1)
+    };
+
+    let owned_paths: Vec<PathBuf> = paths.to_vec();
+    // Zip build is CPU + sync-fs bound; run on blocking pool to keep the
+    // async runtime free.
+    let tmp = tokio::task::spawn_blocking(move || -> Result<tempfile::NamedTempFile> {
+        let tmp = tempfile::Builder::new()
+            .prefix("bitmule-bundle-")
+            .suffix(".zip")
+            .tempfile()
+            .context("create bundle tempfile")?;
+        let file = tmp.reopen().context("reopen bundle tempfile")?;
+        let mut zw = zip::ZipWriter::new(file);
+        let opts: SimpleFileOptions = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .large_file(true);
+
+        for p in &owned_paths {
+            let md = std::fs::metadata(p)
+                .with_context(|| format!("stat {}", p.display()))?;
+            if md.is_file() {
+                let name = p.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .ok_or_else(|| anyhow!("path has no file name: {}", p.display()))?;
+                zw.start_file(&name, opts)
+                    .with_context(|| format!("zip start_file {name}"))?;
+                let mut f = std::fs::File::open(p)
+                    .with_context(|| format!("open {}", p.display()))?;
+                std::io::copy(&mut f, &mut zw)
+                    .with_context(|| format!("copy {} into zip", p.display()))?;
+            } else if md.is_dir() {
+                let root_name = p.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .ok_or_else(|| anyhow!("dir path has no basename: {}", p.display()))?;
+                for entry in walkdir::WalkDir::new(p).min_depth(1) {
+                    let entry = entry.with_context(|| format!("walk {}", p.display()))?;
+                    let rel = entry.path().strip_prefix(p)
+                        .with_context(|| format!("strip_prefix {}", entry.path().display()))?;
+                    let mut zip_name = std::path::PathBuf::from(&root_name);
+                    zip_name.push(rel);
+                    let zip_name_str = zip_name.to_string_lossy().replace('\\', "/");
+                    let ft = entry.file_type();
+                    if ft.is_dir() {
+                        zw.add_directory(&zip_name_str, opts)
+                            .with_context(|| format!("zip add_directory {zip_name_str}"))?;
+                    } else if ft.is_file() {
+                        zw.start_file(&zip_name_str, opts)
+                            .with_context(|| format!("zip start_file {zip_name_str}"))?;
+                        let mut f = std::fs::File::open(entry.path())
+                            .with_context(|| format!("open {}", entry.path().display()))?;
+                        std::io::copy(&mut f, &mut zw)
+                            .with_context(|| format!("copy {} into zip", entry.path().display()))?;
+                    }
+                    // symlinks / other file types: skipped silently.
+                }
+            } else {
+                return Err(anyhow!("{} is neither a regular file nor a directory", p.display()));
+            }
+        }
+
+        let mut inner = zw.finish().context("finalize zip central directory")?;
+        inner.flush().context("flush zip file")?;
+        Ok(tmp)
+    }).await.context("zip build task join")??;
+
+    Ok((tmp, display_name))
+}
+
+async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, multi: bool) -> Result<()> {
+    // Bundling decision is duplicated with `prepare_and_spawn_send` for the
+    // progress-line label only. The real send uses whatever
+    // `prepare_and_spawn_send` decides.
+    let will_bundle = paths.len() > 1 || (paths.len() == 1 && paths[0].is_dir());
+    let name_for_progress = if will_bundle {
+        "bundle.zip".to_string()
+    } else {
+        paths[0].file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file.bin".to_string())
+    };
     let mut last_pct = 0u64;
     let on_progress = move |sent: u64, total: u64| {
         if total == 0 { return }
@@ -315,9 +452,14 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool)
         }
     };
 
+    if will_bundle {
+        eprintln!("bundling {} entr{} into store-mode zip…",
+            paths.len(),
+            if paths.len() == 1 { "y" } else { "ies" });
+    }
     eprintln!("computing file commitment…");
-    let SendSpawn { session_hex, share_url, file_name: _, file_size, handle } =
-        prepare_and_spawn_send(server.to_string(), path.clone(), mode, multi, on_progress).await?;
+    let SendSpawn { session_hex, share_url, file_name, file_size, handle } =
+        prepare_and_spawn_send(server.to_string(), paths, mode, multi, on_progress).await?;
 
     println!("session: {}", session_hex);
     println!("share:   {share_url}");
@@ -350,7 +492,7 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool)
             println!("mode:    complete (WebRTC, exits after first receiver has the file)");
         }
     }
-    println!("sending {} ({} bytes)…", path.display(), file_size);
+    println!("sending {} ({} bytes)…", file_name, file_size);
     use std::io::Write;
     std::io::stdout().flush().ok();
 
@@ -540,7 +682,7 @@ mod tests {
         // --- prepare + spawn the sender via the new entrypoint ---
         let SendSpawn { share_url, handle: send_handle, .. } = prepare_and_spawn_send(
             server_url.clone(),
-            src_path.clone(),
+            vec![src_path.clone()],
             TransportMode::Webrtc,
             /* multi */ false,
             /* on_progress */ |_sent, _total| {},

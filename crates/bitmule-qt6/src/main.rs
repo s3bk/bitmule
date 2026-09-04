@@ -71,8 +71,10 @@ async fn share(files: Vec<PathBuf>, multi_send: bool) -> Url {
     let path_clone = path.clone();
     let mode = if multi_send { ServeMode::Multi } else { ServeMode::Complete };
     tokio::spawn(async move {
+        // Qt6 multi-file/dir bundling lives in F3; wire path here is
+        // single-file so container=None matches the current selector.
         if let Err(e) = send_file_multi(
-            SERVER, share_key, bulk_key, path_clone, mode,
+            SERVER, share_key, bulk_key, path_clone, None, mode,
         ).await {
             eprintln!("bitmule send failed: {e:#}");
         }

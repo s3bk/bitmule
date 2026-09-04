@@ -58,6 +58,12 @@ pub(crate) struct MetaFrame {
     pub chunk_bytes: u32,
     #[serde(rename = "totalChunks")]
     pub total_chunks: u64,
+    /// Container-type flag. `Some("zip-store")` means the sender bundled
+    /// N files or a directory into an on-the-fly zip (store mode, no
+    /// compression) — the receiver should unpack it. `None` = single
+    /// user-selected file, receiver keeps it as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
 }
 
 /// Reject any name that would escape `out_dir` or is otherwise unsafe on
@@ -104,6 +110,7 @@ pub async fn send_file_over_relay(
     server_url_http: &str,
     session_id: &SessionId,
     file_path: &Path,
+    container: Option<&str>,
     out_json_tx: mpsc::UnboundedSender<String>,
     progress: Arc<Mutex<RelaySendProgress>>,
     bulk_key: &crate::crypto::BulkKey,
@@ -127,13 +134,17 @@ pub async fn send_file_over_relay(
     let total_chunks = if size == 0 { 0 } else { (size + RELAY_CHUNK_BYTES as u64 - 1) / RELAY_CHUNK_BYTES as u64 };
 
     // Inner plaintext meta (encrypted under meta_key before hitting the wire).
-    let meta_plain = serde_json::json!({
+    let mut meta_plain_val = serde_json::json!({
         "type": "meta_relay",
         "name": name,
         "size": size,
         "chunkBytes": RELAY_CHUNK_BYTES,
         "totalChunks": total_chunks,
-    }).to_string();
+    });
+    if let Some(c) = container {
+        meta_plain_val["container"] = serde_json::Value::String(c.to_string());
+    }
+    let meta_plain = meta_plain_val.to_string();
     let (meta_nonce, meta_ct) = meta_key.encrypt_meta(session_id_bytes, meta_plain.as_bytes())?;
     let meta_enc_frame = serde_json::json!({
         "type": "meta_relay_enc",
@@ -368,6 +379,9 @@ struct MetaRelayFrame {
     chunk_bytes: u32,
     #[serde(rename = "totalChunks")]
     total_chunks: u64,
+    /// See [`MetaFrame::container`]. Same semantics on the relay path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    container: Option<String>,
 }
 
 

@@ -985,9 +985,10 @@ pub async fn send_file_multi(
     share_key: ShareKey,
     bulk_key: BulkKey,
     file_path: PathBuf,
+    container: Option<String>,
     mode: crate::multipeer::ServeMode,
 ) -> Result<()> {
-    let mut orch = send_serve(server_url_http, share_key, bulk_key, file_path, mode).await?;
+    let mut orch = send_serve(server_url_http, share_key, bulk_key, file_path, container, mode).await?;
     orch.await_complete().await
 }
 
@@ -1061,6 +1062,7 @@ pub async fn send_file_relay(
     share_key: ShareKey,
     bulk_key: BulkKey,
     file_path: &Path,
+    container: Option<&str>,
     on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
     let session_hex = share_key.session_id_hex();
@@ -1079,7 +1081,7 @@ pub async fn send_file_relay(
     let progress = std::sync::Arc::new(tokio::sync::Mutex::new(crate::RelaySendProgress::default()));
     let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
     crate::send_file_over_relay(
-        server_url_http, &session_id, file_path, out_tx, progress,
+        server_url_http, &session_id, file_path, container, out_tx, progress,
         &bulk, &meta, &session_id_bytes,
         on_progress,
     ).await
@@ -1999,6 +2001,7 @@ async fn peer_session_run(
         &session.shared.file_path,
         session.shared.file_size,
         session.shared.total_chunks,
+        session.shared.container.as_deref(),
     )?;
 
     channel_set_low_threshold(&mut session.rtc, session.channel_id, BUFFERED_LOW_THRESHOLD)?;
@@ -2199,19 +2202,23 @@ fn build_meta_enc_payload(
     file_path: &Path,
     file_size: u64,
     total_chunks: u64,
+    container: Option<&str>,
 ) -> Result<Vec<u8>> {
     let name = file_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".to_string());
-    let meta_plain = serde_json::json!({
+    let mut meta_plain_val = serde_json::json!({
         "type": "meta",
         "name": name,
         "size": file_size,
         "chunkBytes": CHUNK_BYTES,
         "totalChunks": total_chunks,
-    })
-    .to_string();
+    });
+    if let Some(c) = container {
+        meta_plain_val["container"] = serde_json::Value::String(c.to_string());
+    }
+    let meta_plain = meta_plain_val.to_string();
     let (nonce, ct) = meta_key.encrypt_meta(session_id_bytes, meta_plain.as_bytes())?;
     let frame = serde_json::json!({
         "type": "meta_enc",
@@ -2424,6 +2431,7 @@ pub async fn send_serve(
     share_key: ShareKey,
     pre_generated_bulk_key: BulkKey,
     file_path: PathBuf,
+    container: Option<String>,
     mode: crate::multipeer::ServeMode,
 ) -> Result<SenderOrchestrator> {
     let session_hex = share_key.session_id_hex();
@@ -2456,6 +2464,7 @@ pub async fn send_serve(
         file_size,
         total_chunks,
         mode,
+        container,
     });
 
     // Sender-side Hello — no to_receiver_id (server broadcasts).

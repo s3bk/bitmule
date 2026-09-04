@@ -46,3 +46,6 @@ roaring = "0.10"
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"
+zip = { version = "2", default-features = false }
+tempfile = "3"
+walkdir = "2"

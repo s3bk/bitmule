@@ -187,11 +187,15 @@ pub async fn send_file(
     on_url.on_url(share_url.clone(), session_hex.clone(), file_name, file_size);
 
     let mode = if multi { ServeMode::Multi } else { ServeMode::Complete };
+    // FFI send only accepts a single file path today — multi-file/dir
+    // bundling belongs in the Kotlin/Swift caller (F4 Android + iOS
+    // pickers zip on their side). None here = single-file wire path.
     send_file_multi(
         server.trim_end_matches('/'),
         share_key,
         bulk_key,
         path,
+        None,
         mode,
     )
     .await

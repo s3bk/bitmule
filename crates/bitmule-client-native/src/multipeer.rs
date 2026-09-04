@@ -354,6 +354,9 @@ pub struct SenderShared {
     pub file_size: u64,
     pub total_chunks: u64,
     pub mode: ServeMode,
+    /// See MetaFrame::container semantics. `Some("zip-store")` = receiver
+    /// should unpack; `None` = single file, keep as-is.
+    pub container: Option<String>,
 }
 
 /// Per-peer serving state. Owned by the per-peer task's async block —
