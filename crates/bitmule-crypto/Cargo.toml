@@ -1,0 +1,20 @@
+[package]
+name = "bitmule-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared crypto primitives for bitmule (native + wasm)"
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+aes-gcm = "0.10"
+hkdf.workspace = true
+hmac = "0.12"
+sha2.workspace = true
+x25519-dalek.workspace = true
+zeroize = "1.9.0"
+rand_core = { version = "0.6" }
+base64 = "0.22"
+getrandom = { version = "0.2", features = ["js"] }

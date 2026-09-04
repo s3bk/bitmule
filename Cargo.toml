@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/bitmule",
     "crates/bitmule-core",
+    "crates/bitmule-crypto",
     "crates/bitmule-server",
     "crates/bitmule-server-signal-ws",
     "crates/bitmule-server-store-fs",

@@ -527,6 +527,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bitmule-core",
+ "bitmule-crypto",
  "bytes",
  "futures-util",
  "hkdf",
@@ -553,6 +554,7 @@ name = "bitmule-client-wasm"
 version = "0.1.0"
 dependencies = [
  "bitmule-core",
+ "bitmule-crypto",
  "getrandom 0.2.17",
  "js-sys",
  "uuid 1.26.0",
@@ -582,6 +584,22 @@ dependencies = [
  "tracing",
  "uuid 1.26.0",
  "x25519-dalek",
+]
+
+[[package]]
+name = "bitmule-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "hkdf",
+ "hmac",
+ "rand_core 0.6.4",
+ "sha2",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
