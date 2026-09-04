@@ -8,7 +8,10 @@ called through UniFFI-generated Kotlin bindings.
 ## First build
 
 ```bash
-# 1. Cross-compile the Rust .so per ABI.
+# 1. Cross-compile the Rust .so per ABI. rustflags in the workspace
+#    `.cargo/config.toml` pass `-Wl,-z,max-page-size=65536` to the
+#    Android linker so the produced .so satisfies the 16 KB page-size
+#    requirement (Google Play, 2025-11+); no extra env needed.
 cd ../crates/bitmule-mobile-ffi
 cargo ndk -t aarch64-linux-android \
           -t armv7-linux-androideabi \
@@ -28,6 +31,37 @@ gradle build :app:assembleDebug
 ```
 
 APK lands at `app/build/outputs/apk/debug/app-debug.apk`.
+
+### 16 KB page-size support
+
+Google Play requires apps targeting Android 15+ on 64-bit ARM to
+support 16 KB kernel page sizes (effective 2025-11 for new apps and
+updates). This project ships that support by default:
+
+- Workspace `../.cargo/config.toml` sets
+  `-Wl,-z,max-page-size=65536` on every android target. 65536 covers
+  4 / 16 / 64 KB kernel-page ABIs in one link — future-proof against
+  the next bump.
+- `app/build.gradle.kts` sets `packaging.jniLibs.useLegacyPackaging
+  = false` explicitly so AGP page-aligns .so entries in the APK zip.
+  AGP >= 8.5 already defaults this way; explicit survives an
+  accidental downgrade.
+
+Verify a built APK:
+
+```bash
+# APK Analyzer (Android Studio) shows the alignment on each .so.
+# Command-line check:
+unzip -l app/build/outputs/apk/debug/app-debug.apk | grep '\.so'
+# ...then for each .so, use zipalign -v -c 16384 <apk> — success
+# = 16 KB aligned.
+```
+
+If you still see the Android Studio "not supporting 16 KB devices"
+warning after a full rebuild, confirm `cargo ndk` is >= 3.5 and the
+Android NDK bundled with your `sdkmanager` is >= r27, then rebuild
+the `.so` from scratch (`cargo clean -p bitmule-mobile-ffi` before
+step 1 above).
 
 ## Layout
 
