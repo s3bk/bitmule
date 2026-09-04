@@ -308,6 +308,17 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
 
         tokio::select! {
             maybe_frame = unrouted_rx.recv() => {
+                // FIXME(m2b-3): router-error surfacing is weaker here than the
+                // pre-M2b-3 shape. Before the split, `parse_ws_frame(maybe_msg)?`
+                // propagated parse errors mid-handshake. Now a parse-Err inside
+                // the router only shows up when we await `router_task` after
+                // shutdown, so a mid-handshake parse-fail results in `recv()`
+                // returning None → the `bail!` below fires with a generic
+                // "router terminated" message instead of the underlying parse
+                // error. Not blocking for M2b-3 (parse errors during ICE/SDP/KEX
+                // are rare) but fix when the router lives past send_connect in
+                // M2b-4 — probably a `health_rx: oneshot<Result<()>>` on the
+                // handle that select! can watch alongside `unrouted_rx`.
                 let frame = match maybe_frame {
                     Some(f) => f,
                     None => bail!("ws router terminated before DC opened"),
