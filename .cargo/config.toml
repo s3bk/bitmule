@@ -1,0 +1,19 @@
+# Android 16 KB page-size support (Google Play requirement, effective
+# 2025-11 for new/updated apps targeting Android 15+ on 64-bit ARM).
+# The `.so` must be linked with `max-page-size=16384` so the loader
+# can map it under a 16 KB kernel-page ABI without alignment errors.
+#
+# `65536` here covers 4 KB, 16 KB, AND 64 KB kernel page sizes in one
+# link — future-proof against Android's next bump. Overhead is one
+# padded segment at load time, no runtime cost.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=65536"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=65536"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=65536"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=65536"]

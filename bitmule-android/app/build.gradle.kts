@@ -48,6 +48,18 @@ android {
     // -p bitmule-mobile-ffi -o app/src/main/jniLibs` — see the
     // FFI crate README for the exact recipe.
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+
+    // Android 16 KB page-size support. AGP >= 8.5 defaults to
+    // useLegacyPackaging = false which page-aligns .so entries in
+    // the APK; setting it explicitly here keeps intent obvious and
+    // survives an accidental AGP downgrade. Paired with the
+    // `max-page-size=65536` rustflags in workspace `.cargo/config.toml`
+    // so the linked .so itself is aligned.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
 }
 
 dependencies {
