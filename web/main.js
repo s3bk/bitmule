@@ -885,6 +885,25 @@ async function startSendSession(files) {
       }
       return;
     }
+    // Server-emitted peer_left when a receiver's WS drops. Prune the
+    // per-peer state so the UI counter + peers map stays accurate
+    // without waiting on ICE-failed / DC-close timeouts.
+    if (frame.type === "peer_left" && frame.role === "receiver" && fromId) {
+      const peer = session.peers.get(fromId);
+      if (peer) {
+        console.info(`peer_left: ${fromId.slice(0,8)}… — pruning`);
+        if (!peer.complete) {
+          session.activeCount = Math.max(0, session.activeCount - 1);
+        }
+        try { peer.wrpc.close(); } catch {}
+        session.peers.delete(fromId);
+        updateSendCounters();
+        if (session.activeCount === 0) {
+          els.sessionState.textContent = "waiting for receiver…";
+        }
+      }
+      return;
+    }
     if (frame.type === "sdp" || frame.type === "ice" || frame.type === "kex_pub") {
       const peer = fromId ? session.peers.get(fromId) : null;
       if (!peer) return;
@@ -1402,6 +1421,16 @@ function startRecvSession(sessionHex, fragment) {
     if (frame.type === "peer_hello" && frame.role === "sender") {
       session.senderPresent = true;
       console.info("sender present on ws session — WebRTC negotiation window open");
+    }
+    // Server-emitted peer_left when the sender's WS drops. Reflect
+    // it in the UI so the receiver doesn't sit at "waiting for
+    // sender to negotiate…" forever after the sender has gone away.
+    if (frame.type === "peer_left" && frame.role === "sender") {
+      session.senderPresent = false;
+      console.info("sender left the session");
+      if (!recvSession || recvSession !== session) return;
+      els.recvState.textContent = "sender disconnected — session idle";
+      return;
     }
     if (frame.type === "sdp" || frame.type === "ice") {
       try {

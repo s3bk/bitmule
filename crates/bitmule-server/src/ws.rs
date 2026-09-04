@@ -260,16 +260,31 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
         }
     }
 
-    // Unregister and drop the room if it's now empty.
+    // Unregister and notify the other side.
+    //
+    // `peer_left` frames let the counterparty prune stale UI + tear
+    // down orphaned peer state without waiting on ICE timeouts. Frame
+    // shape mirrors `peer_hello`: {"type":"peer_left","role":<role>,
+    // "receiver_id"?:<hex>,"from_receiver_id"?:<hex>}. A departing
+    // receiver's frame lists its receiver_id so the sender can look
+    // up the right per-peer entry to close.
     {
         let mut r = room.lock().await;
         match role {
             Role::Sender => {
                 r.sender = None;
+                // Fan a sender-departed notice to every receiver.
+                r.fan_to_receivers(r#"{"type":"peer_left","role":"sender"}"#);
             }
             Role::Receiver => {
                 if let Some(rid) = receiver_id {
                     r.receivers.remove(&rid);
+                    // Notify the sender that THIS receiver went away.
+                    let hex = rid.as_hex();
+                    let frame = format!(
+                        r#"{{"type":"peer_left","role":"receiver","receiver_id":"{hex}","from_receiver_id":"{hex}"}}"#
+                    );
+                    r.route_to_sender(&frame);
                 }
             }
         }
