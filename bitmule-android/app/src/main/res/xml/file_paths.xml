@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Received files live under app-scoped external files dir
+         `getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)` on
+         Android, exposed to Share intents via this FileProvider. -->
+    <external-files-path name="downloads" path="Download/" />
+    <files-path name="internal" path="." />
+</paths>

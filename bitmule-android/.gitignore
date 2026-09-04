@@ -1,0 +1,14 @@
+# Gradle
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+
+# Android
+app/src/main/jniLibs/            # Cross-compiled .so from bitmule-mobile-ffi
+app/src/main/java/uniffi/        # UniFFI-generated Kotlin bindings
+
+# APK output
+*.apk
+*.aab
