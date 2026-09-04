@@ -49,3 +49,22 @@ hex = "0.4"
 zip = { version = "2", default-features = false }
 tempfile = "3"
 walkdir = "2"
+
+# Release profile shared across the workspace. Strip debug + symbol
+# tables so `cargo build --release` produces small binaries — critical
+# for the Android .so files that ship inside the APK (unstripped
+# release .so grows to ~200 MB per ABI because rustc keeps debug info
+# by default; three ABIs × 200 MB explains an 800 MB APK).
+#
+# `strip = "symbols"` drops the symbol table + debug info; keeps the
+# binary runnable but backtraces become opaque. `panic = "abort"`
+# shrinks a further ~5-10% by removing landing pads but breaks
+# std::panic::catch_unwind — leave it as unwind so the FFI's
+# BitmuleError catch-all still works. `lto = "thin"` shrinks + speeds
+# incrementally; full LTO is much slower link-time for marginal gain.
+# `codegen-units = 1` is the size-optimal setting but slows single
+# builds; comment out and add back only if release size becomes
+# critical again.
+[profile.release]
+strip = "symbols"
+lto = "thin"
