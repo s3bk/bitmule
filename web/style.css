@@ -321,3 +321,11 @@ font-size: 32px;
   word-wrap: normal;
   -webkit-overflow-scrolling: touch;
 }
+details {
+    display: flex;
+    flex-direction: column;
+}
+
+label.option-row {
+    display: block;
+}
