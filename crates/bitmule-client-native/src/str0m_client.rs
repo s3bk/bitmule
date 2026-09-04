@@ -247,33 +247,50 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
         .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     info!(session = %session_hex, "opening sender WS + Rtc");
 
-    let mut ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
+    let ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
     let (mut rtc, mut pool) = build_rtc().await?;
+
+    // M2b-3: hand the WS to a router+writer pair for the handshake. Router
+    // dispatches inbound frames (unrouted here since no peer tasks yet);
+    // writer serializes an outbox mpsc onto the sink. On DC-open we shut
+    // both tasks down + reunite the sink+stream back into a `Ws` for
+    // LiveSession so downstream file-transfer code stays unchanged.
+    let (sink, stream) = ws.split();
+    let crate::multipeer::WsWriterHandle {
+        outbox_tx,
+        task: writer_task,
+    } = crate::multipeer::spawn_ws_writer(sink);
+    let crate::multipeer::WsRouterHandle {
+        register_tx: _,
+        mut unrouted_rx,
+        shutdown_tx: router_shutdown_tx,
+        task: router_task,
+    } = crate::multipeer::spawn_ws_router(stream);
 
     // Active side: create the data channel BEFORE offer generation so its
     // m-line lands in the SDP.
     let mut change = rtc.sdp_api();
     let channel_id = change.add_channel("bitmule".into());
-    let (offer, mut pending) = change
+    let (offer, pending) = change
         .apply()
         .ok_or_else(|| anyhow!("sdp_api produced no offer — nothing added"))?;
     let mut next_timeout = drain_rtc(&mut rtc, &pool).await?;
 
-    ws_send(&mut ws, &SignalFrame::Hello {
+    crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::Hello {
         role: Role::Sender.as_str().to_owned(),
         receiver_id: None,
         wire_version: Some(crate::WIRE_VERSION),
-    }).await?;
+    }, None)?;
 
     // Crypto handshake — send our ephemeral immediately, wait for peer's
     // in the loop below (concurrent with SDP exchange).
     let local_ephemeral = Ephemeral::generate();
     let local_pub = local_ephemeral.public_bytes();
     let local_mac = share_key.mac_ephemeral_pub(&local_pub);
-    ws_send(&mut ws, &SignalFrame::KexPub {
+    crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::KexPub {
         pub_hex: hex_encode(&local_pub),
         mac_hex: hex_encode(&local_mac),
-    }).await?;
+    }, None)?;
     let mut ephemeral_holder = Some(local_ephemeral);
     let mut wrap_key: Option<WrapKey> = None;
     let mut meta_key: Option<MetaKey> = None;
@@ -285,16 +302,15 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
     let mut offer_holder: Option<SdpOffer> = Some(offer);
     let mut pending_holder: Option<_> = Some(pending);
     let mut opened = false;
-    let mut buf = vec![0u8; 4096];
 
     while !opened {
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
 
         tokio::select! {
-            maybe_msg = ws.next() => {
-                let frame = match parse_ws_frame(maybe_msg)? {
+            maybe_frame = unrouted_rx.recv() => {
+                let frame = match maybe_frame {
                     Some(f) => f,
-                    None => continue,
+                    None => bail!("ws router terminated before DC opened"),
                 };
                 match frame {
                     SignalFrame::Ice { candidate: Some(c) } => {
@@ -324,10 +340,10 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
                         let offer = offer_holder.take().expect("offer set on entry");
                         let offer_sdp = offer.to_sdp_string();
                         info!("OFFER SDP:\n{}", offer_sdp);
-                        ws_send(&mut ws, &SignalFrame::Sdp {
+                        crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::Sdp {
                             kind: "offer".into(),
                             sdp: offer_sdp,
-                        }).await?;
+                        }, None)?;
                         debug!("offer sent");
                     }
                     SignalFrame::Sdp { kind, sdp } if kind == "answer" => {
@@ -390,10 +406,10 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
             let b = pre_generated_bulk_key.clone();
             let wk = wrap_key.as_ref().unwrap();
             let (nonce, ct) = wk.wrap_bulk_key(&b)?;
-            ws_send(&mut ws, &SignalFrame::KeyWrap {
+            crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::KeyWrap {
                 enc_b_hex: hex_encode(&ct),
                 nonce_hex: hex_encode(&nonce),
-            }).await?;
+            }, None)?;
             bulk_key = Some(b);
             key_wrap_sent = true;
             info!("bulk key generated + wrapped + sent");
@@ -403,6 +419,18 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
     let wrap_key = wrap_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
     let meta_key = meta_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
     let bulk_key = bulk_key.ok_or_else(|| anyhow!("DC opened before bulk key was generated"))?;
+
+    // Tear down router+writer + reunite the WS. Drop-order matters: dropping
+    // `outbox_tx` (the sole remaining sender clone in M2b-3, since no peer
+    // tasks were spawned) closes the writer's mpsc → writer returns the sink.
+    // Router shutdown_tx signal breaks the router's select! → router returns
+    // the stream. Reunite yields the original Ws for LiveSession.
+    let _ = router_shutdown_tx.send(true);
+    drop(outbox_tx);
+    let sink = writer_task.await.map_err(|e| anyhow!("ws writer join: {e}"))??;
+    let stream = router_task.await.map_err(|e| anyhow!("ws router join: {e}"))??;
+    let ws = stream.reunite(sink).map_err(|e| anyhow!("ws reunite: {e}"))?;
+
     Ok(LiveSession {
         session_id, role: Role::Sender, rtc, pool, ws, channel_id,
         wrap_key, meta_key, bulk_key: Some(bulk_key), share_key,

@@ -3,13 +3,15 @@
 //! Spec: `docs/multipeer.md`. This module holds the type definitions
 //! for the per-peer serving model; wiring lands in follow-up slices.
 //! - M2b-1: type scaffold (ServeMode / DcControlFrame / ChunkRange / PeerHandle / CoveredNote).
-//! - M2b-2 (this slice): shared-WS router + writer scaffolding. Parent task
+//! - M2b-2: shared-WS router + writer scaffolding. Parent task
 //!   owns single WS split into stream+sink; router dispatches inbound
 //!   frames by `from_receiver_id` to per-peer mpsc inboxes; writer drains
-//!   an outbox mpsc onto the sink. Types + spawn helpers only, not yet
-//!   integrated into `send_connect` (that's M2b-3).
-//! - M2b-3: swap parent send_connect over to WsRouter+WsWriter shape,
-//!   still single-peer.
+//!   an outbox mpsc onto the sink.
+//! - M2b-3 (this slice): send_connect swapped over to router+writer shape,
+//!   still single-peer. Router+writer support shutdown-and-return-halves so
+//!   the caller can reunite the WS before it lands in LiveSession —
+//!   downstream file-transfer code keeps its `session.ws.next()` shape
+//!   untouched until N-Rtc dispatch (M2b-4) needs the split-in-flight.
 //! - M2b-4: N-Rtc dispatch loop over shared SocketPool via Rtc::accepts().
 //! - M2b-5: PeerSession struct + per-peer task spawn on peer_hello.
 //! - M2b-6: block-serve loop with request_ranges wire.
@@ -127,7 +129,8 @@ pub(crate) struct PeerRegistration {
     pub inbox_tx: mpsc::UnboundedSender<SignalFrame>,
 }
 
-/// Handle to the running WS router task.
+/// Handle to the running WS router task. Task returns the reclaimed
+/// stream half on graceful shutdown so the caller can reunite the WS.
 #[allow(dead_code)]
 pub(crate) struct WsRouterHandle {
     /// Send `PeerRegistration` here to add a per-peer route. Router
@@ -137,30 +140,43 @@ pub(crate) struct WsRouterHandle {
     /// registered peer land here. Peer_hello notifications from the
     /// server are the primary content.
     pub unrouted_rx: mpsc::UnboundedReceiver<SignalFrame>,
-    pub task: tokio::task::JoinHandle<Result<()>>,
+    /// Set to `true` to ask the router to exit its select! loop after
+    /// draining the current iteration. Router then returns the stream
+    /// half back through `task`.
+    pub shutdown_tx: watch::Sender<bool>,
+    pub task: tokio::task::JoinHandle<Result<SplitStream<Ws>>>,
 }
 
-/// Handle to the running WS writer task.
+/// Handle to the running WS writer task. Task returns the reclaimed
+/// sink half on graceful shutdown (all `outbox_tx` clones dropped).
 #[allow(dead_code)]
 pub(crate) struct WsWriterHandle {
     /// All outbound WS payloads route through this mpsc. Per-peer tasks
     /// keep a clone of the sender; parent uses `.send()` to enqueue.
+    /// Drop every clone to trigger writer shutdown.
     pub outbox_tx: mpsc::UnboundedSender<Message>,
-    pub task: tokio::task::JoinHandle<Result<()>>,
+    pub task: tokio::task::JoinHandle<Result<SplitSink<Ws, Message>>>,
 }
 
-/// Spawn the router task. Owns the read half of the WS; runs until the
-/// stream closes or a fatal parse error. Returns a handle with the
-/// registration channel + unrouted mpsc receiver.
+/// Spawn the router task. Owns the read half of the WS; runs until
+/// `shutdown_tx.send(true)` is called or the stream closes. Returns a
+/// handle with the registration channel + unrouted mpsc receiver;
+/// awaiting `task` after shutdown yields the stream half back.
 #[allow(dead_code)]
 pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
     let (register_tx, mut register_rx) = mpsc::unbounded_channel::<PeerRegistration>();
     let (unrouted_tx, unrouted_rx) = mpsc::unbounded_channel::<SignalFrame>();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel::<bool>(false);
 
     let task = tokio::spawn(async move {
         let mut peers: HashMap<String, mpsc::UnboundedSender<SignalFrame>> = HashMap::new();
         loop {
             tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
                 Some(reg) = register_rx.recv() => {
                     peers.insert(reg.receiver_id, reg.inbox_tx);
                 }
@@ -184,14 +200,15 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
                 else => break,
             }
         }
-        Ok(())
+        Ok(stream)
     });
 
-    WsRouterHandle { register_tx, unrouted_rx, task }
+    WsRouterHandle { register_tx, unrouted_rx, shutdown_tx, task }
 }
 
 /// Spawn the writer task. Owns the write half of the WS; drains the
-/// outbox mpsc until it closes.
+/// outbox mpsc until every `outbox_tx` clone is dropped, then returns
+/// the sink half.
 #[allow(dead_code)]
 pub(crate) fn spawn_ws_writer(mut sink: SplitSink<Ws, Message>) -> WsWriterHandle {
     use futures_util::SinkExt;
@@ -202,7 +219,7 @@ pub(crate) fn spawn_ws_writer(mut sink: SplitSink<Ws, Message>) -> WsWriterHandl
                 .await
                 .map_err(|e| anyhow!("ws writer send: {e}"))?;
         }
-        Ok(())
+        Ok(sink)
     });
     WsWriterHandle { outbox_tx, task }
 }
