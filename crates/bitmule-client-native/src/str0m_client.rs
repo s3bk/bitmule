@@ -108,6 +108,14 @@ impl SocketPool {
     /// Send to `dest` from the socket bound to `source_ip`. If no socket
     /// matches, falls back to the first available socket + logs a warning
     /// (indicates a str0m Transmit for a source we didn't bind).
+    ///
+    /// Transient send failures (EINVAL / ENETUNREACH / EHOSTUNREACH /
+    /// EAFNOSUPPORT) are logged and swallowed as `Ok(())` — str0m's ICE
+    /// state machine handles per-pair failures on its own by trying
+    /// other pairs. Observed with Firefox emitting an srflx candidate
+    /// to a public IP that no local socket can route to; without this
+    /// swallow the whole peer task errors on the first STUN write and
+    /// the transfer never gets a chance to fall back to a working pair.
     pub async fn send_from(&self, source: SocketAddr, dest: SocketAddr, bytes: &[u8]) -> Result<()> {
         let sock = match self.sockets.get(&source.ip()) {
             Some(s) => s.clone(),
@@ -117,8 +125,21 @@ impl SocketPool {
                     .ok_or_else(|| anyhow!("socket pool is empty"))?
             }
         };
-        sock.send_to(bytes, dest).await
-            .with_context(|| format!("send_to {dest}"))?;
+        if let Err(e) = sock.send_to(bytes, dest).await {
+            use std::io::ErrorKind;
+            match e.kind() {
+                ErrorKind::InvalidInput
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::HostUnreachable
+                | ErrorKind::AddrNotAvailable => {
+                    warn!("send_to {dest} from {source}: {e} — ignoring, str0m will retry another pair");
+                }
+                _ => {
+                    return Err(anyhow::Error::from(e))
+                        .with_context(|| format!("send_to {dest} from {source}"));
+                }
+            }
+        }
         Ok(())
     }
 
