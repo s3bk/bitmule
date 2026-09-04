@@ -174,65 +174,125 @@ async fn commit_file(path: &Path, bulk_key: &BulkKey) -> Result<[u8; 32]> {
     Ok(hasher.finalize(bulk_key))
 }
 
-async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool) -> Result<()> {
+/// Everything an in-process caller (tests, embedders) needs after
+/// [`prepare_and_spawn_send`] returns: the share URL to hand to the
+/// receiver + the JoinHandle to `await` for the transfer's final result.
+///
+/// Also carries `session_hex`, `file_name`, `file_size` so callers can
+/// log or display the same info the CLI does without re-statting the
+/// file or re-deriving the session id.
+pub struct SendSpawn {
+    pub session_hex: String,
+    pub share_url: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+/// Prepare a send session and spawn the transfer as a background task.
+///
+/// Splits out of `cmd_send` so an integration test (or any embedder)
+/// can drive both sides of a transfer from the same process: call
+/// this, hand `share_url` to a receiver, then `.await` `handle` for
+/// the transfer's final result. No stdout/stderr side effects here —
+/// callers do their own printing.
+///
+/// The transfer body picks `send_file_multi` when `multi` is true,
+/// `send_file` otherwise. `on_progress(sent, total)` fires from the
+/// legacy single-peer path only (multipeer has no equivalent hook
+/// yet); pass a no-op closure when unused.
+pub async fn prepare_and_spawn_send<F>(
+    server: String,
+    path: PathBuf,
+    mode: TransportMode,
+    multi: bool,
+    on_progress: F,
+) -> Result<SendSpawn>
+where
+    F: FnMut(u64, u64) + Send + 'static,
+{
     let meta = tokio::fs::metadata(&path).await
         .with_context(|| format!("stat {}", path.display()))?;
     if !meta.is_file() {
         return Err(anyhow!("{} must be a regular file", path.display()));
     }
+    let file_size = meta.len();
+    let file_name = path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".to_string());
+
     // Mint share_key (URL secret) + bulk_key (file-encryption key) up front.
     // Then hash the file with the bulk_key to produce the URL signature
     // commitment. The share URL fragment = base64url(share_key || signature).
     let share_key = ShareKey::random();
     let bulk_key = BulkKey::random();
     let session_hex = share_key.session_id_hex();
-    eprintln!("computing file commitment…");
     let signature = commit_file(&path, &bulk_key).await?;
     let link = ShareLink::new(share_key.clone(), signature);
-    let share = format!(
+    let share_url = format!(
         "{}/#{}",
         server.trim_end_matches('/'),
         link.to_b64_url()
     );
-    println!("session: {}", session_hex);
-    println!("share:   {share}");
-    if multi {
-        println!("mode:    multi-peer (WebRTC, never exits — Ctrl-C to stop)");
-    } else {
-        println!("mode:    {}", mode_label(mode));
-    }
-    println!("sending {} ({} bytes)…", path.display(), meta.len());
-    use std::io::Write;
-    std::io::stdout().flush().ok();
 
-    if multi {
-        // M2b-8: multipeer serve. Runs until Ctrl-C (WS closes on
-        // disconnect, propagated as Err from await_complete). Complete
-        // is the exit predicate the CALLER opts out of by passing
-        // --multi; without --multi we still route through legacy
-        // send_file for the tested single-peer path.
-        send_file_multi(server, share_key, bulk_key, path, ServeMode::Multi).await?;
-        eprintln!();
-        println!("multi-peer server exited.");
-        return Ok(());
-    }
+    let handle = tokio::spawn(async move {
+        if multi {
+            send_file_multi(&server, share_key, bulk_key, path, ServeMode::Multi).await
+        } else {
+            send_file(&server, share_key, bulk_key, &path, mode, on_progress).await
+        }
+    });
 
+    Ok(SendSpawn { session_hex, share_url, file_name, file_size, handle })
+}
+
+async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool) -> Result<()> {
+    // Precompute the progress callback so the closure's `name_for_progress`
+    // captures the file name string exactly once (cheap clone before
+    // ownership of `path` moves into `prepare_and_spawn_send`).
     let name_for_progress = path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".to_string());
     let mut last_pct = 0u64;
-    send_file(server, share_key, bulk_key, &path, mode, move |sent, total| {
+    let on_progress = move |sent: u64, total: u64| {
         if total == 0 { return }
         let pct = sent * 100 / total;
         if pct != last_pct {
             last_pct = pct;
             eprint!("\r{}: {}%    ", name_for_progress, pct);
+            use std::io::Write;
             let _ = std::io::stderr().flush();
         }
-    }).await?;
-    eprintln!();
-    println!("done.");
-    Ok(())
+    };
+
+    eprintln!("computing file commitment…");
+    let SendSpawn { session_hex, share_url, file_name: _, file_size, handle } =
+        prepare_and_spawn_send(server.to_string(), path.clone(), mode, multi, on_progress).await?;
+
+    println!("session: {}", session_hex);
+    println!("share:   {share_url}");
+    if multi {
+        println!("mode:    multi-peer (WebRTC, never exits — Ctrl-C to stop)");
+    } else {
+        println!("mode:    {}", mode_label(mode));
+    }
+    println!("sending {} ({} bytes)…", path.display(), file_size);
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+
+    match handle.await {
+        Ok(Ok(())) => {
+            eprintln!();
+            if multi {
+                println!("multi-peer server exited.");
+            } else {
+                println!("done.");
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(je) => Err(anyhow!("send task join: {je}")),
+    }
 }
 
 async fn cmd_recv(
@@ -351,4 +411,123 @@ async fn contact_add(first: String, pubkey: Option<String>) -> Result<()> {
     println!("stored:  {}", path.display());
     println!("pubkey:  {}", saved.public_blob_b64);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use bitmule_core::traits::ChunkStore;
+    use bitmule_server::{relay, state::AppState, ws::ws_handler};
+    use bitmule_server_store_fs::FsChunkStore;
+
+    /// End-to-end round-trip: spawn an in-process bitmule-server on a
+    /// random localhost port, call `prepare_and_spawn_send` on a random
+    /// 32 KiB file, hand its share URL to `cmd_recv`, wait ≤10s for the
+    /// receiver to finish, and confirm the received bytes match.
+    ///
+    /// Bounded by tokio::time::timeout so the test either passes cleanly
+    /// or fails deterministically — no hangs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prepare_and_spawn_send_roundtrip() -> Result<()> {
+        // --- server bring-up (same axum::Router shape as bitmule-server main) ---
+        let server_data_dir = tempfile::tempdir()?;
+        let store: Arc<dyn ChunkStore> =
+            Arc::new(FsChunkStore::new(server_data_dir.path()));
+        let state = AppState::new(store);
+        let app = axum::Router::new()
+            .route("/ws/:session", axum::routing::get(ws_handler))
+            .route(
+                "/session/:sess/chunk/:idx",
+                axum::routing::put(relay::put_chunk).get(relay::get_chunk),
+            )
+            .route("/session/:sess/have", axum::routing::get(relay::have))
+            .route("/session/:sess/capacity", axum::routing::get(relay::capacity))
+            .route(
+                "/session/:sess/delivered/:idx",
+                axum::routing::post(relay::mark_delivered),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let bound = listener.local_addr()?;
+        let server_url = format!("http://{bound}");
+        let _server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // --- file under test: 32 KiB of deterministic-random bytes ---
+        let src_dir = tempfile::tempdir()?;
+        let src_path = src_dir.path().join("payload.bin");
+        let want: Vec<u8> = (0..32 * 1024u32)
+            .map(|i| ((i.wrapping_mul(2654435761)) & 0xff) as u8)
+            .collect();
+        tokio::fs::write(&src_path, &want).await?;
+
+        // --- prepare + spawn the sender via the new entrypoint ---
+        let SendSpawn { share_url, handle: send_handle, .. } = prepare_and_spawn_send(
+            server_url.clone(),
+            src_path.clone(),
+            TransportMode::Webrtc,
+            /* multi */ false,
+            /* on_progress */ |_sent, _total| {},
+        )
+        .await?;
+
+        // --- hand the URL to cmd_recv, capped at 10s wall clock ---
+        let dst_dir = tempfile::tempdir()?;
+        let dst_out = dst_dir.path().to_path_buf();
+        let server_url_recv = server_url.clone();
+        let share_for_recv = share_url.clone();
+        let recv_fut = async move {
+            cmd_recv(
+                &server_url_recv,
+                Some(share_for_recv),
+                dst_out,
+                TransportMode::Webrtc,
+            )
+            .await
+        };
+
+        // Await sender + receiver together; whichever errors first fails
+        // the test, and the outer timeout guarantees no hang.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (send_res, recv_res) = tokio::join!(
+                async {
+                    match send_handle.await {
+                        Ok(inner) => inner,
+                        Err(je) => Err(anyhow!("send join: {je}")),
+                    }
+                },
+                recv_fut,
+            );
+            send_res.and(recv_res)
+        })
+        .await;
+
+        match joined {
+            Ok(Ok(())) => { /* both sides clean */ }
+            Ok(Err(e)) => return Err(anyhow!("transfer failed: {e:#}")),
+            Err(_) => return Err(anyhow!("transfer did not finish within 10s")),
+        }
+
+        // --- verify the received file matches ---
+        let entries: Vec<_> = std::fs::read_dir(dst_dir.path())?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        let got_path = entries
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no file landed in {}", dst_dir.path().display()))?;
+        let got = tokio::fs::read(&got_path).await?;
+        if got != want {
+            return Err(anyhow!(
+                "received bytes differ: got {} bytes, want {}",
+                got.len(),
+                want.len()
+            ));
+        }
+        Ok(())
+    }
 }
