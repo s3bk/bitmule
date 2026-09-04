@@ -15,16 +15,52 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::fmt::Debug;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
+use tokio::runtime::Runtime;
 
 use bitmule_client_native::{recv_file as native_recv, send_file_multi, TransportMode};
 use bitmule_client_native::multipeer::ServeMode;
 use bitmule_crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
 
 uniffi::include_scaffolding!("bitmule_mobile_ffi");
+
+// Global multi-threaded tokio runtime for the FFI. Every `async fn`
+// exported over UniFFI wraps its body in `TOKIO_RT.spawn(...).await`,
+// so the actual work always runs inside a tokio context regardless of
+// the executor that polls the outer Future. Without this, calls
+// against `tokio::fs`, `tokio::spawn`, `str0m`'s inner tokio primitives,
+// etc. fail at runtime with "there is no reactor running" the moment
+// the Kotlin coroutine dispatch picks up the outer Future on a
+// non-tokio thread.
+//
+// One process-wide runtime is deliberate: multiple runtimes on Android
+// would compete for threadpool workers + double the wake-up cost, and
+// nothing in our surface wants isolated schedulers.
+static TOKIO_RT: LazyLock<Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("bitmule-ffi-tokio")
+        .build()
+        .expect("failed to build bitmule-ffi tokio runtime")
+});
+
+/// Wrap an async body in a tokio spawn so it runs on TOKIO_RT and its
+/// inner tokio primitives are all in a valid reactor context.
+async fn run_on_tokio<F, T>(fut: F) -> Result<T, BitmuleError>
+where
+    F: std::future::Future<Output = Result<T, BitmuleError>> + Send + 'static,
+    T: Send + 'static,
+{
+    match TOKIO_RT.spawn(fut).await {
+        Ok(inner) => inner,
+        Err(join_err) => Err(BitmuleError::Unknown {
+            reason: format!("tokio join: {join_err}"),
+        }),
+    }
+}
 
 pub fn ffi_version() -> String {
     // Semver of the FFI SURFACE (not the crate as a whole). Bump on
@@ -129,6 +165,17 @@ pub async fn recv_file(
     out_dir: String,
     on_progress: Arc<dyn ProgressListener>,
 ) -> Result<RecvOutcome, BitmuleError> {
+    // Enter the FFI tokio runtime for the whole body so every tokio
+    // primitive downstream (native_recv, container::unpack_zip_store,
+    // str0m internals) has a live reactor.
+    run_on_tokio(recv_file_inner(url, out_dir, on_progress)).await
+}
+
+async fn recv_file_inner(
+    url: String,
+    out_dir: String,
+    on_progress: Arc<dyn ProgressListener>,
+) -> Result<RecvOutcome, BitmuleError> {
     let parsed = parse_share_url(url)?;
     let link = ShareLink::from_b64_url(&parsed.fragment)
         .map_err(|e| BitmuleError::InvalidFragment { reason: format!("{e:#}") })?;
@@ -207,6 +254,15 @@ fn dir_size_recursive(dir: &Path) -> u64 {
 }
 
 pub async fn send_file(
+    server: String,
+    file_paths: Vec<String>,
+    multi: bool,
+    on_url: Arc<dyn UrlListener>,
+) -> Result<SendOutcome, BitmuleError> {
+    run_on_tokio(send_file_inner(server, file_paths, multi, on_url)).await
+}
+
+async fn send_file_inner(
     server: String,
     file_paths: Vec<String>,
     multi: bool,
