@@ -37,8 +37,12 @@ struct Args {
 
     /// Hard upper bound on total ciphertext bytes stored across all sessions.
     /// When exceeded, the maintenance loop evicts oldest chunks first until
-    /// storage drops back at or below this value. Default 500 GiB.
-    #[arg(long, default_value_t = 500u64 * 1024 * 1024 * 1024)]
+    /// storage drops back at or below this value.
+    ///
+    /// Accepts SI (kB / MB / GB / TB, base 1000) and IEC (KiB / MiB / GiB /
+    /// TiB, base 1024) byte suffixes; plain digits = raw bytes. Case-
+    /// insensitive on the leading letter. Default 500GiB.
+    #[arg(long, default_value = "500GiB", value_parser = parse_byte_size)]
     max_disk_bytes: u64,
 
     /// If set, serve static files from this directory on any GET that
@@ -104,6 +108,94 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Parse a byte-size string with optional SI or IEC suffix. Examples:
+///   "10"      -> 10
+///   "10kB"    -> 10_000                (SI: 1000-power)
+///   "10 KiB"  -> 10 * 1024              (IEC: 1024-power)
+///   "500GiB"  -> 500 * 1024^3
+///   "2.5MB"   -> 2_500_000              (decimal fractions on SI multipliers)
+/// Case-insensitive on the leading letter. Whitespace between number
+/// and suffix is optional. Missing suffix = raw bytes.
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() { return Err("empty byte size".to_string()); }
+    // Split into leading numeric part + trailing suffix.
+    let split = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
+    let (num_str, suffix) = s.split_at(split);
+    let num_str = num_str.trim();
+    let suffix = suffix.trim().to_ascii_lowercase();
+    let value: f64 = num_str
+        .parse()
+        .map_err(|e| format!("invalid number in {s:?}: {e}"))?;
+    if value < 0.0 || !value.is_finite() {
+        return Err(format!("byte size must be a finite non-negative number, got {value}"));
+    }
+    // IEC (1024-power) suffixes first — "kib"/"mib"/"gib"/"tib".
+    // SI (1000-power) — "kb"/"mb"/"gb"/"tb". Bare "k"/"m"/"g"/"t"
+    // and "b" also accepted; bare letter = SI to match `--help` output
+    // in most CLIs (`dd bs=1M` is SI-decimal in coreutils).
+    let mul: f64 = match suffix.as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1_000.0,
+        "m" | "mb" => 1_000_000.0,
+        "g" | "gb" => 1_000_000_000.0,
+        "t" | "tb" => 1_000_000_000_000.0,
+        "kib" => 1024.0,
+        "mib" => (1024u64 * 1024) as f64,
+        "gib" => (1024u64 * 1024 * 1024) as f64,
+        "tib" => (1024u64 * 1024 * 1024 * 1024) as f64,
+        other => return Err(format!("unknown byte-size suffix {other:?}")),
+    };
+    let bytes = value * mul;
+    if bytes > u64::MAX as f64 {
+        return Err(format!("byte size {s:?} overflows u64"));
+    }
+    Ok(bytes as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_size;
+
+    #[test]
+    fn plain_bytes() {
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+        assert_eq!(parse_byte_size("42").unwrap(), 42);
+        assert_eq!(parse_byte_size("42B").unwrap(), 42);
+    }
+
+    #[test]
+    fn si_suffixes_are_1000_power() {
+        assert_eq!(parse_byte_size("10kB").unwrap(), 10_000);
+        assert_eq!(parse_byte_size("10 kB").unwrap(), 10_000);
+        assert_eq!(parse_byte_size("10MB").unwrap(), 10_000_000);
+        assert_eq!(parse_byte_size("10 GB").unwrap(), 10_000_000_000);
+        assert_eq!(parse_byte_size("1TB").unwrap(), 1_000_000_000_000);
+        assert_eq!(parse_byte_size("2.5MB").unwrap(), 2_500_000);
+    }
+
+    #[test]
+    fn iec_suffixes_are_1024_power() {
+        assert_eq!(parse_byte_size("10KiB").unwrap(), 10 * 1024);
+        assert_eq!(parse_byte_size("10 MiB").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_byte_size("500GiB").unwrap(), 500u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn case_insensitive_suffix() {
+        assert_eq!(parse_byte_size("10gb").unwrap(), 10_000_000_000);
+        assert_eq!(parse_byte_size("10GB").unwrap(), 10_000_000_000);
+        assert_eq!(parse_byte_size("10gib").unwrap(), 10u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn empty_and_bad_suffix_error() {
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("10QQ").is_err());
+        assert!(parse_byte_size("-5MB").is_err());
+    }
 }
 
 async fn maintenance_loop(
