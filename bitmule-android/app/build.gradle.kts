@@ -63,8 +63,11 @@ android {
 }
 
 dependencies {
-    // Compose BOM keeps everything version-aligned.
-    val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+    // Compose BOM keeps everything version-aligned. Bumped to 2025.05.01
+    // for 16 KB page-size support in transitive native libs
+    // (androidx.graphics.path etc.); the 2024.10 BOM still pulled
+    // older transitives that failed Google Play's 16 KB check.
+    val composeBom = platform("androidx.compose:compose-bom:2025.05.01")
     implementation(composeBom)
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
@@ -75,7 +78,10 @@ dependencies {
 
     // UniFFI's Kotlin runtime. Version must match the uniffi Rust
     // crate version in bitmule-mobile-ffi/Cargo.toml (currently 0.28).
-    implementation("net.java.dev.jna:jna:5.14.0@aar")
+    // JNA 5.14 shipped libjnidispatch.so without 16 KB alignment.
+    // 5.15+ builds each ABI with `-Wl,-z,max-page-size=16384` so the
+    // Play Store 16 KB check passes.
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
