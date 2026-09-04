@@ -76,21 +76,31 @@ function parseSessionFragment(rawHash) {
   if (isHex64(h)) {
     return { kind: "hex", sessionHex: h, shareKey: null, signature: null };
   }
-  // Send-initiated ShareLink shape: 86 base64url chars decoding to 64 bytes
-  // = 32-byte share_key || 32-byte signature. Require the wasm module
-  // to parse — mirrors bitmule::ShareLink::from_b64_url on the native side.
-  if (/^[A-Za-z0-9_-]{86}$/.test(h) && window.bitmule && window.bitmule.ShareLink) {
+  // Send-initiated ShareLink shape: base64url chars decoding to 64 bytes
+  // = 32-byte share_key || 32-byte signature. 86 chars unpadded, 88
+  // with padding — accept either shape and let wasm's from_b64_url do
+  // the length check. Non-b64url chars fall through as "unrecognised".
+  if (/^[A-Za-z0-9_\-=]{80,100}$/.test(h)) {
+    if (!window.bitmule || !window.bitmule.ShareLink) {
+      // Wasm not loaded yet — return a "pending" marker so the caller
+      // can decide whether to defer or fall through. The post-wasm
+      // applyRoute re-run will pick this up on the next tick.
+      console.info("parseSessionFragment: b64url-shaped hash but wasm not loaded yet — deferring");
+      return { kind: "sharelink-pending", sessionHex: null, shareKey: null, signature: null };
+    }
     try {
       const link = window.bitmule.ShareLink.fromB64Url(h);
       const signature = link.signature;
       const shareKey = link.takeShareKey();
       const sessionHex = shareKey.sessionIdHex();
+      console.info("parseSessionFragment: ShareLink parsed, session", sessionHex);
       return { kind: "sharelink", sessionHex, shareKey, signature };
     } catch (e) {
-      console.warn("parseSessionFragment: ShareLink parse failed", e);
+      console.warn("parseSessionFragment: ShareLink parse failed:", e, "fragment:", h);
       return null;
     }
   }
+  console.warn("parseSessionFragment: hash didn't match either shape:", h);
   return null;
 }
 
@@ -1615,6 +1625,13 @@ function applyRoute() {
       typeof mod.version === "function" ? mod.version() : "loaded";
     setStatus(els.wasmStatus, "ok", `v${version}`);
     window.bitmule = mod;
+    // Re-run routing now that ShareLink parsing is available — if the
+    // page loaded with a modern (base64url) hash before wasm was ready,
+    // `applyRoute()` treated it as no session and rendered the landing.
+    // With `window.bitmule` set, `parseSessionFragment` can now decode
+    // the ShareLink; re-apply so we land in receive mode.
+    try { applyRoute(); }
+    catch (e) { console.warn("post-wasm applyRoute:", e); }
   } catch (err) {
     setStatus(els.wasmStatus, "err", "not built");
     console.info("bitmule-client-wasm not loaded:", err?.message || err);
