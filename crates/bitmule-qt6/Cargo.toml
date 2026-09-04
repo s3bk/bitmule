@@ -14,3 +14,6 @@ qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+open = "5"

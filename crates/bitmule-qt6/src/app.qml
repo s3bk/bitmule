@@ -5,12 +5,13 @@ import Uploader 1.0
 
 Window {
     visible: true
-    width: 400
-    height: 500
+    width: 480
+    height: 720
     title: "File Uploader (Qt6)"
 
     UploaderApi {
         id: api
+        Component.onCompleted: api.init_from_qml()
     }
 
     ColumnLayout {
@@ -109,6 +110,89 @@ Window {
                 Layout.preferredHeight: 240
                 fillMode: Image.PreserveAspectFit
                 smooth: false
+            }
+        }
+
+        // F00: options panel. Persisted to <config>/bitmule/bitmule-
+        // qt6-options.json via api.save_options() on every change.
+        GroupBox {
+            Layout.fillWidth: true
+            title: "Options"
+            ColumnLayout {
+                anchors.fill: parent
+                CheckBox {
+                    text: "multi-send by default (keep URL live for more receivers)"
+                    checked: api.opt_multi_send
+                    onCheckedChanged: {
+                        if (api.opt_multi_send !== checked) {
+                            api.opt_multi_send = checked;
+                            api.save_options();
+                        }
+                    }
+                }
+                CheckBox {
+                    text: "request UPnP port mapping"
+                    checked: api.opt_upnp
+                    onCheckedChanged: {
+                        if (api.opt_upnp !== checked) {
+                            api.opt_upnp = checked;
+                            api.save_options();
+                        }
+                    }
+                }
+                CheckBox {
+                    text: "watch clipboard for bitmule links"
+                    checked: api.opt_clipboard_watch
+                    onCheckedChanged: {
+                        if (api.opt_clipboard_watch !== checked) {
+                            api.opt_clipboard_watch = checked;
+                            api.save_options();
+                        }
+                    }
+                }
+                CheckBox {
+                    text: "automatically start downloads from clipboard links"
+                    checked: api.opt_auto_download
+                    onCheckedChanged: {
+                        if (api.opt_auto_download !== checked) {
+                            api.opt_auto_download = checked;
+                            api.save_options();
+                        }
+                    }
+                }
+            }
+        }
+
+        // F02: fetch queue — bitmule links detected on the clipboard
+        // that aren't own uploads. Row per URL with an "Open" button
+        // that hands to the system browser (in-app receiver panel is
+        // a follow-up).
+        GroupBox {
+            Layout.fillWidth: true
+            title: "Detected links"
+            visible: api.fetch_queue.length > 0
+            ColumnLayout {
+                anchors.fill: parent
+                Repeater {
+                    model: api.fetch_queue
+                    delegate: RowLayout {
+                        Layout.fillWidth: true
+                        Label {
+                            Layout.fillWidth: true
+                            text: modelData
+                            elide: Label.ElideMiddle
+                            font.pixelSize: 12
+                        }
+                        Button {
+                            text: "Open"
+                            onClicked: api.open_fetch_url(modelData)
+                        }
+                        Button {
+                            text: "×"
+                            onClicked: api.drop_fetch_url(modelData)
+                        }
+                    }
+                }
             }
         }
     }
