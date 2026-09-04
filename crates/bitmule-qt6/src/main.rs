@@ -1,7 +1,7 @@
 use c_str_macro::c_str;
 use qmetaobject::*;
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -356,6 +356,13 @@ impl UploaderApi {
         qmetaobject::future::execute_async(async move {
             let out_dir = recv_out_dir();
             let _ = std::fs::create_dir_all(&out_dir);
+            // Stage the transfer inside a per-download subdir so a partial
+            // file from a mid-stream failure (e.g. AEAD decrypt error) is
+            // never visible in the user's Downloads folder. On success we
+            // rename the finished file into out_dir; on any error we
+            // clean up staging.
+            let stage_dir = out_dir.join(format!(".staging-{}", short_stage_tag(&url)));
+            let _ = std::fs::create_dir_all(&stage_dir);
             let (server, fragment) = match split_share_url(&url) {
                 Some(v) => v,
                 None => {
@@ -400,7 +407,7 @@ impl UploaderApi {
                 &server,
                 share_key,
                 expected_sig,
-                &out_dir,
+                &stage_dir,
                 bitmule_client_native::TransportMode::Webrtc,
                 move |received, total, name| {
                     let pct = if total > 0 {
@@ -416,16 +423,42 @@ impl UploaderApi {
                 },
             ).await;
             match result {
-                Ok(path) => {
-                    let name_s = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    update_recv_state(&state, &url, |s| {
-                        s.status = "complete".into();
-                        s.progress = 1.0;
-                        s.name = name_s;
-                        s.path = Some(path.to_string_lossy().into_owned());
-                    });
+                Ok(staged_path) => {
+                    // recv_file returned Ok, which means AEAD verify
+                    // already passed. Promote the file out of staging
+                    // into out_dir. Only after the rename lands is the
+                    // file visible in the user's Downloads folder.
+                    let name_s = staged_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let final_path = unique_dest_path(&out_dir, &name_s);
+                    match std::fs::rename(&staged_path, &final_path) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_dir_all(&stage_dir);
+                            update_recv_state(&state, &url, |s| {
+                                s.status = "complete".into();
+                                s.progress = 1.0;
+                                s.name = final_path.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                s.path = Some(final_path.to_string_lossy().into_owned());
+                            });
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&stage_dir);
+                            update_recv_state(&state, &url, |s| {
+                                s.status = "error".into();
+                                s.error = Some(format!("promote staged file: {e:#}"));
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
+                    // Verify already deletes on mismatch, but a
+                    // mid-stream AEAD failure leaves partial bytes in
+                    // stage_dir. Clean the whole staging tree either way.
+                    let _ = std::fs::remove_dir_all(&stage_dir);
                     update_recv_state(&state, &url, |s| {
                         s.status = "error".into();
                         s.error = Some(format!("{e:#}"));
@@ -505,6 +538,30 @@ struct RecvTransferState {
 
 /// Where recv_file writes downloads. Follows the same
 /// XDG_DOWNLOAD_DIR / $HOME/Downloads convention as most Linux apps.
+fn short_stage_tag(url: &str) -> String {
+    // 8 hex chars off a stable hash of the URL — enough to keep
+    // concurrent staging dirs from colliding without leaking the
+    // full URL onto disk paths.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    format!("{:08x}", (h.finish() & 0xffff_ffff) as u32)
+}
+
+fn unique_dest_path(dir: &Path, name: &str) -> PathBuf {
+    let cand = dir.join(name);
+    if !cand.exists() { return cand; }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    for n in 1u32..1000 {
+        let cand = dir.join(format!("{stem} ({n}){ext}"));
+        if !cand.exists() { return cand; }
+    }
+    dir.join(name)
+}
+
 fn recv_out_dir() -> PathBuf {
     if let Ok(x) = std::env::var("XDG_DOWNLOAD_DIR") {
         return PathBuf::from(x).join("bitmule");

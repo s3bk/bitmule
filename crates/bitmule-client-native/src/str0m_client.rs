@@ -811,12 +811,24 @@ async fn drain_rtc_capture_data(
             }
             Output::Event(Event::ChannelData(ChannelData { id, binary, data })) if id == expected_channel => {
                 if binary {
+                    // Defensive: a zero-length binary event shouldn't
+                    // happen (sender never dc.sends an empty buffer) but
+                    // if str0m ever emits one on state transition, do
+                    // NOT consume a chunk index — decrypt(empty) always
+                    // fails and would poison the whole stream.
+                    if data.is_empty() {
+                        warn!("dropped 0-byte binary frame at recv_idx={}", *recv_idx);
+                        continue;
+                    }
                     if let Some(f) = file_opt.as_mut() {
                         // Decrypt this chunk with idx-derived nonce. SCTP is
                         // ordered so incrementing recv_idx per binary frame
                         // matches the sender's send-side idx exactly.
                         let plain = bulk_key.decrypt_chunk(*recv_idx, &data)
-                            .with_context(|| format!("decrypt_chunk idx={}", *recv_idx))?;
+                            .with_context(|| format!(
+                                "decrypt_chunk idx={} data_len={}",
+                                *recv_idx, data.len(),
+                            ))?;
                         f.write_all(&plain).await.context("write chunk")?;
                         *received += plain.len() as u64;
                         *recv_idx += 1;
