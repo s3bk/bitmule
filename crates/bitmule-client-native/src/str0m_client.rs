@@ -25,7 +25,7 @@ use str0m::{
     net::{Protocol, Receive},
     Candidate, Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, sync::broadcast};
+use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, net::UdpSocket, sync::broadcast};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
@@ -1700,7 +1700,7 @@ fn constant_time_eq_bytes<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
 //   - Receiver-side stays untouched.
 
 use crate::multipeer::{
-    ws_enqueue_targeted, PeerHandle, PeerRegistration, PeerSession,
+    ws_enqueue_targeted, DcControlFrame, PeerHandle, PeerRegistration, PeerSession,
     SenderOrchestrator, SenderShared, WsRouterHandle,
 };
 use bitmule_core::ReceiverId;
@@ -1976,18 +1976,404 @@ async fn peer_session_run(
     let meta_key = meta_key.ok_or_else(|| anyhow!("peer {rid_hex} DC opened before KEX completed"))?;
     session.wrap_key = Some(wrap_key);
     session.meta_key = Some(meta_key);
-    info!(peer = %rid_hex, "DC open — parking on shutdown_rx until M2b-6 block-serve lands");
+    info!(peer = %rid_hex, "DC open — entering block-serve loop (M2b-6)");
 
-    // Sanity: keep session's covered map alive on the task's stack so
-    // parent-side Arc reads see the empty set during progress polls
-    // before block-serve populates it.
-    let _keep_session = session;
+    // M2b-6: block-serve loop.
+    //
+    // 1. Send meta_enc as the first text frame on DC (AEAD-wrap the file
+    //    meta under the per-peer meta_key, session_id_bytes as AAD).
+    // 2. Set flow-control threshold once.
+    // 3. Loop:
+    //     - Drain any queued incoming DC text frames (RequestRanges /
+    //       RecvDone), serve chunks or ack + exit.
+    //     - Select on {shutdown, pool_rx (drain + capture DC data),
+    //       inbox_rx (Ice trickle), timeout}.
+    //
+    // Complete-mode cross-peer shutdown is NOT wired here — M2b-8 adds it
+    // once cmd_send + --multi land. Complete mode today just serves this
+    // peer through recv_done + DoneAck like Multi does.
 
-    // M2b-5 end-state: park on shutdown. M2b-6 replaces this with the
-    // request_ranges → chunk-serve loop.
-    let _ = shutdown_rx.changed().await;
-    info!(peer = %rid_hex, "peer task exiting");
+    let meta_key_ref = session.meta_key.as_ref().expect("meta_key set above");
+    let meta_enc_bytes = build_meta_enc_payload(
+        &session.shared.session_id_bytes,
+        meta_key_ref,
+        &session.shared.file_path,
+        session.shared.file_size,
+        session.shared.total_chunks,
+    )?;
+
+    channel_set_low_threshold(&mut session.rtc, session.channel_id, BUFFERED_LOW_THRESHOLD)?;
+
+    let mut dc_in: Vec<(bool, Vec<u8>)> = Vec::new();
+    channel_write_all_peer(
+        &mut session.rtc,
+        &pool,
+        session.channel_id,
+        false,
+        &meta_enc_bytes,
+        &mut pool_rx,
+        &mut dc_in,
+    )
+    .await?;
+    info!(peer = %rid_hex, "meta_enc sent");
+
+    let mut file = tokio::fs::File::open(&session.shared.file_path)
+        .await
+        .with_context(|| format!("open {}", session.shared.file_path.display()))?;
+
+    let mut next_timeout =
+        drain_rtc_capture_dc_frames(&mut session.rtc, &pool, session.channel_id, &mut dc_in).await?;
+
+    let mut recv_done = false;
+    while !recv_done {
+        if *shutdown_rx.borrow() {
+            info!(peer = %rid_hex, "shutdown mid-serve — exiting peer task");
+            return Ok(());
+        }
+
+        // Process queued DC frames first (RequestRanges / RecvDone).
+        // `dc_in` accumulates from the last drain; drain here so serve calls
+        // during processing don't concurrently push into a Vec we're iterating.
+        let batch: Vec<(bool, Vec<u8>)> = dc_in.drain(..).collect();
+        for (binary, data) in batch {
+            if binary {
+                warn!(peer = %rid_hex, "receiver sent binary DC data ({} bytes) — protocol violation, ignoring", data.len());
+                continue;
+            }
+            match serde_json::from_slice::<DcControlFrame>(&data) {
+                Ok(DcControlFrame::RequestRanges { ranges }) => {
+                    for r in ranges {
+                        if r.end <= r.start {
+                            warn!(peer = %rid_hex, "empty/inverted range {}..{} — skipping", r.start, r.end);
+                            continue;
+                        }
+                        let total_u32: u32 = session.shared.total_chunks.min(u32::MAX as u64) as u32;
+                        if r.start > total_u32 || r.end > total_u32 {
+                            warn!(peer = %rid_hex, "range {}..{} out of bounds (total_chunks {}) — clamping", r.start, r.end, total_u32);
+                        }
+                        let start = r.start.min(total_u32);
+                        let end = r.end.min(total_u32);
+                        serve_range(
+                            &mut file,
+                            &session.shared,
+                            start..end,
+                            &session.covered,
+                            &mut session.rtc,
+                            &pool,
+                            session.channel_id,
+                            &mut pool_rx,
+                            &mut dc_in,
+                        )
+                        .await?;
+                    }
+                    next_timeout = drain_rtc_capture_dc_frames(
+                        &mut session.rtc, &pool, session.channel_id, &mut dc_in,
+                    )
+                    .await?;
+                }
+                Ok(DcControlFrame::RecvDone) => {
+                    // Peer has assembled the whole file locally. Ack + exit.
+                    let ack = serde_json::to_vec(&DcControlFrame::DoneAck)
+                        .map_err(|e| anyhow!("encode DoneAck: {e}"))?;
+                    channel_write_all_peer(
+                        &mut session.rtc,
+                        &pool,
+                        session.channel_id,
+                        false,
+                        &ack,
+                        &mut pool_rx,
+                        &mut dc_in,
+                    )
+                    .await?;
+                    drain_until_buffer_empty_peer(
+                        &mut session.rtc,
+                        &pool,
+                        session.channel_id,
+                        &mut pool_rx,
+                        &mut dc_in,
+                    )
+                    .await?;
+                    info!(peer = %rid_hex, "recv_done + DoneAck exchanged — exiting peer task");
+                    recv_done = true;
+                    break;
+                }
+                Ok(DcControlFrame::DoneAck) => {
+                    warn!(peer = %rid_hex, "receiver sent DoneAck — wrong direction, ignoring");
+                }
+                Err(e) => {
+                    warn!(peer = %rid_hex, "malformed DC control frame ({} bytes): {e}", data.len());
+                }
+            }
+        }
+        if recv_done { break; }
+
+        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!(peer = %rid_hex, "shutdown signalled — exiting peer task");
+                    return Ok(());
+                }
+            }
+            maybe_frame = inbox_rx.recv() => {
+                // Post-DC-open signaling: apply late ICE trickle, ignore rest.
+                match maybe_frame {
+                    Some(SignalFrame::Ice { candidate: Some(c) }) => {
+                        if let Some(remote) = parse_ice_candidate(&c).await {
+                            session.rtc.add_remote_candidate(remote);
+                            next_timeout = drain_rtc_capture_dc_frames(
+                                &mut session.rtc, &pool, session.channel_id, &mut dc_in,
+                            )
+                            .await?;
+                        }
+                    }
+                    Some(_) => { /* stale signaling — ignore */ }
+                    None => {
+                        warn!(peer = %rid_hex, "inbox closed mid-serve — exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            maybe_pr = pool_rx.recv() => {
+                use broadcast::error::RecvError;
+                match maybe_pr {
+                    Ok(pr) => {
+                        let mut rtcs: [&mut Rtc; 1] = [&mut session.rtc];
+                        if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
+                            next_timeout = drain_rtc_capture_dc_frames(
+                                &mut session.rtc, &pool, session.channel_id, &mut dc_in,
+                            )
+                            .await?;
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(peer = %rid_hex, "pool rx lagged {n} — str0m re-tx will handle");
+                    }
+                    Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
+                }
+            }
+            _ = tokio::time::sleep(dur) => {
+                session.rtc.handle_input(Input::Timeout(Instant::now()))
+                    .map_err(|e| anyhow!("peer {rid_hex} handle_input timeout: {e}"))?;
+                next_timeout = drain_rtc_capture_dc_frames(
+                    &mut session.rtc, &pool, session.channel_id, &mut dc_in,
+                )
+                .await?;
+            }
+        }
+    }
+
+    info!(peer = %rid_hex, "peer task exit clean");
     Ok(())
+}
+
+/// Build the meta_enc DC payload — AEAD-wrap the file MetaFrame under
+/// this peer's meta_key with session_id_bytes as AAD. Result is the
+/// text bytes to write on the DC as the first frame.
+///
+/// M2b-6: mirrors the meta_enc build in `send_file_over_dc` so the
+/// single-peer receiver code can decrypt without a wire change.
+fn build_meta_enc_payload(
+    session_id_bytes: &[u8; 32],
+    meta_key: &MetaKey,
+    file_path: &Path,
+    file_size: u64,
+    total_chunks: u64,
+) -> Result<Vec<u8>> {
+    let name = file_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".to_string());
+    let meta_plain = serde_json::json!({
+        "type": "meta",
+        "name": name,
+        "size": file_size,
+        "chunkBytes": CHUNK_BYTES,
+        "totalChunks": total_chunks,
+    })
+    .to_string();
+    let (nonce, ct) = meta_key.encrypt_meta(session_id_bytes, meta_plain.as_bytes())?;
+    let frame = serde_json::json!({
+        "type": "meta_enc",
+        "nonce_hex": hex_encode(&nonce),
+        "ct_hex": hex_encode(&ct),
+    })
+    .to_string();
+    Ok(frame.into_bytes())
+}
+
+/// Serve one contiguous chunk range: seek + one big read (Seb's
+/// optimization from docs/multipeer.md §"Request-ranges wire") →
+/// split into `CHUNK_BYTES` pieces → AEAD-encrypt each with
+/// `bulk_key.encrypt_chunk(idx, plaintext)` → write binary on DC.
+/// Records each idx in `covered` after successful DC write.
+///
+/// Range is half-open `[start, end)`; caller has already validated
+/// bounds vs `total_chunks`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_range(
+    file: &mut tokio::fs::File,
+    shared: &SenderShared,
+    range: std::ops::Range<u32>,
+    covered: &Arc<Mutex<HashSet<u64>>>,
+    rtc: &mut Rtc,
+    pool: &SocketPool,
+    channel_id: ChannelId,
+    pool_rx: &mut broadcast::Receiver<PoolRecv>,
+    dc_in: &mut Vec<(bool, Vec<u8>)>,
+) -> Result<()> {
+    let n_chunks = (range.end - range.start) as u64;
+    let start_offset = range.start as u64 * CHUNK_BYTES as u64;
+    let want_bytes = (n_chunks * CHUNK_BYTES as u64).min(shared.file_size.saturating_sub(start_offset));
+    if want_bytes == 0 {
+        return Ok(());
+    }
+    file.seek(std::io::SeekFrom::Start(start_offset))
+        .await
+        .with_context(|| format!("seek to chunk {} (offset {})", range.start, start_offset))?;
+    let mut buf = vec![0u8; want_bytes as usize];
+    file.read_exact(&mut buf)
+        .await
+        .with_context(|| format!("read {} bytes from chunk {}", want_bytes, range.start))?;
+
+    let mut written = 0usize;
+    let mut idx = range.start as u64;
+    while written < buf.len() {
+        let end = (written + CHUNK_BYTES).min(buf.len());
+        let ct = shared.bulk_key.encrypt_chunk(idx, &buf[written..end])?;
+        channel_write_all_peer(rtc, pool, channel_id, true, &ct, pool_rx, dc_in).await?;
+        {
+            let mut c = covered.lock().await;
+            c.insert(idx);
+        }
+        written = end;
+        idx += 1;
+    }
+    Ok(())
+}
+
+/// Peer-task equivalent of `channel_write_all`: writes `buf` to the DC,
+/// awaiting SCTP backpressure by pumping the pool_rx + timeout mini loop
+/// until str0m fires `ChannelBufferedAmountLow` and the write is accepted.
+/// Any DC data events observed during the backpressure pump land in
+/// `dc_in` so the outer block-serve loop processes them on next iteration.
+async fn channel_write_all_peer(
+    rtc: &mut Rtc,
+    pool: &SocketPool,
+    channel_id: ChannelId,
+    binary: bool,
+    buf: &[u8],
+    pool_rx: &mut broadcast::Receiver<PoolRecv>,
+    dc_in: &mut Vec<(bool, Vec<u8>)>,
+) -> Result<()> {
+    let mut next_timeout = drain_rtc_capture_dc_frames(rtc, pool, channel_id, dc_in).await?;
+    loop {
+        let accepted = {
+            let mut ch = rtc
+                .channel(channel_id)
+                .ok_or_else(|| anyhow!("channel {:?} gone", channel_id))?;
+            ch.write(binary, buf).map_err(|e| anyhow!("channel write: {e}"))?
+        };
+        if accepted {
+            next_timeout = drain_rtc_capture_dc_frames(rtc, pool, channel_id, dc_in).await?;
+            let _ = next_timeout;
+            return Ok(());
+        }
+        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+        tokio::select! {
+            maybe_pr = pool_rx.recv() => {
+                use broadcast::error::RecvError;
+                match maybe_pr {
+                    Ok(pr) => {
+                        let mut rtcs: [&mut Rtc; 1] = [rtc];
+                        if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
+                            next_timeout = drain_rtc_capture_dc_frames(rtcs[0], pool, channel_id, dc_in).await?;
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!("channel_write_all_peer pool lagged {n}");
+                    }
+                    Err(RecvError::Closed) => bail!("pool rx closed mid-write"),
+                }
+            }
+            _ = tokio::time::sleep(dur) => {
+                rtc.handle_input(Input::Timeout(Instant::now()))
+                    .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
+                next_timeout = drain_rtc_capture_dc_frames(rtc, pool, channel_id, dc_in).await?;
+            }
+        }
+    }
+}
+
+/// Drain str0m outputs, capturing ChannelData events for `expected_channel`
+/// into `dc_in` as `(binary, bytes)` pairs. Other events go through
+/// `handle_generic_event` (ICE state, transmit, etc). Returns the next
+/// Timeout instant per str0m's drain-to-completion contract.
+async fn drain_rtc_capture_dc_frames(
+    rtc: &mut Rtc,
+    pool: &SocketPool,
+    expected_channel: ChannelId,
+    dc_in: &mut Vec<(bool, Vec<u8>)>,
+) -> Result<Instant> {
+    loop {
+        match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
+            Output::Timeout(t) => return Ok(t),
+            Output::Transmit(t) => {
+                pool.send_from(t.source, t.destination, &t.contents)
+                    .await
+                    .with_context(|| format!("send_to {}", t.destination))?;
+            }
+            Output::Event(Event::ChannelData(ChannelData { id, binary, data })) if id == expected_channel => {
+                dc_in.push((binary, data));
+            }
+            Output::Event(e) => handle_generic_event(&e)?,
+        }
+    }
+}
+
+/// Peer-task equivalent of `drain_until_buffer_empty` — waits for SCTP to
+/// flush any queued writes before returning. Called after DoneAck so the
+/// task can exit without truncating the ack on the wire.
+async fn drain_until_buffer_empty_peer(
+    rtc: &mut Rtc,
+    pool: &SocketPool,
+    channel_id: ChannelId,
+    pool_rx: &mut broadcast::Receiver<PoolRecv>,
+    dc_in: &mut Vec<(bool, Vec<u8>)>,
+) -> Result<()> {
+    let mut next_timeout = drain_rtc_capture_dc_frames(rtc, pool, channel_id, dc_in).await?;
+    loop {
+        let buffered = {
+            let mut ch = rtc
+                .channel(channel_id)
+                .ok_or_else(|| anyhow!("channel {:?} gone", channel_id))?;
+            ch.buffered_amount()
+        };
+        if buffered == 0 {
+            return Ok(());
+        }
+        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+        tokio::select! {
+            maybe_pr = pool_rx.recv() => {
+                use broadcast::error::RecvError;
+                match maybe_pr {
+                    Ok(pr) => {
+                        let mut rtcs: [&mut Rtc; 1] = [rtc];
+                        if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
+                            next_timeout = drain_rtc_capture_dc_frames(rtcs[0], pool, channel_id, dc_in).await?;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => bail!("pool rx closed during drain"),
+                }
+            }
+            _ = tokio::time::sleep(dur) => {
+                rtc.handle_input(Input::Timeout(Instant::now()))
+                    .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
+                next_timeout = drain_rtc_capture_dc_frames(rtc, pool, channel_id, dc_in).await?;
+            }
+        }
+    }
 }
 
 /// Long-lived sender-side entry point for the multipeer path. Opens WS,
@@ -1996,16 +2382,32 @@ async fn peer_session_run(
 /// serving tasks. Returns a `SenderOrchestrator` handle whose fields
 /// hold the pool + router + writer + peers map alive for the run.
 ///
-/// M2b-5 wires the orchestrator + peer-spawn primitives; no caller yet.
-/// cmd_send stays on send_connect until M2b-8.
+/// M2b-6: `file_path` + `mode` land in SenderShared so per-peer tasks can
+/// send `meta_enc` on DC-open + serve chunk ranges. cmd_send still stays
+/// on send_connect — the `--multi` wire-up + Complete-mode early-exit
+/// predicate ride on M2b-8. Complete mode here does NOT yet shut down
+/// sibling peers when one reaches full coverage; only the recv_done
+/// exchange on this peer exits its own task.
 #[allow(dead_code)]
 pub async fn send_serve(
     server_url: &str,
     share_key: ShareKey,
     pre_generated_bulk_key: BulkKey,
+    file_path: PathBuf,
+    mode: crate::multipeer::ServeMode,
 ) -> Result<SenderOrchestrator> {
     let session_hex = share_key.session_id_hex();
     info!(session = %session_hex, "opening multipeer sender WS + shared pool");
+
+    // Stat the file once at start — every peer task reads size + total_chunks
+    // from SenderShared without a re-stat.
+    let stat = tokio::fs::metadata(&file_path).await
+        .with_context(|| format!("stat {}", file_path.display()))?;
+    if !stat.is_file() {
+        bail!("{} is not a regular file", file_path.display());
+    }
+    let file_size = stat.len();
+    let total_chunks = if file_size == 0 { 0 } else { (file_size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
 
     let ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
     let pool = Arc::new(build_socket_pool().await?);
@@ -2020,6 +2422,10 @@ pub async fn send_serve(
         bulk_key: pre_generated_bulk_key,
         session_id_bytes,
         wire_version: crate::WIRE_VERSION,
+        file_path,
+        file_size,
+        total_chunks,
+        mode,
     });
 
     // Sender-side Hello — no to_receiver_id (server broadcasts).

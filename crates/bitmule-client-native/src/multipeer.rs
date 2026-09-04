@@ -288,12 +288,20 @@ pub(crate) fn ws_enqueue_targeted(
 /// per file. `share_key` stays live so per-peer KEX MAC verification
 /// can call `share_key.mac_ephemeral_pub`. `session_id_bytes` is derived
 /// once from the session hex and reused for HKDF salting.
+///
+/// M2b-6: file identity (path/size/total_chunks) + serve mode so per-peer
+/// tasks can send the meta_enc frame + serve chunk ranges + eventually
+/// exit under --complete when a peer covers 0..total_chunks.
 #[allow(dead_code)]
 pub struct SenderShared {
     pub share_key: ShareKey,
     pub bulk_key: BulkKey,
     pub session_id_bytes: [u8; 32],
     pub wire_version: u32,
+    pub file_path: PathBuf,
+    pub file_size: u64,
+    pub total_chunks: u64,
+    pub mode: ServeMode,
 }
 
 /// Per-peer serving state. Owned by the per-peer task's async block —
