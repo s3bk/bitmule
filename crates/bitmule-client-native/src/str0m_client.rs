@@ -383,232 +383,6 @@ async fn discover_outbound_ip() -> Result<std::net::IpAddr> {
     }
 }
 
-/// Sender entry point — active side: create data channel, produce offer,
-/// send over WS, wait for answer, run loop until ChannelOpen.
-pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_bulk_key: BulkKey) -> Result<LiveSession> {
-    let session_hex = share_key.session_id_hex();
-    let session_id = SessionId::from_hex(&session_hex)
-        .map_err(|e| anyhow!("session_id from hex: {e}"))?;
-    info!(session = %session_hex, "opening sender WS + Rtc");
-
-    let ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
-    // M2b-4: build the SocketPool once, then the sender-side Rtc against it.
-    // Structure holds today for N=1 (this Rtc) and extends to N=peers in
-    // M2b-5 with no dispatch-path changes — see dispatch_pool_recv_to_rtcs.
-    let mut pool = build_socket_pool().await?;
-    let mut rtc = build_rtc_with_pool_candidates(&pool);
-
-    // mdns-resolved candidates arrive on this channel; select! arm below
-    // drains it so ICE never blocks on a `.local` resolution.
-    let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
-
-    // M2b-3: hand the WS to a router+writer pair for the handshake. Router
-    // dispatches inbound frames (unrouted here since no peer tasks yet);
-    // writer serializes an outbox mpsc onto the sink. On DC-open we shut
-    // both tasks down + reunite the sink+stream back into a `Ws` for
-    // LiveSession so downstream file-transfer code stays unchanged.
-    let (sink, stream) = ws.split();
-    let crate::multipeer::WsWriterHandle {
-        outbox_tx,
-        task: writer_task,
-    } = crate::multipeer::spawn_ws_writer(sink);
-    let crate::multipeer::WsRouterHandle {
-        register_tx: _,
-        mut unrouted_rx,
-        shutdown_tx: router_shutdown_tx,
-        task: router_task,
-    } = crate::multipeer::spawn_ws_router(stream);
-
-    // Active side: create the data channel BEFORE offer generation so its
-    // m-line lands in the SDP.
-    let mut change = rtc.sdp_api();
-    let channel_id = change.add_channel("bitmule".into());
-    let (offer, pending) = change
-        .apply()
-        .ok_or_else(|| anyhow!("sdp_api produced no offer — nothing added"))?;
-    let mut next_timeout = drain_rtc(&mut rtc, &pool).await?;
-
-    crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::Hello {
-        role: Role::Sender.as_str().to_owned(),
-        receiver_id: None,
-        wire_version: Some(crate::WIRE_VERSION),
-    }, None)?;
-
-    // Crypto handshake — send our ephemeral immediately, wait for peer's
-    // in the loop below (concurrent with SDP exchange).
-    let local_ephemeral = Ephemeral::generate();
-    let local_pub = local_ephemeral.public_bytes();
-    let local_mac = share_key.mac_ephemeral_pub(&local_pub);
-    crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::KexPub {
-        pub_hex: hex_encode(&local_pub),
-        mac_hex: hex_encode(&local_mac),
-    }, None)?;
-    let mut ephemeral_holder = Some(local_ephemeral);
-    let mut wrap_key: Option<WrapKey> = None;
-    let mut meta_key: Option<MetaKey> = None;
-    let mut bulk_key: Option<BulkKey> = None;
-    let mut key_wrap_sent = false;
-    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
-
-    let mut peer_hello_seen = false;
-    let mut offer_holder: Option<SdpOffer> = Some(offer);
-    let mut pending_holder: Option<_> = Some(pending);
-    let mut opened = false;
-
-    while !opened {
-        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
-
-        tokio::select! {
-            maybe_frame = unrouted_rx.recv() => {
-                // FIXME(m2b-3): router-error surfacing is weaker here than the
-                // pre-M2b-3 shape. Before the split, `parse_ws_frame(maybe_msg)?`
-                // propagated parse errors mid-handshake. Now a parse-Err inside
-                // the router only shows up when we await `router_task` after
-                // shutdown, so a mid-handshake parse-fail results in `recv()`
-                // returning None → the `bail!` below fires with a generic
-                // "router terminated" message instead of the underlying parse
-                // error. Not blocking for M2b-3 (parse errors during ICE/SDP/KEX
-                // are rare) but fix when the router lives past send_connect in
-                // M2b-4 — probably a `health_rx: oneshot<Result<()>>` on the
-                // handle that select! can watch alongside `unrouted_rx`.
-                let (frame, _from) = match maybe_frame {
-                    Some(f) => f,
-                    None => bail!("ws router terminated before DC opened"),
-                };
-                match frame {
-                    SignalFrame::Ice { candidate: Some(c) } => {
-                        if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
-                            rtc.add_remote_candidate(remote);
-                            next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
-                        }
-                    }
-                    SignalFrame::PeerHello { wire_version, .. } if !peer_hello_seen => {
-                        // Refuse the session if the peer speaks a different
-                        // wire protocol version — the alternative is a
-                        // silent mid-transfer decode failure that reads as
-                        // "corrupted file." Better to bail cleanly here
-                        // with an "update your client" message.
-                        match wire_version {
-                            Some(v) if v == crate::WIRE_VERSION => { /* ok */ }
-                            Some(v) => bail!(
-                                "peer speaks wire version {v}, we speak {}. Update the older client.",
-                                crate::WIRE_VERSION
-                            ),
-                            None => bail!(
-                                "peer did not advertise a wire version — it's running a pre-v{} client. Update the peer's bitmule.",
-                                crate::WIRE_VERSION
-                            ),
-                        }
-                        peer_hello_seen = true;
-                        let offer = offer_holder.take().expect("offer set on entry");
-                        let offer_sdp = offer.to_sdp_string();
-                        info!("OFFER SDP:\n{}", offer_sdp);
-                        crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::Sdp {
-                            kind: "offer".into(),
-                            sdp: offer_sdp,
-                        }, None)?;
-                        debug!("offer sent");
-                    }
-                    SignalFrame::Sdp { kind, sdp } if kind == "answer" => {
-                        info!("ANSWER SDP:\n{}", sdp);
-                        let ans = SdpAnswer::from_sdp_string(&sdp)
-                            .map_err(|e| anyhow!("parse answer: {e}"))?;
-                        let pending_taken = pending_holder.take().expect("pending set on entry");
-                        rtc.sdp_api().accept_answer(pending_taken, ans)
-                            .map_err(|e| anyhow!("accept_answer: {e}"))?;
-                        next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
-                    }
-                    SignalFrame::KexPub { pub_hex, mac_hex } => {
-                        if wrap_key.is_some() {
-                            warn!("duplicate KexPub from peer — ignoring");
-                            continue;
-                        }
-                        let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
-                        let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
-                        let expected_mac = share_key.mac_ephemeral_pub(&peer_pub);
-                        if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
-                            bail!("KexPub MAC verify failed — peer does not know the share key");
-                        }
-                        let eph = ephemeral_holder.take()
-                            .ok_or_else(|| anyhow!("local ephemeral gone before peer KexPub arrived"))?;
-                        let s = eph.derive_shared_secret(&peer_pub)?;
-                        wrap_key = Some(s.wrap_key(&session_id_bytes));
-                        meta_key = Some(s.meta_key(&session_id_bytes));
-                        info!("KEX complete — wrap_key + meta_key derived");
-                    }
-                    _ => {}
-                }
-            }
-
-            maybe_pr = pool.recv() => {
-                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
-                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
-                // M2b-4: route through the N-Rtc dispatch helper (N=1 here).
-                // `None` = no Rtc claimed the packet; log at debug + drop,
-                // never force-feed an unowned packet into a wrong Rtc.
-                let mut rtcs: [&mut Rtc; 1] = [&mut rtc];
-                match dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)? {
-                    Some(_idx) => {
-                        next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
-                    }
-                    None => {
-                        debug!("stray packet from {} on {} — no Rtc accepted, dropped", pr.source, pr.destination);
-                    }
-                }
-            }
-
-            Some(late) = late_cand_rx.recv() => {
-                rtc.add_remote_candidate(late);
-                next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
-            }
-
-            _ = tokio::time::sleep(dur) => {
-                rtc.handle_input(Input::Timeout(Instant::now()))
-                    .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
-                next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
-            }
-        }
-
-        // Sender-side: as soon as wrap_key is derived, wrap the pre-generated
-        // bulk key and send KeyWrap over WS. Receiver decrypts + stores B.
-        // B is generated by the caller (cmd_send) BEFORE the URL is printed so
-        // that ShareLink.signature = SHA256(data || B) can be committed in the
-        // URL fragment — see docs/crypto.md and crates/bitmule/src/main.rs.
-        if wrap_key.is_some() && !key_wrap_sent {
-            let b = pre_generated_bulk_key.clone();
-            let wk = wrap_key.as_ref().unwrap();
-            let (nonce, ct) = wk.wrap_bulk_key(&b)?;
-            crate::multipeer::ws_enqueue_targeted(&outbox_tx, &SignalFrame::KeyWrap {
-                enc_b_hex: hex_encode(&ct),
-                nonce_hex: hex_encode(&nonce),
-            }, None)?;
-            bulk_key = Some(b);
-            key_wrap_sent = true;
-            info!("bulk key generated + wrapped + sent");
-        }
-    }
-    info!("sender data channel open");
-    let wrap_key = wrap_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
-    let meta_key = meta_key.ok_or_else(|| anyhow!("DC opened before KEX completed"))?;
-    let bulk_key = bulk_key.ok_or_else(|| anyhow!("DC opened before bulk key was generated"))?;
-
-    // Tear down router+writer + reunite the WS. Drop-order matters: dropping
-    // `outbox_tx` (the sole remaining sender clone in M2b-3, since no peer
-    // tasks were spawned) closes the writer's mpsc → writer returns the sink.
-    // Router shutdown_tx signal breaks the router's select! → router returns
-    // the stream. Reunite yields the original Ws for LiveSession.
-    let _ = router_shutdown_tx.send(true);
-    drop(outbox_tx);
-    let sink = writer_task.await.map_err(|e| anyhow!("ws writer join: {e}"))??;
-    let stream = router_task.await.map_err(|e| anyhow!("ws router join: {e}"))??;
-    let ws = stream.reunite(sink).map_err(|e| anyhow!("ws reunite: {e}"))?;
-
-    Ok(LiveSession {
-        session_id, role: Role::Sender, rtc, pool, ws, channel_id,
-        wrap_key, meta_key, bulk_key: Some(bulk_key), share_key,
-    })
-}
-
 /// Receiver entry point — passive side: send hello + peer_hello, wait
 /// for offer, produce + send answer, run loop until ChannelOpen (which
 /// carries the id str0m assigned on the passive side).
@@ -764,84 +538,25 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
 const CHUNK_BYTES: usize = 16 * 1024;
 const BUFFERED_LOW_THRESHOLD: usize = 1 * 1024 * 1024;
 
-/// Send a file over the opened WebRTC data channel using the browser-parity
-/// wire framing (see [`recv_file_over_dc`]).
-///
-/// Backpressure: str0m's `channel.write()` returns Ok(false) when the SCTP
-/// send buffer can't accept the payload. We set the buffered-amount-low
-/// threshold to 1 MiB, and on a rejected write we keep pumping the run
-/// loop (which drives SCTP and fires ChannelBufferedAmountLow when it's
-/// safe to try again) until the write is accepted.
-pub async fn send_file_over_dc(
-    session: &mut LiveSession,
-    file_path: &Path,
-    mut on_progress: impl FnMut(u64, u64) + Send,
-) -> Result<()> {
-    let meta_stat = tokio::fs::metadata(file_path).await
-        .with_context(|| format!("stat {}", file_path.display()))?;
-    if !meta_stat.is_file() {
-        bail!("{} is not a regular file", file_path.display());
-    }
-    let size = meta_stat.len();
-    let name = file_path.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file.bin".to_string());
-    let total_chunks = if size == 0 { 0 } else { (size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
-
-    let meta_plain = serde_json::json!({
-        "type": "meta",
-        "name": name,
-        "size": size,
-        "chunkBytes": CHUNK_BYTES,
-        "totalChunks": total_chunks,
-    }).to_string();
-
-    // Encrypt meta under meta_key with session_id as AAD (binds this meta to
-    // this session). Wire framing: {"type":"meta_enc","nonce_hex":"..","ct_hex":".."}.
-    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session.session_id.as_hex())?;
-    let (meta_nonce, meta_ct) = session.meta_key.encrypt_meta(&session_id_bytes, meta_plain.as_bytes())?;
-    let meta_enc_frame = serde_json::json!({
-        "type": "meta_enc",
-        "nonce_hex": hex_encode(&meta_nonce),
-        "ct_hex": hex_encode(&meta_ct),
-    }).to_string();
-
-    let bulk_key = session.bulk_key.as_ref()
-        .ok_or_else(|| anyhow!("bulk_key missing at chunk-encrypt time — KEX handshake incomplete"))?
-        .clone();
-
-    // Set the flow-control threshold once, then send the encrypted meta as a text frame.
-    channel_set_low_threshold(&mut session.rtc, session.channel_id, BUFFERED_LOW_THRESHOLD)?;
-    channel_write_all(session, false, meta_enc_frame.as_bytes()).await?;
-
-    let mut f = tokio::fs::File::open(file_path).await
-        .with_context(|| format!("open {}", file_path.display()))?;
-    let mut sent: u64 = 0;
-    let mut buf = vec![0u8; CHUNK_BYTES];
-    let mut idx: u64 = 0;
-    loop {
-        let n = f.read(&mut buf).await?;
-        if n == 0 { break; }
-        // AEAD-encrypt this chunk under bulk_key with a deterministic
-        // nonce derived from idx. Receiver tracks its own idx counter so
-        // the nonce doesn't need to ride on the wire.
-        let ct = bulk_key.encrypt_chunk(idx, &buf[..n])?;
-        channel_write_all(session, true, &ct).await?;
-        sent += n as u64;
-        idx += 1;
-        on_progress(sent, size);
-    }
-
-    // Done marker + drain the SCTP queue before returning (caller closing
-    // the session immediately after should not cut the tail).
-    channel_write_all(session, false, br#"{"type":"done"}"#).await?;
-    drain_until_buffer_empty(session).await?;
+/// Set the SCTP buffered-amount-low threshold on the session's channel,
+/// then drain per str0m's invariant.
+fn channel_set_low_threshold(rtc: &mut Rtc, id: ChannelId, threshold: usize) -> Result<()> {
+    let mut ch = rtc.channel(id).ok_or_else(|| anyhow!("channel {:?} gone", id))?;
+    ch.set_buffered_amount_low_threshold(threshold);
+    // Note: set_buffered_amount_low_threshold takes &mut self but doesn't
+    // return a Result and isn't itself listed as a "mutation" in str0m's
+    // README enumeration. We still drain in the caller (channel_write_all)
+    // via its initial drain_rtc call — safe.
     Ok(())
 }
 
 /// Write `buf` (text or binary) to the session's data channel, awaiting
 /// backpressure if the SCTP buffer is full. Every write is followed by a
 /// drain per str0m's single-mutation invariant.
+///
+/// Receiver-side helper — used by `recv_file_over_dc` to ship
+/// `request_ranges` + `recv_done` control frames to the sender. The
+/// sender-side equivalent lives per-peer as `channel_write_all_peer`.
 async fn channel_write_all(
     session: &mut LiveSession,
     binary: bool,
@@ -862,8 +577,9 @@ async fn channel_write_all(
         }
 
         // Buffer full — pump one iteration of the run loop to let SCTP
-        // drain, then retry. This is the same select! shape as the
-        // connect loops but scoped to a single wait-tick.
+        // drain, then retry. Short-lived pump: only takes Resolved
+        // candidates (drops Pending mdns; the parent loop re-sees the
+        // Ice frame on its next tick).
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
         tokio::select! {
             maybe_msg = session.ws.next() => {
@@ -872,66 +588,12 @@ async fn channel_write_all(
                     None => continue,
                 };
                 if let SignalFrame::Ice { candidate: Some(c) } = frame {
-                    // channel_write_all is a short-lived pump loop with
-                    // no clean select! surface for late candidates —
-                    // drop any Pending mdns and take only Resolved. The
-                    // outer loop will re-see this Ice frame on the
-                    // parent's next tick (mdns cache short-circuits the
-                    // repeat lookup) if it needs the resolved candidate.
                     if let Some(remote) = resolved_cand_only(parse_ice_candidate(&c)) {
                         session.rtc.add_remote_candidate(remote);
                         next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
                     }
                 }
             }
-            maybe_pr = session.pool.recv() => {
-                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
-                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
-                let input = Input::Receive(Instant::now(), Receive {
-                    proto: Protocol::Udp,
-                    source: pr.source,
-                    destination: pr.destination,
-                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
-                });
-                session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
-                next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
-            }
-            _ = tokio::time::sleep(dur) => {
-                session.rtc.handle_input(Input::Timeout(Instant::now()))
-                    .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
-                next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
-            }
-        }
-    }
-}
-
-/// Set the SCTP buffered-amount-low threshold on the session's channel,
-/// then drain per str0m's invariant.
-fn channel_set_low_threshold(rtc: &mut Rtc, id: ChannelId, threshold: usize) -> Result<()> {
-    let mut ch = rtc.channel(id).ok_or_else(|| anyhow!("channel {:?} gone", id))?;
-    ch.set_buffered_amount_low_threshold(threshold);
-    // Note: set_buffered_amount_low_threshold takes &mut self but doesn't
-    // return a Result and isn't itself listed as a "mutation" in str0m's
-    // README enumeration. We still drain in the caller (channel_write_all)
-    // via its initial drain_rtc call — safe.
-    Ok(())
-}
-
-/// Keep pumping the run loop until the send buffer drains to 0. Used by
-/// send_file_over_dc after the "done" frame so callers can drop the
-/// session cleanly without truncating the tail.
-async fn drain_until_buffer_empty(session: &mut LiveSession) -> Result<()> {
-    let mut next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
-    loop {
-        let buffered = {
-            let mut ch = session.rtc.channel(session.channel_id)
-                .ok_or_else(|| anyhow!("channel gone"))?;
-            ch.buffered_amount()
-        };
-        if buffered == 0 { return Ok(()); }
-
-        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
-        tokio::select! {
             maybe_pr = session.pool.recv() => {
                 let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
                 info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
@@ -1285,6 +947,10 @@ fn websocket_url(http_url: &str) -> Result<String> {
 ///   open; on timeout or error, fall back to Relay. Progress ticks from
 ///   the aborted WebRTC attempt are lost by the fallback — the relay
 ///   path starts from 0 on the retry.
+/// Legacy single-peer send. Only the `TransportMode::Relay` branch is
+/// still wired — WebRTC + Auto legacy paths went away when the
+/// multipeer send_serve stack landed; callers wanting WebRTC send
+/// should use `send_file_multi`.
 pub async fn send_file(
     server_url_http: &str,
     share_key: ShareKey,
@@ -1294,30 +960,9 @@ pub async fn send_file(
     on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
     match mode {
-        TransportMode::Webrtc => send_file_webrtc(server_url_http, share_key, bulk_key, file_path, on_progress).await,
         TransportMode::Relay => send_file_relay(server_url_http, share_key, bulk_key, file_path, on_progress).await,
-        TransportMode::Auto => {
-            let dur = std::time::Duration::from_millis(WEBRTC_FALLBACK_MS);
-            let progress = std::sync::Arc::new(tokio::sync::Mutex::new(on_progress));
-            let webrtc_progress = progress.clone();
-            let webrtc_bulk = bulk_key.clone();
-            let webrtc_fut = async {
-                let mut sess = tokio::time::timeout(dur, send_connect(server_url_http, share_key.clone(), webrtc_bulk)).await
-                    .map_err(|_| anyhow!("webrtc DC open exceeded {} ms", WEBRTC_FALLBACK_MS))??;
-                send_file_over_dc(&mut sess, file_path, |a, b| {
-                    if let Ok(mut g) = webrtc_progress.try_lock() { g(a, b); }
-                }).await
-            };
-            match webrtc_fut.await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    warn!("webrtc path failed ({e}), falling back to relay");
-                    let relay_progress = progress.clone();
-                    send_file_relay(server_url_http, share_key, bulk_key, file_path, move |a, b| {
-                        if let Ok(mut g) = relay_progress.try_lock() { g(a, b); }
-                    }).await
-                }
-            }
+        TransportMode::Webrtc | TransportMode::Auto => {
+            bail!("send_file legacy WebRTC path removed — use send_file_multi (ServeMode::Complete for one-shot, Multi for persistent)");
         }
     }
 }
@@ -1439,17 +1084,6 @@ async fn verify_transferred_signature(
 }
 
 // One-shot helpers per transport — avoid repeating the wire-up.
-
-async fn send_file_webrtc(
-    server_url_http: &str,
-    share_key: ShareKey,
-    bulk_key: BulkKey,
-    file_path: &Path,
-    on_progress: impl FnMut(u64, u64) + Send,
-) -> Result<()> {
-    let mut sess = send_connect(server_url_http, share_key, bulk_key).await?;
-    send_file_over_dc(&mut sess, file_path, on_progress).await
-}
 
 async fn send_file_relay(
     server_url_http: &str,
