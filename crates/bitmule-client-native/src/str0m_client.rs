@@ -25,7 +25,7 @@ use str0m::{
     net::{Protocol, Receive},
     Candidate, Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, net::UdpSocket, sync::broadcast};
+use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, net::UdpSocket, sync::{broadcast, mpsc}};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
@@ -398,6 +398,10 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
     let mut pool = build_socket_pool().await?;
     let mut rtc = build_rtc_with_pool_candidates(&pool);
 
+    // mdns-resolved candidates arrive on this channel; select! arm below
+    // drains it so ICE never blocks on a `.local` resolution.
+    let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
+
     // M2b-3: hand the WS to a router+writer pair for the handshake. Router
     // dispatches inbound frames (unrouted here since no peer tasks yet);
     // writer serializes an outbox mpsc onto the sink. On DC-open we shut
@@ -473,7 +477,7 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
                 };
                 match frame {
                     SignalFrame::Ice { candidate: Some(c) } => {
-                        if let Some(remote) = parse_ice_candidate(&c).await {
+                        if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
                             rtc.add_remote_candidate(remote);
                             next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
                         }
@@ -553,6 +557,11 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
                 }
             }
 
+            Some(late) = late_cand_rx.recv() => {
+                rtc.add_remote_candidate(late);
+                next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
+            }
+
             _ = tokio::time::sleep(dur) => {
                 rtc.handle_input(Input::Timeout(Instant::now()))
                     .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
@@ -613,6 +622,8 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let (mut rtc, mut pool) = build_rtc().await?;
     let mut next_timeout = drain_rtc(&mut rtc, &pool).await?;
 
+    let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
+
     let receiver_id = SessionId::random().as_hex();
     ws_send(&mut ws, &SignalFrame::Hello {
         role: Role::Receiver.as_str().to_owned(),
@@ -648,7 +659,7 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                 };
                 match frame {
                     SignalFrame::Ice { candidate: Some(c) } => {
-                        if let Some(remote) = parse_ice_candidate(&c).await {
+                        if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
                             rtc.add_remote_candidate(remote);
                             next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
                         }
@@ -721,6 +732,11 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                     contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
+                next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
+            }
+
+            Some(late) = late_cand_rx.recv() => {
+                rtc.add_remote_candidate(late);
                 next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
             }
 
@@ -856,7 +872,13 @@ async fn channel_write_all(
                     None => continue,
                 };
                 if let SignalFrame::Ice { candidate: Some(c) } = frame {
-                    if let Some(remote) = parse_ice_candidate(&c).await {
+                    // channel_write_all is a short-lived pump loop with
+                    // no clean select! surface for late candidates —
+                    // drop any Pending mdns and take only Resolved. The
+                    // outer loop will re-see this Ice frame on the
+                    // parent's next tick (mdns cache short-circuits the
+                    // repeat lookup) if it needs the resolved candidate.
+                    if let Some(remote) = resolved_cand_only(parse_ice_candidate(&c)) {
                         session.rtc.add_remote_candidate(remote);
                         next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
                     }
@@ -951,6 +973,8 @@ pub async fn recv_file_over_dc(
         .await
         .with_context(|| format!("mkdir -p {}", out_dir.display()))?;
 
+    let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
+
     let mut meta_opt: Option<MetaFrame> = None;
     let mut file_opt: Option<tokio::fs::File> = None;
     let mut path_opt: Option<PathBuf> = None;
@@ -1037,7 +1061,7 @@ pub async fn recv_file_over_dc(
                     None => continue,
                 };
                 if let SignalFrame::Ice { candidate: Some(c) } = frame {
-                    if let Some(remote) = parse_ice_candidate(&c).await {
+                    if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
                         session.rtc.add_remote_candidate(remote);
                         next_timeout = drain_rtc_capture_data(
                             &mut session.rtc, &session.pool, session.channel_id,
@@ -1058,6 +1082,15 @@ pub async fn recv_file_over_dc(
                     contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
+                next_timeout = drain_rtc_capture_data(
+                    &mut session.rtc, &session.pool, session.channel_id,
+                    &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
+                    &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx, &mut resume_from_chunk,
+                ).await?;
+            }
+
+            Some(late) = late_cand_rx.recv() => {
+                session.rtc.add_remote_candidate(late);
                 next_timeout = drain_rtc_capture_data(
                     &mut session.rtc, &session.pool, session.channel_id,
                     &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
@@ -1779,42 +1812,105 @@ fn parse_ws_frame(msg: Option<Result<Message, tokio_tungstenite::tungstenite::Er
 /// mDNS `.local` addresses are resolved via [`crate::maybe_resolve_mdns_candidate`]
 /// before being handed to str0m; if resolution fails the candidate is dropped
 /// (the peer usually also emits a srflx candidate we can pair with).
-async fn parse_ice_candidate(v: &serde_json::Value) -> Option<Candidate> {
-    let line = v.get("candidate")?.as_str()?;
+/// Drop-pending variant of `dispatch_cand_outcome`: only returns
+/// candidates that resolved synchronously; a Pending mdns resolution
+/// is dropped. Used inside short-lived pump loops (backpressure,
+/// buffer-drain) that don't own an `late_cand_tx` — the parent loop
+/// picks up the same Ice frame again on its next tick anyway, and
+/// mdns has its own 60s cache so the second parse is a hit.
+pub(crate) fn resolved_cand_only(outcome: CandOutcome) -> Option<Candidate> {
+    if let CandOutcome::Resolved(c) = outcome { Some(c) } else { None }
+}
+
+/// Dispatch a CandOutcome: return the resolved candidate immediately
+/// if we have one, or (for a Pending mdns resolution) spawn a bridge
+/// task that forwards the eventual result to `late_tx` and return None
+/// so the caller's loop keeps ticking. Late-arriving candidates land
+/// on `late_tx` and get picked up by the caller's `late_cand_rx.recv()`
+/// select! arm, then handed to `rtc.add_remote_candidate` without ever
+/// having blocked the loop.
+pub(crate) fn dispatch_cand_outcome(
+    outcome: CandOutcome,
+    late_tx: &tokio::sync::mpsc::UnboundedSender<Candidate>,
+) -> Option<Candidate> {
+    match outcome {
+        CandOutcome::Resolved(c) => Some(c),
+        CandOutcome::Pending(handle) => {
+            let tx = late_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(Some(c)) = handle.await {
+                    let _ = tx.send(c);
+                }
+            });
+            None
+        }
+        CandOutcome::Rejected => None,
+    }
+}
+
+/// Outcome of parsing a remote ICE candidate frame.
+///
+/// `Resolved` fires immediately for already-numeric candidates (host
+/// IP or srflx). `Pending` returns a JoinHandle so the caller can add
+/// the mdns-resolved candidate to str0m when the multicast responder
+/// answers — ICE checks against ALL other candidates continue in
+/// parallel. `Rejected` drops the candidate (bad shape, TCP, EOC).
+pub(crate) enum CandOutcome {
+    Resolved(Candidate),
+    Pending(tokio::task::JoinHandle<Option<Candidate>>),
+    Rejected,
+}
+
+fn parse_ice_candidate(v: &serde_json::Value) -> CandOutcome {
+    let line = match v.get("candidate").and_then(|x| x.as_str()) {
+        Some(l) => l,
+        None => return CandOutcome::Rejected,
+    };
     if line.is_empty() {
         info!("remote ICE candidate: <end-of-candidates>");
-        return None;
+        return CandOutcome::Rejected;
     }
     info!("remote ICE candidate: {line}");
 
     // Skip TCP candidates before we bother anyone (mdns, str0m).
-    // str0m is UDP-only in our build; a TCP candidate would fail
-    // `Candidate::from_sdp_string` at best, or waste a 5s mdns lookup
-    // for the same hostname a UDP candidate already resolved (observed
-    // on Firefox: cf19...local `typ host tcptype active` blocked
-    // ICE-Connected for 5s before end-of-candidates arrived).
     let parts: Vec<&str> = line.split_whitespace().collect();
     let is_tcp = parts.get(2).map_or(false, |t| t.eq_ignore_ascii_case("tcp"))
         || parts.iter().any(|p| p.eq_ignore_ascii_case("tcptype"));
     if is_tcp {
         info!("  → skipped: TCP candidate (UDP-only build)");
-        return None;
+        return CandOutcome::Rejected;
     }
 
-    let resolved: String = if parts.get(4).map_or(false, |a| a.ends_with(".local")) {
-        match crate::maybe_resolve_mdns_candidate(line).await {
-            Some(r) => { info!("  → mdns resolved: {r}"); r }
-            None => {
-                info!("  → mdns resolve FAILED, dropping candidate");
-                return None;
+    let needs_mdns = parts.get(4).map_or(false, |a| a.ends_with(".local"));
+    if needs_mdns {
+        // Kick mdns resolution onto a background task so the caller's
+        // select! loop keeps running — ICE checks against non-`.local`
+        // candidates proceed in parallel, and if any of THOSE pair
+        // successfully, we're connected without waiting for mdns at all.
+        let line_owned = line.to_string();
+        let handle = tokio::spawn(async move {
+            let resolved = crate::maybe_resolve_mdns_candidate(&line_owned).await?;
+            match Candidate::from_sdp_string(&resolved) {
+                Ok(c) => {
+                    info!("  → mdns resolved (async): {resolved}");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!("  → mdns resolved but str0m rejected: {e}");
+                    None
+                }
             }
+        });
+        return CandOutcome::Pending(handle);
+    }
+
+    // Numeric-IP candidate — hand to str0m immediately.
+    match Candidate::from_sdp_string(line) {
+        Ok(c) => { info!("  → added to str0m"); CandOutcome::Resolved(c) }
+        Err(e) => {
+            warn!("  → bad ice candidate: {e}");
+            CandOutcome::Rejected
         }
-    } else {
-        line.to_string()
-    };
-    match Candidate::from_sdp_string(&resolved) {
-        Ok(c) => { info!("  → added to str0m"); Some(c) }
-        Err(e) => { warn!("  → bad ice candidate: {e}"); None }
     }
 }
 
@@ -1891,7 +1987,7 @@ use crate::multipeer::{
 };
 use bitmule_core::ReceiverId;
 use std::collections::HashSet;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{watch, Mutex};
 
 /// Spawn a per-peer serving task on receipt of a peer_hello. Registers
 /// the peer's inbox with the WS router, subscribes the peer to the
@@ -2022,6 +2118,12 @@ async fn peer_session_run(
     let rid_hex = session.receiver_id.as_hex();
     info!(peer = %rid_hex, "peer task starting handshake");
 
+    // mdns'd remote candidates arrive on this channel after their
+    // background resolution completes. Select! branches in each of
+    // this task's three loops (pre-DC-open handshake, KEX-wait post-
+    // DC-open, block-serve) drain it so ICE never blocks on `.local`.
+    let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
+
     // Kick str0m to drain any startup outputs (mainly Timeout).
     let mut next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
 
@@ -2081,7 +2183,7 @@ async fn peer_session_run(
                 };
                 match frame {
                     SignalFrame::Ice { candidate: Some(c) } => {
-                        if let Some(remote) = parse_ice_candidate(&c).await {
+                        if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
                             session.rtc.add_remote_candidate(remote);
                             next_timeout = drain_rtc_capture_open(&mut session.rtc, &pool, channel_id, &mut opened).await?;
                         }
@@ -2150,6 +2252,11 @@ async fn peer_session_run(
                     info!(peer = %rid_hex, "shutdown signalled — exiting peer task");
                     return Ok(());
                 }
+            }
+
+            Some(late) = late_cand_rx.recv() => {
+                session.rtc.add_remote_candidate(late);
+                next_timeout = drain_rtc_capture_open(&mut session.rtc, &pool, channel_id, &mut opened).await?;
             }
 
             _ = tokio::time::sleep(dur) => {
@@ -2225,7 +2332,7 @@ async fn peer_session_run(
                             )?;
                         }
                         Some(SignalFrame::Ice { candidate: Some(c) }) => {
-                            if let Some(remote) = parse_ice_candidate(&c).await {
+                            if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
                                 session.rtc.add_remote_candidate(remote);
                                 next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
                             }
@@ -2246,6 +2353,10 @@ async fn peer_session_run(
                         Err(RecvError::Lagged(_)) => {}
                         Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
                     }
+                }
+                Some(late) = late_cand_rx.recv() => {
+                    session.rtc.add_remote_candidate(late);
+                    next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
                 }
                 _ = tokio::time::sleep(dur) => {
                     session.rtc.handle_input(Input::Timeout(Instant::now()))
@@ -2416,7 +2527,7 @@ async fn peer_session_run(
                 // Post-DC-open signaling: apply late ICE trickle, ignore rest.
                 match maybe_frame {
                     Some(SignalFrame::Ice { candidate: Some(c) }) => {
-                        if let Some(remote) = parse_ice_candidate(&c).await {
+                        if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
                             session.rtc.add_remote_candidate(remote);
                             next_timeout = drain_rtc_capture_dc_frames(
                                 &mut session.rtc, &pool, session.channel_id, &mut dc_in,
@@ -2448,6 +2559,13 @@ async fn peer_session_run(
                     }
                     Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
                 }
+            }
+            Some(late) = late_cand_rx.recv() => {
+                session.rtc.add_remote_candidate(late);
+                next_timeout = drain_rtc_capture_dc_frames(
+                    &mut session.rtc, &pool, session.channel_id, &mut dc_in,
+                )
+                .await?;
             }
             _ = tokio::time::sleep(dur) => {
                 session.rtc.handle_input(Input::Timeout(Instant::now()))
