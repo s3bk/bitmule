@@ -1383,7 +1383,7 @@ async fn ws_send(ws: &mut Ws, frame: &SignalFrame) -> Result<()> {
 /// the JSON top level. Server (Phase M1) forwards to only that receiver.
 /// `None` = fan-to-all (backward-compat with the single-receiver stack).
 #[allow(dead_code)]
-async fn ws_send_targeted(
+pub(crate) async fn ws_send_targeted(
     ws: &mut Ws,
     frame: &SignalFrame,
     to_receiver_id: Option<&str>,
@@ -1423,7 +1423,7 @@ async fn ws_send_from(
 /// by the sender's per-peer dispatch to route an incoming answer / ICE /
 /// KexPub / KeyWrap to the right per-peer task.
 #[allow(dead_code)]
-fn parse_ws_frame_with_from_id(
+pub(crate) fn parse_ws_frame_with_from_id(
     msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
 ) -> Result<Option<(SignalFrame, Option<String>)>> {
     let text = match msg {
