@@ -2121,11 +2121,89 @@ async fn peer_session_run(
         }
     }
 
-    let wrap_key = wrap_key.ok_or_else(|| anyhow!("peer {rid_hex} DC opened before KEX completed"))?;
-    let meta_key = meta_key.ok_or_else(|| anyhow!("peer {rid_hex} DC opened before KEX completed"))?;
+    // KEX-over-WS is independent of the DTLS/DC handshake and can
+    // complete after DC-open under normal timing (receiver's KexPub +
+    // MAC verify are on a separate signaling round-trip). If we get
+    // here with KEX still pending, keep spinning inbox_rx + pool_rx +
+    // timeout until KexPub lands. Bounded wait — a truly missing
+    // KexPub means the receiver never sent one, which is a fatal
+    // protocol error, not a benign timing gap.
+    if wrap_key.is_none() {
+        info!(peer = %rid_hex, "DC open, KEX still pending — waiting for KexPub");
+        let kex_deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while wrap_key.is_none() {
+            if Instant::now() >= kex_deadline {
+                bail!("peer {rid_hex}: KEX did not complete within 10s of DC-open");
+            }
+            if *shutdown_rx.borrow() {
+                return Ok(());
+            }
+            let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+            tokio::select! {
+                maybe_frame = inbox_rx.recv() => {
+                    match maybe_frame {
+                        Some(SignalFrame::KexPub { pub_hex, mac_hex }) => {
+                            let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                            let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
+                            let expected_mac = session.shared.share_key.mac_ephemeral_pub(&peer_pub);
+                            if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                                bail!("peer {rid_hex} post-DC-open KexPub MAC verify failed");
+                            }
+                            let eph = ephemeral_holder.take()
+                                .ok_or_else(|| anyhow!("peer {rid_hex} local ephemeral gone before post-open KexPub"))?;
+                            let s = eph.derive_shared_secret(&peer_pub)?;
+                            wrap_key = Some(s.wrap_key(&session.shared.session_id_bytes));
+                            meta_key = Some(s.meta_key(&session.shared.session_id_bytes));
+                            info!(peer = %rid_hex, "KEX complete (post-DC-open)");
+                            // Send the wrapped bulk_key immediately so
+                            // the receiver can decrypt chunks.
+                            let wk = wrap_key.as_ref().unwrap();
+                            let (nonce, ct) = wk.wrap_bulk_key(&session.shared.bulk_key)?;
+                            ws_enqueue_targeted(
+                                &outbox_tx,
+                                &SignalFrame::KeyWrap {
+                                    enc_b_hex: hex_encode(&ct),
+                                    nonce_hex: hex_encode(&nonce),
+                                },
+                                Some(&rid_hex),
+                            )?;
+                        }
+                        Some(SignalFrame::Ice { candidate: Some(c) }) => {
+                            if let Some(remote) = parse_ice_candidate(&c).await {
+                                session.rtc.add_remote_candidate(remote);
+                                next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
+                            }
+                        }
+                        Some(_) => { /* stale post-open sig */ }
+                        None => bail!("peer {rid_hex} inbox closed while waiting for KEX"),
+                    }
+                }
+                maybe_pr = pool_rx.recv() => {
+                    use broadcast::error::RecvError;
+                    match maybe_pr {
+                        Ok(pr) => {
+                            let mut rtcs: [&mut Rtc; 1] = [&mut session.rtc];
+                            if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
+                                next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
+                    }
+                }
+                _ = tokio::time::sleep(dur) => {
+                    session.rtc.handle_input(Input::Timeout(Instant::now()))
+                        .map_err(|e| anyhow!("peer {rid_hex} handle_input timeout: {e}"))?;
+                    next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
+                }
+            }
+        }
+    }
+    let wrap_key = wrap_key.expect("wrap_key set above");
+    let meta_key = meta_key.expect("meta_key set above");
     session.wrap_key = Some(wrap_key);
     session.meta_key = Some(meta_key);
-    info!(peer = %rid_hex, "DC open — entering block-serve loop (M2b-6)");
+    info!(peer = %rid_hex, "DC open + KEX complete — entering block-serve loop");
 
     // M2b-6: block-serve loop.
     //

@@ -189,6 +189,15 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
 
     let task = tokio::spawn(async move {
         let mut peers: HashMap<String, mpsc::UnboundedSender<SignalFrame>> = HashMap::new();
+        // Pending: WS frames whose envelope `from_receiver_id` names a
+        // peer that hasn't registered yet. Common when the receiver
+        // ships peer_hello + KexPub + SDP answer back-to-back and the
+        // KexPub reaches the router BEFORE the orchestrator has
+        // finished spawn_peer_task's registration handshake. Small cap
+        // to bound worst-case memory if a bogus from_receiver_id keeps
+        // arriving for a peer that never registers.
+        let mut pending: HashMap<String, Vec<SignalFrame>> = HashMap::new();
+        const PENDING_CAP_PER_PEER: usize = 32;
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -197,10 +206,17 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
                     }
                 }
                 Some(reg) = register_rx.recv() => {
+                    // Drain any pending frames for this peer's id into
+                    // the freshly-registered inbox BEFORE the ack fires,
+                    // so `spawn_peer_task`'s caller sees a consistent
+                    // "registration is live and any queued frames are
+                    // already delivered" post-condition.
+                    if let Some(queued) = pending.remove(&reg.receiver_id) {
+                        for f in queued {
+                            let _ = reg.inbox_tx.send(f);
+                        }
+                    }
                     peers.insert(reg.receiver_id, reg.inbox_tx);
-                    // Ack after insert so `spawn_peer_task`'s await
-                    // returns only once dispatch is live. Silently
-                    // drop if the caller dropped its rx (canceled).
                     let _ = reg.ack.send(());
                 }
                 maybe_msg = stream.next() => {
@@ -216,12 +232,38 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
                             let _ = inbox.send(frame);
                         }
                         None => {
-                            // Preserve `from` alongside the frame so the
-                            // orchestrator loop can pick up the envelope-
-                            // level from_receiver_id even when the frame
-                            // body's own receiver_id field is absent (which
-                            // is the common shape on server-relayed
-                            // peer_hello notifications).
+                            // Dual-delivery: forward every frame with an
+                            // unknown from_receiver_id to unrouted_rx
+                            // AND buffer a clone by receiver_id for a
+                            // future peer registration.
+                            //
+                            // - unrouted_rx keeps the legacy single-peer
+                            //   `send_connect` path working (it never
+                            //   registers peers, so it reads everything
+                            //   from unrouted_rx and just ignores the
+                            //   from_receiver_id envelope).
+                            // - pending[from] wins the race where a
+                            //   receiver ships KexPub/SDP-answer BEFORE
+                            //   the multipeer orchestrator finishes
+                            //   spawn_peer_task. On registration, the
+                            //   buffered frames drain into the peer's
+                            //   inbox so the peer_session_run's KEX
+                            //   completes without a lost frame.
+                            //
+                            // The multipeer orchestrator drops the
+                            // unrouted copy at debug level (non-PeerHello
+                            // unrouted frames are expected chatter under
+                            // this dual-delivery scheme).
+                            if let Some(rid) = from.as_deref() {
+                                let entry = pending.entry(rid.to_string()).or_default();
+                                if entry.len() < PENDING_CAP_PER_PEER {
+                                    entry.push(frame.clone());
+                                }
+                                // Silent-cap: if a bogus from_receiver_id
+                                // spams us past the cap, we stop buffering
+                                // but still forward to unrouted so
+                                // send_connect / diagnostics see it.
+                            }
                             let _ = unrouted_tx.send((frame, from));
                         }
                     }

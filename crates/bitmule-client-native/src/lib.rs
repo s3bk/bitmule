@@ -400,7 +400,10 @@ impl Role {
 pub const WIRE_VERSION: u32 = 2;
 
 /// Wire frames on the signaling WebSocket. Mirrors what `web/main.js` sends.
-#[derive(Debug, Serialize, Deserialize)]
+/// `Clone` for the M2b router's dual-delivery path — a frame may need
+/// to land on both `pending[from_receiver_id]` (for a not-yet-registered
+/// peer) and `unrouted_rx` (for the legacy single-peer send_connect).
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum SignalFrame {
     Hello {
