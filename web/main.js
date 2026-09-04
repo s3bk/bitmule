@@ -133,6 +133,16 @@ const els = {
   stopAfterFirst: document.getElementById("stop-after-first"),
   sessionActiveCount: document.getElementById("session-active-count"),
   sessionTotalCount: document.getElementById("session-total-count"),
+
+  // F00 options menu
+  optMultiSend: document.getElementById("opt-multi-send"),
+  optUpnp: document.getElementById("opt-upnp"),
+  optClipboardWatch: document.getElementById("opt-clipboard-watch"),
+  optAutoDownload: document.getElementById("opt-auto-download"),
+
+  // F02 clipboard fetch queue
+  fetchQueue: document.getElementById("fetch-queue"),
+  fetchQueueList: document.getElementById("fetch-queue-list"),
   copyBtn: document.getElementById("copy-link"),
   cancelBtn: document.getElementById("cancel-session"),
   requestFilesBtn: document.getElementById("request-files-btn"),
@@ -1991,6 +2001,178 @@ wireSendMode();
 wireRecvMode();
 wireRequestMode();
 wireInvitedSendMode();
+wireOptions();
 window.addEventListener("hashchange", applyRoute);
 window.addEventListener("popstate", applyRoute);
 applyRoute();
+
+// ---- F00: options menu + persistence -----------------------------------
+
+const OPTIONS_KEY = "bitmule.options.v1";
+
+function loadOptions() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(OPTIONS_KEY) || "{}"); } catch {}
+  const defaults = { multiSend: true, upnp: false, clipboardWatch: false, autoDownload: false };
+  return Object.assign(defaults, saved);
+}
+
+function saveOptions(opts) {
+  try { localStorage.setItem(OPTIONS_KEY, JSON.stringify(opts)); } catch {}
+}
+
+function getOptions() {
+  // Read live from the DOM inputs so a mid-session toggle applies
+  // without re-loading. Falls back to the persisted snapshot if the
+  // DOM inputs aren't wired yet.
+  if (!els.optMultiSend) return loadOptions();
+  return {
+    multiSend: !!els.optMultiSend.checked,
+    upnp: !!els.optUpnp.checked,
+    clipboardWatch: !!els.optClipboardWatch.checked,
+    autoDownload: !!els.optAutoDownload.checked,
+  };
+}
+
+function wireOptions() {
+  const opts = loadOptions();
+  if (els.optMultiSend) els.optMultiSend.checked = opts.multiSend;
+  if (els.optUpnp) els.optUpnp.checked = opts.upnp;
+  if (els.optClipboardWatch) els.optClipboardWatch.checked = opts.clipboardWatch;
+  if (els.optAutoDownload) els.optAutoDownload.checked = opts.autoDownload;
+  // "multi-send by default" flips the stop-after-first default:
+  // multi-send on → stop-after-first off, and vice versa.
+  if (els.stopAfterFirst) els.stopAfterFirst.checked = !opts.multiSend;
+
+  const persist = () => {
+    saveOptions(getOptions());
+    // If clipboard-watch flipped, start / stop the poller.
+    if (els.optClipboardWatch && els.optClipboardWatch.checked) startClipboardWatcher();
+    else stopClipboardWatcher();
+  };
+  for (const el of [els.optMultiSend, els.optUpnp, els.optClipboardWatch, els.optAutoDownload]) {
+    if (el) el.addEventListener("change", persist);
+  }
+  // Reflect multi-send back onto the stop-after-first checkbox each
+  // time it changes, so the two controls stay coherent.
+  if (els.optMultiSend && els.stopAfterFirst) {
+    els.optMultiSend.addEventListener("change", () => {
+      els.stopAfterFirst.checked = !els.optMultiSend.checked;
+    });
+  }
+  if (opts.clipboardWatch) startClipboardWatcher();
+}
+
+// ---- F02: clipboard watcher + fetch queue ------------------------------
+
+let clipboardWatchTimer = null;
+let lastClipboardText = "";
+const fetchQueueLinks = new Map(); // url → { status: "pending"|"downloading"|"done" }
+
+function isValidBitmuleUrl(text) {
+  if (typeof text !== "string") return false;
+  const trimmed = text.trim();
+  // Rough check: matches http(s)://…/#<hex-or-b64url>. parseSessionFragment
+  // does the definitive validation; this is just a fast prefilter.
+  const m = trimmed.match(/^(https?:\/\/[^\s#]+)(#[A-Za-z0-9_\-=]{20,})$/);
+  return !!m;
+}
+
+function isOurOwnLink(url) {
+  // Ignore any URL for a session THIS tab is currently serving —
+  // matches the same-tab self-download guard in applyRoute.
+  if (!url) return false;
+  const hash = (new URL(url)).hash.replace(/^#/, "");
+  const parsed = parseSessionFragment("#" + hash);
+  const hex = parsed && parsed.sessionHex;
+  if (!hex) return false;
+  if (sendSession && sendSession.sessionHex === hex) return true;
+  if (requestSession && requestSession.sessionHex === hex) return true;
+  return false;
+}
+
+function renderFetchQueue() {
+  if (!els.fetchQueueList) return;
+  els.fetchQueueList.innerHTML = "";
+  if (fetchQueueLinks.size === 0) {
+    els.fetchQueue.hidden = true;
+    return;
+  }
+  els.fetchQueue.hidden = false;
+  for (const [url, state] of fetchQueueLinks) {
+    const li = document.createElement("li");
+    li.className = "fetch-queue-item";
+    const label = document.createElement("span");
+    label.className = "fetch-queue-url";
+    label.textContent = url;
+    li.appendChild(label);
+    if (state.status === "pending") {
+      const btn = document.createElement("button");
+      btn.className = "pick-btn";
+      btn.textContent = "Download";
+      btn.addEventListener("click", () => triggerFetchDownload(url));
+      li.appendChild(btn);
+    } else {
+      const s = document.createElement("span");
+      s.className = "fetch-queue-status";
+      s.textContent = state.status;
+      li.appendChild(s);
+    }
+    els.fetchQueueList.appendChild(li);
+  }
+}
+
+function triggerFetchDownload(url) {
+  const state = fetchQueueLinks.get(url);
+  if (!state) return;
+  state.status = "downloading";
+  renderFetchQueue();
+  // Route via applyRoute: navigate the tab to the URL. If the user
+  // wants multiple concurrent downloads they can open the queue links
+  // in new tabs; for now single-tab receive is the simplest surface.
+  // For same-origin URLs, use history + hashchange; for cross-origin,
+  // open a new tab.
+  try {
+    const u = new URL(url);
+    if (u.origin === location.origin) {
+      history.pushState(null, "", u.pathname + u.search + u.hash);
+      applyRoute();
+    } else {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+    state.status = "done";
+  } catch (e) {
+    console.warn("triggerFetchDownload:", e);
+    state.status = "error";
+  }
+  renderFetchQueue();
+}
+
+async function pollClipboardOnce() {
+  if (!navigator.clipboard || !navigator.clipboard.readText) return;
+  let text;
+  try { text = await navigator.clipboard.readText(); }
+  catch { return; /* permission denied or not focused */ }
+  if (text === lastClipboardText) return;
+  lastClipboardText = text;
+  if (!isValidBitmuleUrl(text)) return;
+  const url = text.trim();
+  if (isOurOwnLink(url)) return;
+  if (fetchQueueLinks.has(url)) return;
+  fetchQueueLinks.set(url, { status: "pending" });
+  renderFetchQueue();
+  const opts = getOptions();
+  if (opts.autoDownload) triggerFetchDownload(url);
+}
+
+function startClipboardWatcher() {
+  if (clipboardWatchTimer) return;
+  clipboardWatchTimer = setInterval(pollClipboardOnce, 1500);
+  console.info("clipboard watcher: on");
+}
+function stopClipboardWatcher() {
+  if (!clipboardWatchTimer) return;
+  clearInterval(clipboardWatchTimer);
+  clipboardWatchTimer = null;
+  console.info("clipboard watcher: off");
+}

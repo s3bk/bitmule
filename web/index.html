@@ -174,6 +174,40 @@
         </section>
       </div>
 
+      <!-- Options menu (F00). Toggles persist to localStorage;
+           main.js reads them on session start. -->
+      <section id="options" class="options" aria-live="polite">
+        <details>
+          <summary class="options-summary">Options</summary>
+          <label class="option-row">
+            <input id="opt-multi-send" type="checkbox" />
+            multi-send by default (keep the URL live for more receivers)
+          </label>
+          <label class="option-row">
+            <input id="opt-upnp" type="checkbox" />
+            request UPnP port mapping (native only — no-op in browser)
+          </label>
+          <label class="option-row">
+            <input id="opt-clipboard-watch" type="checkbox" />
+            watch clipboard for bitmule links
+          </label>
+          <label class="option-row">
+            <input id="opt-auto-download" type="checkbox" />
+            automatically start downloads from clipboard links
+            <span class="option-hint">(requires clipboard watch)</span>
+          </label>
+        </details>
+      </section>
+
+      <!-- F02: clipboard-detected links queue. Populated by the
+           clipboard watcher when opt-clipboard-watch is on; each row
+           has a "Download" button unless opt-auto-download fired
+           already. -->
+      <section id="fetch-queue" class="fetch-queue" hidden aria-live="polite">
+        <h2 class="section-title">Detected links</h2>
+        <ul id="fetch-queue-list" class="fetch-queue-list"></ul>
+      </section>
+
       <!-- Global status row (visible in both modes) -->
       <section id="status" class="status" aria-live="polite">
         <div class="status-row">
