@@ -9,8 +9,8 @@ members = [
     "crates/bitmule-client-wasm",
     "crates/bitmule-client-native",
     "crates/bitmule-e2e-tests",
-    "crates/bitmule-desktop-qt6",
-    "crates/bitmule-desktop-gtk4",
+    "crates/bitmule-qt6",
+    "crates/bitmule-gtk4",
 ]
 
 [workspace.package]
