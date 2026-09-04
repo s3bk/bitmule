@@ -920,6 +920,19 @@ pub async fn recv_file_over_dc(
     let mut done = false;
     let mut buf = vec![0u8; 4096];
     let mut recv_idx: u64 = 0;
+    let mut resume_from_chunk: Option<u64> = None;
+    // M2b-7: request_ranges / recv_done state.
+    //
+    // On first tick after meta arrives, emit `RequestRanges` for the
+    // (possibly resumed) missing chunk range. On the tick where
+    // `recv_idx == total_chunks`, emit `RecvDone`. Both are one-shots.
+    //
+    // Wire compat: legacy single-peer sender ignores RequestRanges and
+    // just streams. Legacy sender's `{"type":"done"}` and multipeer
+    // sender's `{"type":"done_ack"}` are both treated as the end signal
+    // by `drain_rtc_capture_data`.
+    let mut request_sent = false;
+    let mut recv_done_sent = false;
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session.session_id.as_hex())?;
     let bulk_key = session.bulk_key.as_ref()
         .ok_or_else(|| anyhow!("bulk_key missing at chunk-decrypt time — KEX handshake incomplete"))?
@@ -928,10 +941,55 @@ pub async fn recv_file_over_dc(
     let mut next_timeout = drain_rtc_capture_data(
         &mut session.rtc, &session.pool, session.channel_id,
         &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
-        &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
+        &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx, &mut resume_from_chunk,
     ).await?;
 
     while !done {
+        // M2b-7: one-shot RequestRanges emission after meta parsed.
+        // total_chunks derived from meta.size so we ask for exactly the
+        // range we're missing given any resume prefix.
+        if !request_sent {
+            if let Some(m) = meta_opt.as_ref() {
+                let total_chunks = if m.size == 0 { 0 } else { (m.size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
+                let start = resume_from_chunk.unwrap_or(0);
+                if start < total_chunks {
+                    // Half-open [start, end) in u32 chunk-index space.
+                    // Wire cap is u32; a 64 TiB file at 16 KiB/chunk =
+                    // ~4.3B chunks — hits u32::MAX. Real files today are
+                    // well under, so plain cast is safe; add a bounds
+                    // guard if we ever ship >64 TiB.
+                    let req = crate::multipeer::DcControlFrame::RequestRanges {
+                        ranges: vec![crate::multipeer::ChunkRange {
+                            start: start as u32,
+                            end: total_chunks as u32,
+                        }],
+                    };
+                    let bytes = serde_json::to_vec(&req)
+                        .map_err(|e| anyhow!("encode request_ranges: {e}"))?;
+                    channel_write_all(session, false, &bytes).await?;
+                    info!("emitted request_ranges [{}..{})", start, total_chunks);
+                }
+                request_sent = true;
+                // Already-complete resume: nothing to request, skip
+                // straight to recv_done below.
+            }
+        }
+
+        // M2b-7: one-shot RecvDone emission once we've decrypted every
+        // chunk. Sender responds with DoneAck; `done` flips in drain.
+        if request_sent && !recv_done_sent {
+            if let Some(m) = meta_opt.as_ref() {
+                let total_chunks = if m.size == 0 { 0 } else { (m.size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 };
+                if recv_idx >= total_chunks {
+                    let bytes = serde_json::to_vec(&crate::multipeer::DcControlFrame::RecvDone)
+                        .map_err(|e| anyhow!("encode recv_done: {e}"))?;
+                    channel_write_all(session, false, &bytes).await?;
+                    recv_done_sent = true;
+                    info!("emitted recv_done (chunks {} / {})", recv_idx, total_chunks);
+                }
+            }
+        }
+
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
 
         tokio::select! {
@@ -947,7 +1005,7 @@ pub async fn recv_file_over_dc(
                         next_timeout = drain_rtc_capture_data(
                             &mut session.rtc, &session.pool, session.channel_id,
                             &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
-                            &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
+                            &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx, &mut resume_from_chunk,
                         ).await?;
                     }
                 }
@@ -966,7 +1024,7 @@ pub async fn recv_file_over_dc(
                 next_timeout = drain_rtc_capture_data(
                     &mut session.rtc, &session.pool, session.channel_id,
                     &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
-                    &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
+                    &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx, &mut resume_from_chunk,
                 ).await?;
             }
 
@@ -976,7 +1034,7 @@ pub async fn recv_file_over_dc(
                 next_timeout = drain_rtc_capture_data(
                     &mut session.rtc, &session.pool, session.channel_id,
                     &mut meta_opt, &mut file_opt, &mut path_opt, &mut received, &mut done, &mut on_progress, out_dir,
-                    &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx,
+                    &bulk_key, &session.meta_key, &session_id_bytes, &mut recv_idx, &mut resume_from_chunk,
                 ).await?;
             }
         }
@@ -1009,6 +1067,7 @@ async fn drain_rtc_capture_data(
     meta_key: &MetaKey,
     session_id_bytes: &[u8; 32],
     recv_idx: &mut u64,
+    resume_from_chunk: &mut Option<u64>,
 ) -> Result<Instant> {
     loop {
         match rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
@@ -1066,9 +1125,54 @@ async fn drain_rtc_capture_data(
                                 Ok(m) => {
                                     let name = crate::sanitize_filename(&m.name);
                                     let path = out_dir.join(&name);
-                                    let file = tokio::fs::File::create(&path).await
-                                        .with_context(|| format!("create {}", path.display()))?;
-                                    on_progress(0, m.size, &m.name);
+                                    // M2b-7: resume-aware open. If the file already exists
+                                    // at `path` and is < declared size, treat its aligned
+                                    // prefix as bytes we already have and request only the
+                                    // missing ranges from the sender. Aligned = truncate down
+                                    // to a chunk boundary so a mid-chunk crash re-transmits
+                                    // the partial chunk cleanly.
+                                    //
+                                    // Correctness assumption: same URL = same bulk_key = same
+                                    // plaintext, so any existing bytes at this path were
+                                    // written by a prior receiver session for THE SAME file.
+                                    // If the user pointed a different URL at the same out_dir
+                                    // + name, the decrypted output will be garbage; that's
+                                    // a --out-dir-hygiene concern, not something the wire
+                                    // can detect without a full-file MAC.
+                                    let existing_size = match tokio::fs::metadata(&path).await {
+                                        Ok(s) if s.is_file() => s.len(),
+                                        _ => 0,
+                                    };
+                                    let (mut file, have_chunks) = if existing_size > 0 && existing_size <= m.size {
+                                        let full = existing_size / CHUNK_BYTES as u64;
+                                        let aligned = full * CHUNK_BYTES as u64;
+                                        let mut f = tokio::fs::OpenOptions::new()
+                                            .read(true).write(true).create(true).truncate(false)
+                                            .open(&path).await
+                                            .with_context(|| format!("open (resume) {}", path.display()))?;
+                                        if aligned != existing_size {
+                                            f.set_len(aligned).await
+                                                .with_context(|| format!("truncate {} to chunk boundary {}", path.display(), aligned))?;
+                                        }
+                                        f.seek(std::io::SeekFrom::End(0)).await?;
+                                        info!("resuming {} from chunk {} (aligned bytes {})", path.display(), full, aligned);
+                                        (f, full)
+                                    } else {
+                                        if existing_size > m.size {
+                                            warn!("existing {} is larger ({} bytes) than declared size ({}) — truncating", path.display(), existing_size, m.size);
+                                        }
+                                        let f = tokio::fs::File::create(&path).await
+                                            .with_context(|| format!("create {}", path.display()))?;
+                                        (f, 0u64)
+                                    };
+                                    // Progress accounting: bytes covered by the resume
+                                    // prefix are already "received."
+                                    let resumed_bytes = have_chunks * CHUNK_BYTES as u64;
+                                    *received = resumed_bytes;
+                                    *recv_idx = have_chunks;
+                                    *resume_from_chunk = Some(have_chunks);
+                                    on_progress(resumed_bytes, m.size, &m.name);
+                                    let _ = &mut file;
                                     *file_opt = Some(file);
                                     *path_opt = Some(path);
                                     *meta_opt = Some(m);
@@ -1076,7 +1180,11 @@ async fn drain_rtc_capture_data(
                                 Err(e) => warn!("meta decode after decrypt: {e}"),
                             }
                         }
-                        Some("done") => { *done = true; }
+                        // Sender EOF markers: legacy single-peer sender emits
+                        // `{"type":"done"}`; M2b-6 multipeer sender emits
+                        // `{"type":"done_ack"}` after receiver's RecvDone.
+                        // Both mean "no more chunks coming — close cleanly."
+                        Some("done") | Some("done_ack") => { *done = true; }
                         _ => {}
                     }
                 }
