@@ -580,7 +580,7 @@ pub(crate) async fn maybe_resolve_mdns_candidate(candidate_line: &str) -> Option
     let ip_str = match race_mdns_resolvers(addr, std::time::Duration::from_secs(5)).await {
         Some(ip) => ip.to_string(),
         None => {
-            debug!("mdns resolve of {addr} failed / timed out (both resolvers)");
+            debug!("mdns resolve of {addr} failed / timed out");
             return None;
         }
     };
