@@ -761,48 +761,54 @@ function startSendSession(files) {
   sendSession = session;
   showSessionPanel(link);
 
-  // WebRTC-vs-relay fallback. If the DC hasn't opened within
-  // CONFIG.webrtcTimeoutMs of the WS opening, the sender starts
-  // uploading chunks via server relay. Tracked on the session so the
-  // DC-open handler can cancel the timer if it wins the race.
+  // Send-side WebRTC-first, relay-fallback. Symmetric to the recv
+  // side: NO timeout, NO fallback until we have positive evidence
+  // WebRTC failed AND a receiver is present on the WS.
+  //
+  // Signals we watch:
+  //   - `peer_hello` from server → receiverPresent = true.
+  //   - createPeer's onState "failed" AFTER receiverPresent AND
+  //     !dcOpen → arm relay upload.
+  //
+  // No armFallbackTimer, no CONFIG.webrtcTimeoutMs auto-trip.
+  session.receiverPresent = false;
+  session.dcOpen = false;
   session.relayStarted = false;
-  session.fallbackTimer = null;
   session.relayProgress = { meta: null, sentIdxs: [], done: false };
 
-  const armFallbackTimer = () => {
-    session.fallbackTimer = setTimeout(async () => {
-      if (sendSession !== session) return;
-      if (session.dcOpen) return;
-      if (session.relayStarted) return;
-      const file = session.files && session.files[0];
-      if (!file) return;
-      session.relayStarted = true;
-      els.sessionState.textContent =
-        `WebRTC not open after ${CONFIG.webrtcTimeoutMs}ms — falling back to server relay…`;
-      els.sessionState.classList.add("transferring");
-      try {
-        await sendFileOverRelay(session.sessionHex, ws, file, {
-          onProgress: (sent, total) => {
-            if (sendSession !== session) return;
-            const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
-            els.sessionState.textContent =
-              `sending via relay ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
-          },
-          progressState: session.relayProgress,
-        });
-        els.sessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
-        document.body.dataset.transferStatus = 'complete';
-        els.cancelBtn.textContent = "Send another";
-        els.cancelBtn.classList.add("done");
-      } catch (err) {
-        els.sessionState.textContent = `relay send failed: ${err.message}`;
-      }
-    }, CONFIG.webrtcTimeoutMs);
+  const startRelayUpload = async (reason) => {
+    if (sendSession !== session) return;
+    if (session.dcOpen || session.relayStarted) return;
+    const file = session.files && session.files[0];
+    if (!file) return;
+    session.relayStarted = true;
+    // Short low-drama arm text; sendFileOverRelay's onProgress
+    // replaces it with per-chunk progress as soon as bytes move.
+    els.sessionState.textContent = "using relay fallback…";
+    els.sessionState.classList.add("transferring");
+    try {
+      await sendFileOverRelay(session.sessionHex, ws, file, {
+        onProgress: (sent, total) => {
+          if (sendSession !== session) return;
+          const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
+          els.sessionState.textContent =
+            `sending via relay ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
+        },
+        progressState: session.relayProgress,
+      });
+      els.sessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
+      document.body.dataset.transferStatus = 'complete';
+      els.cancelBtn.textContent = "Send another";
+      els.cancelBtn.classList.add("done");
+    } catch (err) {
+      els.sessionState.textContent = `relay send failed: ${err.message}`;
+    }
   };
 
   ws.addEventListener("open", () => {
     ws.send(JSON.stringify({ type: "hello", role: "sender" }));
-    armFallbackTimer();
+    // Idle text — waits for a receiver. No fallback timer.
+    els.sessionState.textContent = "waiting for receiver…";
   });
 
   ws.addEventListener("message", async (ev) => {
@@ -827,6 +833,7 @@ function startSendSession(files) {
     // The receiver's peer_hello is the trigger to spin up WebRTC and
     // send an SDP offer. Subsequent sdp/ice frames flow through the peer.
     if (frame.type === "peer_hello") {
+      session.receiverPresent = true;
       els.sessionState.textContent =
         "receiver joined — negotiating direct connection…";
       els.sessionState.classList.add("transferring");
@@ -836,11 +843,6 @@ function startSendSession(files) {
           ws,
           onOpen: async (dc) => {
             session.dcOpen = true;
-            // Cancel the fallback timer — WebRTC won the race.
-            if (session.fallbackTimer) {
-              clearTimeout(session.fallbackTimer);
-              session.fallbackTimer = null;
-            }
             // If the relay-upload path had already started, don't also
             // stream via DC — the receiver's already picking up chunks
             // from the relay and would end up with duplicates.
@@ -895,6 +897,12 @@ function startSendSession(files) {
           },
           onState: (s) => {
             console.info("sender pc state:", s);
+            // ICE `failed` is the terminal spec state — retry is
+            // not possible from here. Only kick relay upload if a
+            // receiver is present AND the DC hasn't opened yet.
+            if (!session.dcOpen && session.receiverPresent && s === "failed") {
+              startRelayUpload(`ICE state: ${s}`);
+            }
           },
         });
         try {
@@ -1104,7 +1112,11 @@ function startRecvSession(sessionHex, fragment) {
     session.relayArmed = true;
     session.webrtcFailed = true;
     console.info(`relay armed (${reason}) — replaying ${session.relayPrearmBuffer.length} buffered frames`);
-    els.recvState.textContent = `WebRTC failed (${reason}) — falling back to relay`;
+    // Short, low-drama arm message. commonProgress will replace it
+    // with "receiving X: N%" as soon as the first relay chunk lands,
+    // so the fallback moment reads as a transient state, not a stuck
+    // error page.
+    els.recvState.textContent = "using relay fallback…";
     for (const buffered of session.relayPrearmBuffer) {
       try { relayRecv.onWsFrame(buffered); }
       catch (e) { console.warn("relay replay failed:", e); }
