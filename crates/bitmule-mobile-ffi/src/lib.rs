@@ -62,6 +62,51 @@ where
     }
 }
 
+/// Best-effort one-shot: open a fresh WS to `server/ws/<session_hex>`,
+/// send `text_frame`, close. Used for RequestRelay signal emit on
+/// receiver-side fallback + WebrtcReady timing beacon on DC-open.
+/// Any error is logged and swallowed — the caller's primary flow
+/// must not fail because a side-channel signal didn't land.
+///
+/// 5s cap on the whole open+send+close cycle so a stuck server
+/// can't wedge the caller. Cheap; each call is a fresh TCP+TLS+WS
+/// upgrade so don't spam this in a tight loop.
+async fn _emit_side_channel_frame(server_url: &str, session_hex: &str, text_frame: &str) {
+    use futures_util::SinkExt;
+    let ws_base = if let Some(rest) = server_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = server_url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        server_url.to_string()
+    };
+    let url = format!(
+        "{}/ws/{}",
+        ws_base.trim_end_matches('/'),
+        session_hex,
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(text_frame.to_string().into())).await?;
+            let _ = ws.close(None).await;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        },
+    ).await;
+    match result {
+        Ok(Ok(())) => {
+            tracing::debug!("side-channel WS frame sent: {text_frame}");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("side-channel WS frame ({text_frame}) failed: {e}");
+        }
+        Err(_) => {
+            tracing::warn!("side-channel WS frame ({text_frame}) timed out");
+        }
+    }
+}
+
 pub fn ffi_version() -> String {
     // Semver of the FFI SURFACE (not the crate as a whole). Bump on
     // any UDL change so the shell can fail fast on binary/binding
@@ -183,12 +228,18 @@ async fn recv_file_inner(
 
     // WebRTC-first with relay fallback. WEBRTC_DEADLINE bounds the
     // WebRTC attempt so a broken NAT / ICE-failure doesn't hang the
-    // caller forever — the web SPA has the same pattern via
-    // armFallbackTimer. On any WebRTC-side error OR the deadline
-    // firing without a DC-open, we re-open on the relay transport
-    // and re-run recv with the same share_key + signature. The relay
-    // path negotiates fresh crypto over the same WS/session_hex.
-    const WEBRTC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+    // caller forever. On any WebRTC-side error OR the deadline firing
+    // without a DC-open, we (1) emit `request_relay` on a side-channel
+    // WS so any listening sender switches to relay immediately (skips
+    // its own timeout window), (2) re-open on the relay transport and
+    // re-run recv with the same share_key + signature.
+    //
+    // 10s deadline (dropped from 15s per Seb 2026-09-05) — real
+    // WebRTC handshakes on healthy networks complete in ~1-3s; 10s is
+    // plenty of headroom without making the fallback UX sluggish.
+    const WEBRTC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    let session_hex_for_signals = link.share_key.session_id_hex();
+    let server_for_signals = parsed.server.clone();
     let listener_wr = on_progress.clone();
     let webrtc_attempt = tokio::time::timeout(
         WEBRTC_DEADLINE,
@@ -207,7 +258,12 @@ async fn recv_file_inner(
     let outcome = match webrtc_attempt {
         Ok(Ok(o)) => o,
         Ok(Err(webrtc_err)) => {
-            tracing::warn!("recv webrtc failed ({webrtc_err:#}); falling back to relay");
+            tracing::warn!("recv webrtc failed ({webrtc_err:#}); requesting relay switch and falling back");
+            _emit_side_channel_frame(
+                &server_for_signals,
+                &session_hex_for_signals,
+                r#"{"type":"request_relay"}"#,
+            ).await;
             let listener_relay = on_progress.clone();
             native_recv(
                 &parsed.server,
@@ -223,7 +279,12 @@ async fn recv_file_inner(
             .map_err(BitmuleError::from)?
         }
         Err(_) => {
-            tracing::warn!("recv webrtc DC did not open within {WEBRTC_DEADLINE:?}; falling back to relay");
+            tracing::warn!("recv webrtc DC did not open within {WEBRTC_DEADLINE:?}; requesting relay switch and falling back");
+            _emit_side_channel_frame(
+                &server_for_signals,
+                &session_hex_for_signals,
+                r#"{"type":"request_relay"}"#,
+            ).await;
             let listener_relay = on_progress.clone();
             native_recv(
                 &parsed.server,
@@ -389,7 +450,7 @@ async fn send_file_inner(
     // surfaces to the caller. Live-URL sessions that need relay
     // should be started explicitly by the caller with a --relay-mode
     // FFI arg (not yet exposed; add when needed).
-    const WEBRTC_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+    const WEBRTC_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
     if multi {
         send_file_multi(
             &server_trimmed,

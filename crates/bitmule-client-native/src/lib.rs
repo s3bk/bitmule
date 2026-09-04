@@ -488,6 +488,36 @@ pub(crate) enum SignalFrame {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         signer_pub_hex: Option<String>,
     },
+    /// Receiver-to-sender request: "I've given up on WebRTC. Please
+    /// switch to relay transport for this session and re-emit your
+    /// progress so I can start pulling chunks." Sender-side handler
+    /// should cancel the WebRTC attempt cleanly and start
+    /// `send_file_over_relay` on the same session_hex, then call
+    /// `resend_relay_progress` to catch the receiver up on which
+    /// chunks are already on the server. Server broadcasts within
+    /// the session, so a single request lands on any active sender
+    /// WS regardless of which peer sent it.
+    ///
+    /// Wire pair with the receiver's independent 10s fallback timer:
+    /// if the sender's listener catches this frame, both sides switch
+    /// synchronously and skip the timeout window; if the sender is
+    /// legacy code that doesn't handle it, the receiver still falls
+    /// back on its own timer and the sender times out independently.
+    RequestRelay {},
+    /// Client → server timing beacon. Fired by either side the moment
+    /// the WebRTC data channel opens successfully, with the elapsed
+    /// time from the WS-hello send to DC-open. Server-side action:
+    /// log the pair `{session_hex, role, elapsed_ms}` so we can build
+    /// a distribution of "how long does WebRTC take to come up on real
+    /// networks" and tune the fallback timer per client type.
+    ///
+    /// Server-side handler is a follow-up on the server crate. Client
+    /// emits regardless of whether the server knows what to do with
+    /// it — the frame is opaque to peers on the session; the server
+    /// silently swallows it (or logs it once wired).
+    WebrtcReady {
+        elapsed_ms: u64,
+    },
 }
 
 pub(crate) type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
