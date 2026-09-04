@@ -1024,7 +1024,14 @@ function startPeerForReceiver(session, receiverId) {
     dc: null,
     bytesSent: 0,
     bytesTotal: (session.files && session.files[0]) ? session.files[0].size : 0,
+    // request_ranges plumbing (M2b-7 resume support). Receiver emits
+    // request_ranges after seeing meta_enc, telling us which chunk
+    // window to send. We MUST honor it — a resuming receiver has
+    // recv_idx pre-set to the resume point, so streaming from chunk 0
+    // guarantees a decrypt_chunk mismatch at the resume boundary.
+    requestedRange: null,
   };
+  peer.rangeReady = new Promise((resolve) => { peer.resolveRange = resolve; });
   upsertPeerProgressRow(peer, "connecting…");
 
   // Fresh ephemeral X25519 keypair for THIS peer's KEX.
@@ -1041,13 +1048,26 @@ function startPeerForReceiver(session, receiverId) {
       }
     },
     onMessage: (data) => {
-      // Receiver's DC messages arrive here. In the AEAD wire, they're
-      // JSON control frames: `request_ranges`, `recv_done`. We ignore
-      // request_ranges (we already stream the whole file); we care
-      // about recv_done → send done_ack + close.
+      // Receiver's DC messages arrive here. Two JSON control frames on
+      // the AEAD wire: `request_ranges` (which chunks does the receiver
+      // need, honors resume) and `recv_done` (all decrypted OK →
+      // return done_ack + close).
       if (typeof data !== "string") return;
       let f;
       try { f = JSON.parse(data); } catch { return; }
+      if (f.type === "request_ranges" && Array.isArray(f.ranges) && f.ranges.length > 0) {
+        // First range wins (native receiver only ever emits one).
+        // MUST honor: a resuming receiver has recv_idx pre-set to the
+        // resume point, so streaming from chunk 0 would produce a
+        // decrypt_chunk mismatch at the resume boundary.
+        const r = f.ranges[0];
+        if (Number.isInteger(r.start) && Number.isInteger(r.end) && r.end >= r.start) {
+          peer.requestedRange = { start: r.start, end: r.end };
+          if (peer.resolveRange) { peer.resolveRange(peer.requestedRange); peer.resolveRange = null; }
+          console.info(`[send] request_ranges → [${r.start}..${r.end}) for ${peer.receiverId.slice(0,8)}`);
+        }
+        return;
+      }
       if (f.type === "recv_done") {
         try { peer.dc && peer.dc.send(JSON.stringify({ type: "done_ack" })); }
         catch (e) { console.warn("done_ack send failed:", e); }
@@ -1176,10 +1196,32 @@ async function sendMetaAndChunksForPeer(session, peer) {
     peer.dc.addEventListener("bufferedamountlow", check);
   });
 
-  let offset = 0;
-  let idx = 0;
-  console.info(`[send] peer=${peer.receiverId.slice(0,8)} file.size=${file.size} chunkBytes=${chunkBytes} expected_chunks=${Math.ceil(file.size / chunkBytes)}`);
-  while (offset < file.size) {
+  // Wait briefly for request_ranges from receiver so we honor resume.
+  // Receiver emits it as soon as meta_enc is parsed. If nothing lands
+  // in 500ms (e.g. legacy receiver that doesn't send request_ranges),
+  // fall back to the full [0, totalChunks) range.
+  let range;
+  try {
+    range = await Promise.race([
+      peer.rangeReady,
+      new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+    ]);
+  } catch { range = null; }
+  if (!range) {
+    range = { start: 0, end: totalChunks };
+    console.info(`[send] no request_ranges — defaulting to [0..${totalChunks})`);
+  }
+  const rangeStart = Math.max(0, Math.min(range.start, totalChunks));
+  const rangeEnd   = Math.max(rangeStart, Math.min(range.end, totalChunks));
+
+  let offset = rangeStart * chunkBytes;
+  let idx = rangeStart;
+  console.info(`[send] peer=${peer.receiverId.slice(0,8)} file.size=${file.size} chunkBytes=${chunkBytes} expected_chunks=${Math.ceil(file.size / chunkBytes)} range=[${rangeStart}..${rangeEnd})`);
+  // Update the shared bytesSent baseline so the progress UI shows the
+  // resumed prefix as already-delivered (matches receiver's view).
+  peer.bytesSent = offset;
+  const endByte = Math.min(rangeEnd * chunkBytes, file.size);
+  while (offset < endByte) {
     if (session.peers.get(peer.receiverId) !== peer) return; // torn down
     const end = Math.min(offset + chunkBytes, file.size);
     const plain = new Uint8Array(await file.slice(offset, end).arrayBuffer());
