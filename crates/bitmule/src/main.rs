@@ -270,14 +270,14 @@ where
                 .unwrap_or_else(|| "file.bin".to_string());
             (p.clone(), None, None, name)
         } else if meta.is_dir() {
-            let (zip_file, disp) = build_zip_bundle(&paths).await?;
+            let (zip_file, disp) = bitmule_client_native::container::build_zip_bundle(&paths).await?;
             let path = zip_file.path().to_path_buf();
             (path, Some(zip_file), Some("zip-store".to_string()), disp)
         } else {
             return Err(anyhow!("{} is neither a regular file nor a directory", p.display()));
         }
     } else {
-        let (zip_file, disp) = build_zip_bundle(&paths).await?;
+        let (zip_file, disp) = bitmule_client_native::container::build_zip_bundle(&paths).await?;
         let path = zip_file.path().to_path_buf();
         (path, Some(zip_file), Some("zip-store".to_string()), disp)
     };
@@ -329,104 +329,8 @@ where
     Ok(SendSpawn { session_hex, share_url, file_name, file_size, handle })
 }
 
-/// Build a store-mode (level-0, no compression) zip bundle from `paths`.
-/// Returns the `NamedTempFile` guard (kept alive by caller to survive
-/// the transfer; `Drop` unlinks) and a display name for user output.
-///
-/// Directory entries are walked recursively; each file is written under
-/// the directory's basename to preserve the top-level container name.
-/// File entries are stored under their basename.
-///
-/// Store mode is chosen because bitmule compresses on the wire via zstd
-/// downstream — layering deflate here would waste CPU on already-random
-/// data (the AEAD-encrypted chunks) once compression lands.
-async fn build_zip_bundle(paths: &[PathBuf]) -> Result<(tempfile::NamedTempFile, String)> {
-    use std::io::Write;
-    use zip::write::SimpleFileOptions;
-    use zip::CompressionMethod;
-
-    let display_name = if paths.len() == 1 && paths[0].is_dir() {
-        let base = paths[0].file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "bundle".to_string());
-        format!("{base}.zip")
-    } else if paths.len() == 1 {
-        let stem = paths[0].file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "bundle".to_string());
-        format!("{stem}.zip")
-    } else {
-        let stem = paths[0].file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "bundle".to_string());
-        format!("{stem}-and-{}-more.zip", paths.len() - 1)
-    };
-
-    let owned_paths: Vec<PathBuf> = paths.to_vec();
-    // Zip build is CPU + sync-fs bound; run on blocking pool to keep the
-    // async runtime free.
-    let tmp = tokio::task::spawn_blocking(move || -> Result<tempfile::NamedTempFile> {
-        let tmp = tempfile::Builder::new()
-            .prefix("bitmule-bundle-")
-            .suffix(".zip")
-            .tempfile()
-            .context("create bundle tempfile")?;
-        let file = tmp.reopen().context("reopen bundle tempfile")?;
-        let mut zw = zip::ZipWriter::new(file);
-        let opts: SimpleFileOptions = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .large_file(true);
-
-        for p in &owned_paths {
-            let md = std::fs::metadata(p)
-                .with_context(|| format!("stat {}", p.display()))?;
-            if md.is_file() {
-                let name = p.file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .ok_or_else(|| anyhow!("path has no file name: {}", p.display()))?;
-                zw.start_file(&name, opts)
-                    .with_context(|| format!("zip start_file {name}"))?;
-                let mut f = std::fs::File::open(p)
-                    .with_context(|| format!("open {}", p.display()))?;
-                std::io::copy(&mut f, &mut zw)
-                    .with_context(|| format!("copy {} into zip", p.display()))?;
-            } else if md.is_dir() {
-                let root_name = p.file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .ok_or_else(|| anyhow!("dir path has no basename: {}", p.display()))?;
-                for entry in walkdir::WalkDir::new(p).min_depth(1) {
-                    let entry = entry.with_context(|| format!("walk {}", p.display()))?;
-                    let rel = entry.path().strip_prefix(p)
-                        .with_context(|| format!("strip_prefix {}", entry.path().display()))?;
-                    let mut zip_name = std::path::PathBuf::from(&root_name);
-                    zip_name.push(rel);
-                    let zip_name_str = zip_name.to_string_lossy().replace('\\', "/");
-                    let ft = entry.file_type();
-                    if ft.is_dir() {
-                        zw.add_directory(&zip_name_str, opts)
-                            .with_context(|| format!("zip add_directory {zip_name_str}"))?;
-                    } else if ft.is_file() {
-                        zw.start_file(&zip_name_str, opts)
-                            .with_context(|| format!("zip start_file {zip_name_str}"))?;
-                        let mut f = std::fs::File::open(entry.path())
-                            .with_context(|| format!("open {}", entry.path().display()))?;
-                        std::io::copy(&mut f, &mut zw)
-                            .with_context(|| format!("copy {} into zip", entry.path().display()))?;
-                    }
-                    // symlinks / other file types: skipped silently.
-                }
-            } else {
-                return Err(anyhow!("{} is neither a regular file nor a directory", p.display()));
-            }
-        }
-
-        let mut inner = zw.finish().context("finalize zip central directory")?;
-        inner.flush().context("flush zip file")?;
-        Ok(tmp)
-    }).await.context("zip build task join")??;
-
-    Ok((tmp, display_name))
-}
+// build_zip_bundle moved to bitmule_client_native::container so Qt6 +
+// mobile FFI can share the same on-the-fly bundling.
 
 async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, multi: bool) -> Result<()> {
     // Bundling decision is duplicated with `prepare_and_spawn_send` for the
@@ -583,8 +487,8 @@ async fn cmd_recv(
     if let Some(container) = outcome.container.as_deref() {
         match container {
             "zip-store" => {
-                let unpack_dir = unpack_dir_for(&path);
-                match unpack_zip_store(&path, &unpack_dir).await {
+                let unpack_dir = bitmule_client_native::container::unpack_dir_for(&path);
+                match bitmule_client_native::container::unpack_zip_store(&path, &unpack_dir).await {
                     Ok(entries) => {
                         // Zip is redundant now — the caller wanted the files, not the archive.
                         // Best-effort delete; log but don't fail if it stays.
@@ -610,67 +514,7 @@ async fn cmd_recv(
     Ok(())
 }
 
-/// Sibling directory next to the received zip: `<parent>/<stem>/`.
-/// If the stem collides with an existing dir, add `-1`, `-2`, … until
-/// a fresh name is found. Returns a plain PathBuf; caller creates it.
-fn unpack_dir_for(zip_path: &Path) -> PathBuf {
-    let parent = zip_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = zip_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "bundle".to_string());
-    let mut candidate = parent.join(&stem);
-    let mut n = 1u32;
-    while candidate.exists() {
-        candidate = parent.join(format!("{stem}-{n}"));
-        n += 1;
-    }
-    candidate
-}
-
-/// Unpack a store-mode (or any compression method — the `zip` crate handles
-/// all methods on read) archive into `dest`. Skips zip-slip entries (any
-/// entry whose enclosed path escapes `dest`). Returns the number of file
-/// entries extracted (directories are counted separately and not returned).
-async fn unpack_zip_store(zip_path: &Path, dest: &Path) -> Result<usize> {
-    let zip_path = zip_path.to_path_buf();
-    let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<usize> {
-        std::fs::create_dir_all(&dest)
-            .with_context(|| format!("mkdir -p {}", dest.display()))?;
-        let file = std::fs::File::open(&zip_path)
-            .with_context(|| format!("open {}", zip_path.display()))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .with_context(|| format!("read zip archive {}", zip_path.display()))?;
-        let mut extracted: usize = 0;
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i)
-                .with_context(|| format!("zip entry #{i}"))?;
-            // enclosed_name() strips absolute prefixes AND rejects `..`
-            // traversal — the zip crate's canonical anti-zip-slip guard.
-            let Some(rel) = entry.enclosed_name() else {
-                eprintln!("(skipping unsafe zip entry name: {:?})", entry.name());
-                continue;
-            };
-            let out_path = dest.join(&rel);
-            if entry.is_dir() {
-                std::fs::create_dir_all(&out_path)
-                    .with_context(|| format!("mkdir {}", out_path.display()))?;
-            } else {
-                if let Some(parent) = out_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("mkdir {}", parent.display()))?;
-                }
-                let mut out_file = std::fs::File::create(&out_path)
-                    .with_context(|| format!("create {}", out_path.display()))?;
-                std::io::copy(&mut entry, &mut out_file)
-                    .with_context(|| format!("extract {}", out_path.display()))?;
-                extracted += 1;
-            }
-        }
-        Ok(extracted)
-    }).await.context("zip unpack join")?
-}
+// unpack_dir_for + unpack_zip_store moved to bitmule_client_native::container.
 
 async fn identity_add(name: String, contact_base: String) -> Result<()> {
     let id = identity::create(&name).await?;

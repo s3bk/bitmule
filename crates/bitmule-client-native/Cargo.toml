@@ -31,3 +31,6 @@ rand_core = { version = "0.6", features = ["std"] }
 aes-gcm = "0.10"
 zstd = "0.13"
 base64 = "0.22"
+zip = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }

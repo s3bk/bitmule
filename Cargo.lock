@@ -625,9 +625,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "walkdir",
  "x25519-dalek",
- "zip",
 ]
 
 [[package]]
@@ -651,13 +649,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "str0m",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "walkdir",
  "x25519-dalek",
  "zeroize",
+ "zip",
  "zstd",
 ]
 
