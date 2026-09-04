@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>exif-stripper demo</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #111; }
+  h1 { font-size: 20px; }
+  .row { display: flex; gap: 24px; margin-top: 16px; }
+  .card { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+  .card img { max-width: 100%; border-radius: 4px; display: block; }
+  .stat { font-family: ui-monospace, monospace; font-size: 13px; color: #444; }
+  button { margin-top: 12px; }
+  #status { margin-top: 12px; color: #555; }
+</style>
+</head>
+<body>
+  <h1>exif-stripper demo</h1>
+  <p>Pick a JPEG or PNG. It's streamed through the WASM transformer
+     (<code>File.stream() → pipeThrough(TransformStream) → Blob</code>) —
+     the file is never fully buffered by this page's own JS, only by the
+     browser's internal <code>Response</code>/<code>Blob</code> plumbing
+     at the very end, for the preview.</p>
+
+  <input id="file-input" type="file" accept="image/jpeg,image/png" />
+  <div id="status"></div>
+
+  <div class="row">
+    <div class="card">
+      <strong>Original</strong>
+      <div class="stat" id="orig-size">—</div>
+      <img id="orig-img" alt="" />
+    </div>
+    <div class="card">
+      <strong>Stripped</strong>
+      <div class="stat" id="clean-size">—</div>
+      <img id="clean-img" alt="" />
+      <div><a id="download" download="cleaned">Download cleaned file</a></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import init, { ExifStripTransformer } from "../pkg/exif_stripper.js";
+
+    const status = document.querySelector("#status");
+    status.textContent = "Loading WASM module…";
+    await init();
+    status.textContent = "Ready. Pick a file.";
+
+    /** @param {File} file @returns {ReadableStream<Uint8Array>} */
+    function stripExif(file) {
+      const transformer = new ExifStripTransformer();
+      const ts = new TransformStream({
+        transform(chunk, controller) {
+          transformer.transform(chunk, controller);
+        },
+        flush(controller) {
+          transformer.flush(controller);
+        },
+      });
+      return file.stream().pipeThrough(ts);
+    }
+
+    document.querySelector("#file-input").addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      status.textContent = "Stripping…";
+      const t0 = performance.now();
+
+      document.querySelector("#orig-size").textContent = `${file.size.toLocaleString()} bytes`;
+      document.querySelector("#orig-img").src = URL.createObjectURL(file);
+
+      const cleanStream = stripExif(file);
+      const cleanBlob = await new Response(cleanStream).blob();
+
+      document.querySelector("#clean-size").textContent = `${cleanBlob.size.toLocaleString()} bytes`;
+      const cleanUrl = URL.createObjectURL(cleanBlob);
+      document.querySelector("#clean-img").src = cleanUrl;
+
+      const dl = document.querySelector("#download");
+      dl.href = cleanUrl;
+      dl.download = "cleaned-" + file.name;
+
+      status.textContent = `Done in ${(performance.now() - t0).toFixed(1)} ms.`;
+    });
+  </script>
+</body>
+</html>
