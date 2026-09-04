@@ -23,7 +23,7 @@ pub mod str0m_client;
 pub mod crypto;
 pub mod pipeline;
 pub mod multipeer;
-pub use str0m_client::{LiveSession, recv_file, send_file, send_file_multi};
+pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
 pub use multipeer::ServeMode;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -593,26 +593,26 @@ pub(crate) async fn maybe_resolve_mdns_candidate(candidate_line: &str) -> Option
     Some(out_parts.join(" "))
 }
 
-// ---- top-level file transfer with WebRTC / relay auto-fallback ----------
+// ---- top-level file transfer entry points -------------------------------
 //
-// send_file / recv_file are the CLI-facing entry points that unify the DC
-// and relay paths. Default (mode=Auto) is WebRTC-first with a 3s fallback
-// timer to the relay path; --webrtc and --relay force a single mode.
+// Send: `send_file_multi` (WebRTC multipeer, default) or `send_file_relay`
+//       (server-relay legacy).
+// Recv: `recv_file` (dispatches WebRTC or Relay per `TransportMode`).
+//
+// The pre-multipeer `send_file` public API was deleted 2026-09-04 per Seb:
+// no callers remained. Same day: `TransportMode::Auto` deleted — the
+// WebRTC-first-with-3s-relay-fallback flow lived only inside the removed
+// send_file / recv_file Auto branches, and the SPA now handles fallback
+// on its own layer (peer-present + ICE-failed trigger, not a wall clock).
 
 /// How the caller wants file transfer to happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
-    /// Try WebRTC first; if the data channel hasn't opened after
-    /// [`WEBRTC_FALLBACK_MS`], fall back to relay. Default for CLI.
-    Auto,
     /// Only WebRTC. Errors if the DC never opens.
     Webrtc,
     /// Skip WebRTC entirely; use server relay from the start.
     Relay,
 }
-
-/// How long the auto mode waits for the DC to open before falling back.
-pub const WEBRTC_FALLBACK_MS: u64 = 3000;
 
 
 fn derive_ws_url(server_url_http: &str) -> String {

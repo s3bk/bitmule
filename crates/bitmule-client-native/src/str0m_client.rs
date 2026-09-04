@@ -928,7 +928,7 @@ async fn drain_rtc_capture_data(
 
 // ---- top-level dispatchers (unify DC + relay per TransportMode) ---------
 
-use crate::{TransportMode, WEBRTC_FALLBACK_MS};
+use crate::TransportMode;
 
 fn websocket_url(http_url: &str) -> Result<String> {
     if let Some(rest) = http_url.strip_prefix("http://") {
@@ -937,33 +937,6 @@ fn websocket_url(http_url: &str) -> Result<String> {
         Ok(format!("wss://{rest}"))
     } else {
         bail!("invalid protocol")
-    }
-}
-
-/// Send `file_path` over a fresh session. Dispatch by TransportMode:
-/// - `Webrtc`: send_connect → send_file_over_dc.
-/// - `Relay`: open a ws, spawn a pumper task, forward to send_file_over_relay.
-/// - `Auto`: try Webrtc with `WEBRTC_FALLBACK_MS` deadline for the DC to
-///   open; on timeout or error, fall back to Relay. Progress ticks from
-///   the aborted WebRTC attempt are lost by the fallback — the relay
-///   path starts from 0 on the retry.
-/// Legacy single-peer send. Only the `TransportMode::Relay` branch is
-/// still wired — WebRTC + Auto legacy paths went away when the
-/// multipeer send_serve stack landed; callers wanting WebRTC send
-/// should use `send_file_multi`.
-pub async fn send_file(
-    server_url_http: &str,
-    share_key: ShareKey,
-    bulk_key: BulkKey,
-    file_path: &Path,
-    mode: TransportMode,
-    on_progress: impl FnMut(u64, u64) + Send,
-) -> Result<()> {
-    match mode {
-        TransportMode::Relay => send_file_relay(server_url_http, share_key, bulk_key, file_path, on_progress).await,
-        TransportMode::Webrtc | TransportMode::Auto => {
-            bail!("send_file legacy WebRTC path removed — use send_file_multi (ServeMode::Complete for one-shot, Multi for persistent)");
-        }
     }
 }
 
@@ -1025,33 +998,6 @@ pub async fn recv_file(
             Ok(path)
         }
         TransportMode::Relay => recv_file_relay(server_url_http, share_key, expected_signature, out_dir, on_progress).await,
-        TransportMode::Auto => {
-            let dur = std::time::Duration::from_millis(WEBRTC_FALLBACK_MS);
-            let progress = std::sync::Arc::new(tokio::sync::Mutex::new(on_progress));
-            let webrtc_progress = progress.clone();
-            let webrtc_fut = async {
-                let mut sess = tokio::time::timeout(dur, recv_connect(server_url_http, share_key.clone())).await
-                    .map_err(|_| anyhow!("webrtc DC open exceeded {} ms", WEBRTC_FALLBACK_MS))??;
-                let path = recv_file_over_dc(&mut sess, out_dir, |a, b, n| {
-                    if let Ok(mut g) = webrtc_progress.try_lock() { g(a, b, n); }
-                }).await?;
-                if let Some(sig) = expected_signature {
-                    verify_transferred_signature(&path, &sig, sess.bulk_key.as_ref()
-                        .ok_or_else(|| anyhow!("session has no bulk key at verify time"))?).await?;
-                }
-                Ok::<_, anyhow::Error>(path)
-            };
-            match webrtc_fut.await {
-                Ok(p) => Ok(p),
-                Err(e) => {
-                    warn!("webrtc path failed ({e}), falling back to relay");
-                    let relay_progress = progress.clone();
-                    recv_file_relay(server_url_http, share_key, expected_signature, out_dir, move |a, b, n| {
-                        if let Ok(mut g) = relay_progress.try_lock() { g(a, b, n); }
-                    }).await
-                }
-            }
-        }
     }
 }
 
@@ -1085,7 +1031,7 @@ async fn verify_transferred_signature(
 
 // One-shot helpers per transport — avoid repeating the wire-up.
 
-async fn send_file_relay(
+pub async fn send_file_relay(
     server_url_http: &str,
     share_key: ShareKey,
     bulk_key: BulkKey,

@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
-use bitmule_client_native::{recv_file, send_file, send_file_multi, ServeMode, TransportMode};
+use bitmule_client_native::{recv_file, send_file_multi, send_file_relay, ServeMode, TransportMode};
 use clap::{Parser, Subcommand};
 use qrcode::{render::unicode, QrCode};
 use std::path::{Path, PathBuf};
@@ -103,15 +103,15 @@ enum IdentityAction {
     },
 }
 
-fn resolve_mode(webrtc: bool, relay: bool) -> TransportMode {
-    if webrtc { TransportMode::Webrtc }
-    else if relay { TransportMode::Relay }
-    else { TransportMode::Auto }
+fn resolve_mode(_webrtc: bool, relay: bool) -> TransportMode {
+    // TransportMode::Auto was deleted with the pre-multipeer send/recv
+    // path (Sep 4, per Seb "nobody is on the old api, delete it").
+    // Default = Webrtc; --relay flag forces relay.
+    if relay { TransportMode::Relay } else { TransportMode::Webrtc }
 }
 
 fn mode_label(m: TransportMode) -> &'static str {
     match m {
-        TransportMode::Auto => "auto (WebRTC-first, 3s fallback to relay)",
         TransportMode::Webrtc => "WebRTC only",
         TransportMode::Relay => "relay only",
     }
@@ -271,33 +271,23 @@ where
 
     // Dispatch matrix:
     //
-    //  multi | mode      | path taken
-    //  ------+-----------+---------------------------------------------
-    //  false | any       | send_file_multi Complete (WebRTC, exits on 1st peer)
-    //  false | Relay     | legacy send_file (server-relay, single-peer)
-    //  true  | Webrtc    | send_serve Multi (WebRTC-only multipeer)
-    //  true  | Relay     | legacy send_file Relay — session URL stays valid
-    //                      until process exit for any receiver to pick up
-    //  true  | Auto/none | send_serve Multi (WebRTC-multi); relay fallback
-    //                      is a follow-up (concurrent WebRTC+relay under
-    //                      one URL requires bookkeeping we don't have yet)
+    //  multi | mode    | path taken
+    //  ------+---------+-----------------------------------------------
+    //  false | Webrtc  | send_file_multi Complete (exits on 1st peer done)
+    //  false | Relay   | send_file_relay (server-relay single-peer)
+    //  true  | Webrtc  | send_file_multi Multi (WebRTC multipeer)
+    //  true  | Relay   | send_file_relay — session URL stays valid until
+    //                    process exit; late receivers fetch from retained
+    //                    server chunks (natural multipeer-over-relay)
     let handle = tokio::spawn(async move {
         match (multi, mode) {
-            (false, TransportMode::Relay) => {
-                send_file(&server, share_key, bulk_key, &path, mode, on_progress).await
+            (_, TransportMode::Relay) => {
+                send_file_relay(&server, share_key, bulk_key, &path, on_progress).await
             }
-            (false, _) => {
+            (false, TransportMode::Webrtc) => {
                 send_file_multi(&server, share_key, bulk_key, path, ServeMode::Complete).await
             }
-            (true, TransportMode::Relay) => {
-                // Relay-multi: run legacy relay send. The signaling
-                // server keeps the session's chunks around until
-                // retention expires, so a receiver arriving later
-                // just fetches them — natural "multipeer over relay"
-                // semantics for the single-file case.
-                send_file(&server, share_key, bulk_key, &path, mode, on_progress).await
-            }
-            (true, _) => {
+            (true, TransportMode::Webrtc) => {
                 send_file_multi(&server, share_key, bulk_key, path, ServeMode::Multi).await
             }
         }
@@ -351,12 +341,12 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool)
             println!("mode:    relay-multi (server-relay, URL stays valid — Ctrl-C to stop)");
         }
         (false, TransportMode::Relay) => {
-            println!("mode:    relay only (legacy single-peer)");
+            println!("mode:    relay only (single-peer)");
         }
-        (true, _) => {
+        (true, TransportMode::Webrtc) => {
             println!("mode:    multi-peer (WebRTC, never exits — Ctrl-C to stop)");
         }
-        (false, _) => {
+        (false, TransportMode::Webrtc) => {
             println!("mode:    complete (WebRTC, exits after first receiver has the file)");
         }
     }
