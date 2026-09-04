@@ -131,7 +131,16 @@ async fn main() -> Result<()> {
             cmd_send(&cli.server, path, resolve_mode(webrtc, relay), multi).await
         }
         Command::Recv { session, out, webrtc, relay } => {
-            cmd_recv(&cli.server, session, out, resolve_mode(webrtc, relay)).await
+            // Infer the server from the share URL when possible so the
+            // receiver doesn't need `--server` to match the sender's
+            // published origin. Falls back to `--server` (default
+            // http://localhost:8443) if the arg is a bare hex/b64
+            // fragment with no scheme.
+            let inferred = session
+                .as_deref()
+                .and_then(extract_server_from_url);
+            let server = inferred.as_deref().unwrap_or(&cli.server);
+            cmd_recv(server, session, out, resolve_mode(webrtc, relay)).await
         }
         Command::Identity { action } => match action {
             IdentityAction::Add { name, contact_base } => identity_add(name, contact_base).await,
@@ -156,6 +165,29 @@ fn extract_link_fragment(input: &str) -> Option<String> {
     };
     let trimmed = candidate.trim().to_string();
     if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// If `input` is an `http(s)://host[:port]/path#fragment` URL, return
+/// the `scheme://host[:port]` base — everything before the path/fragment.
+/// Returns None when `input` is a bare hex/b64 fragment (no scheme).
+///
+/// Used by `bitmule recv` to infer the signaling server from the share
+/// URL, so the receiver doesn't have to also pass `--server` matching.
+fn extract_server_from_url(input: &str) -> Option<String> {
+    let s = input.trim();
+    let rest = if let Some(r) = s.strip_prefix("http://") {
+        ("http", r)
+    } else if let Some(r) = s.strip_prefix("https://") {
+        ("https", r)
+    } else {
+        return None;
+    };
+    let (scheme, tail) = rest;
+    // authority = up to the first '/' or '#' or end-of-string
+    let end = tail.find(|c: char| c == '/' || c == '#').unwrap_or(tail.len());
+    let authority = &tail[..end];
+    if authority.is_empty() { return None; }
+    Some(format!("{scheme}://{authority}"))
 }
 
 /// Stream `path` through SHA256 and fold in `bulk_key` to produce the
@@ -285,6 +317,21 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool)
 
     println!("session: {}", session_hex);
     println!("share:   {share_url}");
+    // Render the share URL as a terminal QR so a phone camera can
+    // pick it up without pasting. Fits in a standard 80-col shell
+    // for an 86-char b64 fragment at Dense1x2.
+    match QrCode::new(share_url.as_bytes()) {
+        Ok(qr) => {
+            let rendered = qr
+                .render::<unicode::Dense1x2>()
+                .dark_color(unicode::Dense1x2::Light)
+                .light_color(unicode::Dense1x2::Dark)
+                .quiet_zone(true)
+                .build();
+            println!("{rendered}");
+        }
+        Err(e) => eprintln!("(qr render skipped: {e})"),
+    }
     match (multi, mode) {
         (_, TransportMode::Relay) => {
             println!("mode:    relay only (legacy single-peer)");
