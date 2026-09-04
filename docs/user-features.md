@@ -16,6 +16,7 @@ Pro services (hosted uploads and hosted inbox) work identically across **all** p
 ## Privacy & Security
 
 - **End-to-end encryption, two layers.** Files are compressed, padded, and encrypted before they ever leave your device.
+- **Verified integrity** A shared link is tied to one file. It can't be modified later by anbody.
 - **The server never sees your key.** For direct P2P shares, the decryption key is derived from a piece of the link itself that never gets sent to any server — only someone with the full link can decrypt.
 - **Optional password protection.** Add a password for an extra layer on top of the link-based key. Since you're typically sharing with people you already know, if the wrong password is entered, just ask the sender to resend it — downloads start immediately rather than waiting on password verification, so you're not stuck waiting on a large transfer twice.
 - **Automatic metadata stripping.** Identifying metadata (e.g. photo EXIF data) is removed before encryption.
