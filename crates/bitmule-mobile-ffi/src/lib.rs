@@ -21,7 +21,7 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 
-use bitmule_client_native::{recv_file as native_recv, send_file_multi, TransportMode};
+use bitmule_client_native::{recv_file as native_recv, send_file_multi, send_file_relay, TransportMode};
 use bitmule_client_native::multipeer::ServeMode;
 use bitmule_crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
 
@@ -180,19 +180,65 @@ async fn recv_file_inner(
     let link = ShareLink::from_b64_url(&parsed.fragment)
         .map_err(|e| BitmuleError::InvalidFragment { reason: format!("{e:#}") })?;
     let out_dir_path = PathBuf::from(&out_dir);
-    let listener = on_progress.clone();
-    let outcome = native_recv(
-        &parsed.server,
-        link.share_key,
-        Some(link.signature),
-        &out_dir_path,
-        TransportMode::Webrtc,
-        move |received, total, name| {
-            listener.on_progress(received, total, name.to_string());
-        },
+
+    // WebRTC-first with relay fallback. WEBRTC_DEADLINE bounds the
+    // WebRTC attempt so a broken NAT / ICE-failure doesn't hang the
+    // caller forever — the web SPA has the same pattern via
+    // armFallbackTimer. On any WebRTC-side error OR the deadline
+    // firing without a DC-open, we re-open on the relay transport
+    // and re-run recv with the same share_key + signature. The relay
+    // path negotiates fresh crypto over the same WS/session_hex.
+    const WEBRTC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+    let listener_wr = on_progress.clone();
+    let webrtc_attempt = tokio::time::timeout(
+        WEBRTC_DEADLINE,
+        native_recv(
+            &parsed.server,
+            link.share_key.clone(),
+            Some(link.signature),
+            &out_dir_path,
+            TransportMode::Webrtc,
+            move |received, total, name| {
+                listener_wr.on_progress(received, total, name.to_string());
+            },
+        ),
     )
-    .await
-    .map_err(BitmuleError::from)?;
+    .await;
+    let outcome = match webrtc_attempt {
+        Ok(Ok(o)) => o,
+        Ok(Err(webrtc_err)) => {
+            tracing::warn!("recv webrtc failed ({webrtc_err:#}); falling back to relay");
+            let listener_relay = on_progress.clone();
+            native_recv(
+                &parsed.server,
+                link.share_key,
+                Some(link.signature),
+                &out_dir_path,
+                TransportMode::Relay,
+                move |received, total, name| {
+                    listener_relay.on_progress(received, total, name.to_string());
+                },
+            )
+            .await
+            .map_err(BitmuleError::from)?
+        }
+        Err(_) => {
+            tracing::warn!("recv webrtc DC did not open within {WEBRTC_DEADLINE:?}; falling back to relay");
+            let listener_relay = on_progress.clone();
+            native_recv(
+                &parsed.server,
+                link.share_key,
+                Some(link.signature),
+                &out_dir_path,
+                TransportMode::Relay,
+                move |received, total, name| {
+                    listener_relay.on_progress(received, total, name.to_string());
+                },
+            )
+            .await
+            .map_err(BitmuleError::from)?
+        }
+    };
 
     // If the sender flagged `container="zip-store"`, unpack it here
     // and hand the caller the directory. Extraction failure isn't
@@ -329,16 +375,73 @@ async fn send_file_inner(
     on_url.on_url(share_url.clone(), session_hex.clone(), file_name, file_size);
 
     let mode = if multi { ServeMode::Multi } else { ServeMode::Complete };
-    send_file_multi(
-        server.trim_end_matches('/'),
-        share_key,
-        bulk_key,
-        send_path,
-        container,
-        mode,
-    )
-    .await
-    .map_err(BitmuleError::from)?;
+    let server_trimmed = server.trim_end_matches('/').to_string();
+
+    // WebRTC-first with relay fallback in Complete mode. If WebRTC
+    // never completes (no peer connects, ICE fails, etc.) inside the
+    // deadline, republish the same session via the relay path — the
+    // share_key + bulk_key + signature are already committed on the
+    // URL the receiver holds, so re-sending as relay lands cleanly on
+    // whichever transport the receiver is currently attempting.
+    //
+    // Multi mode = server-keeps-URL-live-indefinitely, no deadline
+    // makes sense; we call send_file_multi directly and any failure
+    // surfaces to the caller. Live-URL sessions that need relay
+    // should be started explicitly by the caller with a --relay-mode
+    // FFI arg (not yet exposed; add when needed).
+    const WEBRTC_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+    if multi {
+        send_file_multi(
+            &server_trimmed,
+            share_key,
+            bulk_key,
+            send_path,
+            container,
+            mode,
+        )
+        .await
+        .map_err(BitmuleError::from)?;
+    } else {
+        let share_key_wr = share_key.clone();
+        let bulk_key_wr = bulk_key.clone();
+        let send_path_wr = send_path.clone();
+        let container_wr = container.clone();
+        let server_wr = server_trimmed.clone();
+        let webrtc_attempt = tokio::time::timeout(
+            WEBRTC_SEND_DEADLINE,
+            send_file_multi(&server_wr, share_key_wr, bulk_key_wr, send_path_wr, container_wr, mode),
+        )
+        .await;
+        match webrtc_attempt {
+            Ok(Ok(())) => { /* WebRTC succeeded */ }
+            Ok(Err(webrtc_err)) => {
+                tracing::warn!("send webrtc failed ({webrtc_err:#}); falling back to relay");
+                send_file_relay(
+                    &server_trimmed,
+                    share_key,
+                    bulk_key,
+                    &send_path,
+                    container.as_deref(),
+                    |_sent, _total| {},
+                )
+                .await
+                .map_err(BitmuleError::from)?;
+            }
+            Err(_) => {
+                tracing::warn!("send webrtc did not complete within {WEBRTC_SEND_DEADLINE:?}; falling back to relay");
+                send_file_relay(
+                    &server_trimmed,
+                    share_key,
+                    bulk_key,
+                    &send_path,
+                    container.as_deref(),
+                    |_sent, _total| {},
+                )
+                .await
+                .map_err(BitmuleError::from)?;
+            }
+        }
+    }
 
     Ok(SendOutcome {
         share_url,
