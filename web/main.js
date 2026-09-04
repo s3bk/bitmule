@@ -1076,17 +1076,51 @@ function startRecvSession(sessionHex, fragment) {
     keys: crypto ? keysHolder : undefined,
   });
 
-  // Relay-path receiver runs alongside the DC receiver. Whichever path
-  // delivers the file first wins; onFile fires exactly once.
+  // Relay-path receiver is created eagerly (cheap) but STAYS SILENT
+  // until we decide WebRTC has failed to open. Prevents the receiver
+  // from double-consuming a transfer that WebRTC would have handled
+  // and cuts unnecessary GETs against the relay server.
+  //
+  // WebRTC "opened" = onOpen fired. WebRTC "failed" = either the
+  // 8s wall-clock timer expires without DC-open, or pc's ICE state
+  // transitions to a terminal failure. Only in the failed branch do
+  // we start piping relay frames to relayRecv.
   const relayRecv = makeRelayReceiver(sessionHex, {
     onProgress: commonProgress,
     onFile: (n, b, s) => commonOnFile(n, b, s, "relay"),
   });
+  session.webrtcOk = false;
+  session.webrtcFailed = false;
+  session.relayArmed = false; // starts false; flipped when we commit to relay
+  // Pre-arm buffer for relay frames — captures meta_relay + any
+  // chunk_relay notifications the sender broadcasts before we've
+  // committed to the relay path. Replayed on arm so the receiver
+  // has the full picture; capped to avoid unbounded growth if the
+  // sender streams thousands of chunks pre-arm.
+  session.relayPrearmBuffer = [];
+  const RELAY_PREARM_CAP = 4096;
+  const armRelay = (reason) => {
+    if (session.relayArmed || recvSession !== session) return;
+    session.relayArmed = true;
+    session.webrtcFailed = true;
+    console.info(`relay armed (${reason}) — replaying ${session.relayPrearmBuffer.length} buffered frames`);
+    els.recvState.textContent = `WebRTC not usable (${reason}) — falling back to relay`;
+    for (const buffered of session.relayPrearmBuffer) {
+      try { relayRecv.onWsFrame(buffered); }
+      catch (e) { console.warn("relay replay failed:", e); }
+    }
+    session.relayPrearmBuffer = null;
+  };
+  const WEBRTC_TIMEOUT_MS = 8000;
+  setTimeout(() => {
+    if (!session.webrtcOk) armRelay(`no direct channel in ${WEBRTC_TIMEOUT_MS}ms`);
+  }, WEBRTC_TIMEOUT_MS);
 
   session.peer = createPeer({
     role: "receiver",
     ws,
     onOpen: (dc) => {
+      session.webrtcOk = true;
       els.recvState.textContent =
         "direct channel open — ready to receive";
       els.recvState.classList.add("transferring");
@@ -1095,6 +1129,13 @@ function startRecvSession(sessionHex, fragment) {
     onMessage: recvOnMessage,
     onState: (s) => {
       console.info("receiver pc state:", s);
+      // "dc-closed" comes from bindDataChannel; pc failure states
+      // (failed/disconnected) also trip relay arm. If WebRTC has
+      // already succeeded (webrtcOk) we ignore — the transfer is
+      // in flight over DC and we don't want relay double-processing.
+      if (!session.webrtcOk && (s === "failed" || s === "disconnected" || s === "dc-closed")) {
+        armRelay(`pc state: ${s}`);
+      }
     },
   });
 
@@ -1186,9 +1227,19 @@ function startRecvSession(sessionHex, fragment) {
       }
       return;
     }
-    // Relay-path fallback frames from the sender.
+    // Relay-path fallback frames from the sender. Gated on
+    // session.relayArmed — until WebRTC has explicitly failed (or the
+    // 8s no-open timeout elapsed), we buffer these instead of piping
+    // to keep the receiver from double-processing a transfer the
+    // direct channel will handle. On arm, the buffer replays into
+    // relayRecv so meta_relay + chunk_relay notifications from before
+    // the arm decision aren't lost.
     if (frame.type === "meta_relay" || frame.type === "chunk_relay" || frame.type === "relay_done") {
-      relayRecv.onWsFrame(frame);
+      if (session.relayArmed) {
+        relayRecv.onWsFrame(frame);
+      } else if (session.relayPrearmBuffer && session.relayPrearmBuffer.length < RELAY_PREARM_CAP) {
+        session.relayPrearmBuffer.push(frame);
+      }
     }
   });
 
