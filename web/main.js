@@ -1192,7 +1192,9 @@ async function sendMetaAndChunksForPeer(session, peer) {
     const willEndLoopAfterThis = (end === file.size);
     const expectedChunks = Math.ceil(file.size / chunkBytes);
     if (idx < 3 || idx % 25 === 0 || willEndLoopAfterThis || idx >= expectedChunks - 3) {
-      console.info(`[send] dc.send idx=${idx} plain_len=${plain.length} ct_len=${ct.length} offset_after=${end}/${file.size}`);
+      const prefixHex = Array.from(ct.slice(0, 8)).map(b => b.toString(16).padStart(2, "0")).join("");
+      const tailHex = Array.from(ct.slice(-8)).map(b => b.toString(16).padStart(2, "0")).join("");
+      console.info(`[send] dc.send idx=${idx} plain_len=${plain.length} ct_len=${ct.length} ct_head=${prefixHex} ct_tail=${tailHex} offset_after=${end}/${file.size}`);
     }
     offset = end;
     idx++;
