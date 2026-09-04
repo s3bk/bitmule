@@ -130,6 +130,9 @@ const els = {
   sessionLink: document.getElementById("session-link"),
   sessionQr: document.getElementById("session-qr"),
   sessionState: document.getElementById("session-state"),
+  stopAfterFirst: document.getElementById("stop-after-first"),
+  sessionActiveCount: document.getElementById("session-active-count"),
+  sessionTotalCount: document.getElementById("session-total-count"),
   copyBtn: document.getElementById("copy-link"),
   cancelBtn: document.getElementById("cancel-session"),
   requestFilesBtn: document.getElementById("request-files-btn"),
@@ -741,14 +744,41 @@ function closeSendSession() {
   }
 }
 
-function startSendSession(files) {
+async function startSendSession(files) {
   closeSendSession();
   renderQueue(files);
 
-  const sessionHex = randomHex32();
-  const link = `${serverHttpBase(CONFIG.server)}/#${sessionHex}`;
+  // AEAD-only send flow (per Seb 2026-09-04 "no plaintext path"):
+  // mint ShareKey + BulkKey, stream-hash the file with BulkKey for the
+  // URL commitment, build a ShareLink (base64url) URL. Same shape as
+  // the CLI `bitmule send` URL.
+  if (!window.bitmule || !window.bitmule.ShareKey) {
+    els.sessionState.textContent = "wasm not loaded — refresh and retry";
+    return;
+  }
+  const file = files && files[0];
+  if (!file) return;
 
-  const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHex}`;
+  els.sessionState.textContent = "computing file commitment…";
+  const shareKey = new window.bitmule.ShareKey();
+  const bulkKey = new window.bitmule.BulkKey();
+  const sessionHexRaw = shareKey.sessionIdHex();
+  const sessionIdBytes = hexDecode(sessionHexRaw);
+  // Stream-hash the file via CommitmentHasher (SHA256 || bulk_key).
+  // Load-and-hash in 64 KiB slices so a 5 GB file doesn't need to fit
+  // in memory. Actual send below will re-stream from the same File.
+  const hasher = new window.bitmule.CommitmentHasher();
+  const HASH_CHUNK = 64 * 1024;
+  for (let off = 0; off < file.size; off += HASH_CHUNK) {
+    const slice = await file.slice(off, off + HASH_CHUNK).arrayBuffer();
+    hasher.update(new Uint8Array(slice));
+  }
+  const signature = hasher.finalize(bulkKey);
+  const link = `${serverHttpBase(CONFIG.server)}/#${b64UrlEncode(
+    concatBytes(hexDecode(shareKey.toHex()), signature)
+  )}`;
+
+  const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHexRaw}`;
   let ws;
   try {
     ws = new WebSocket(wsUrl);
@@ -757,9 +787,20 @@ function startSendSession(files) {
     return;
   }
 
-  const session = { sessionHex, link, ws, files, peer: null };
+  const session = {
+    sessionHex: sessionHexRaw, link, ws, files, peer: null,
+    // Modern crypto material — cheap to share across all peer tasks.
+    shareKey, bulkKey, sessionIdBytes,
+    // Multipeer state: map from receiver_id (envelope from_receiver_id)
+    // to per-peer { pc, dc, ephemeral, wrapKey, metaKey, chunkIdx,
+    // metaSent, complete }.
+    peers: new Map(),
+    activeCount: 0,
+    totalCount: 0,
+  };
   sendSession = session;
   showSessionPanel(link);
+  updateSendCounters();
 
   // Send-side WebRTC-first, relay-fallback. Symmetric to the recv
   // side: NO timeout, NO fallback until we have positive evidence
@@ -830,96 +871,33 @@ function startSendSession(files) {
       return;
     }
 
-    // The receiver's peer_hello is the trigger to spin up WebRTC and
-    // send an SDP offer. Subsequent sdp/ice frames flow through the peer.
-    if (frame.type === "peer_hello") {
+    // Multipeer AEAD send: each receiver's peer_hello spawns its own
+    // per-peer state (fresh RTCPeerConnection + fresh Ephemeral +
+    // eventual wrapKey/metaKey/DC). Frames sdp / ice / kex_pub carry
+    // envelope from_receiver_id — route them to the right per-peer
+    // entry. The server sends peer_hello with role:"receiver" AND
+    // from_receiver_id at the envelope level after the M2b patches.
+    const fromId = frame.from_receiver_id || frame.receiver_id || null;
+    if (frame.type === "peer_hello" && frame.role !== "sender") {
       session.receiverPresent = true;
-      els.sessionState.textContent =
-        "receiver joined — negotiating direct connection…";
-      els.sessionState.classList.add("transferring");
-      if (!session.peer) {
-        session.peer = createPeer({
-          role: "sender",
-          ws,
-          onOpen: async (dc) => {
-            session.dcOpen = true;
-            // If the relay-upload path had already started, don't also
-            // stream via DC — the receiver's already picking up chunks
-            // from the relay and would end up with duplicates.
-            if (session.relayStarted) {
-              console.info("DC opened after relay-upload started; skipping DC file stream");
-              return;
-            }
-            const file = session.files && session.files[0];
-            if (!file) {
-              els.sessionState.textContent = "direct channel open (no file queued)";
-              return;
-            }
-            // Debug interrupt: one-shot per session. The URL flag
-            // ?debug=interrupt is consumed at boot (URL cleaned +
-            // localStorage armed); here the sender consumes the arm
-            // exactly once per file, so a subsequent send/resume never
-            // re-interrupts.
-            const opts = { onProgress: (sent, total) => {
-              if (sendSession !== session) return;
-              const pct = total > 0 ? Math.floor((sent / total) * 100) : 0;
-              els.sessionState.textContent =
-                `sending ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
-            }};
-            try {
-              if (localStorage.getItem("bitmule.debug.interrupt") === "1") {
-                localStorage.removeItem("bitmule.debug.interrupt");
-                opts.interruptAt = Math.random() * file.size;
-                console.info(
-                  "debug=interrupt armed; will abort at byte offset ~",
-                  Math.floor(opts.interruptAt),
-                  "of",
-                  file.size
-                );
-              }
-            } catch {}
-            els.sessionState.textContent = `sending ${file.name}: 0%`;
-            try {
-              await sendFileOverDC(dc, file, opts);
-              els.sessionState.textContent = `sent ${file.name} (${fmtSize(file.size)})`;
-              document.body.dataset.transferStatus = 'complete';
-              // Flip the cancel button into a "Send another" affordance —
-              // same click handler tears the session down and returns
-              // the drop-zone.
-              els.cancelBtn.textContent = "Send another";
-              els.cancelBtn.classList.add("done");
-            } catch (err) {
-              els.sessionState.textContent = `send failed: ${err.message}`;
-            }
-          },
-          onMessage: (data) => {
-            console.info("dc message from receiver:", data);
-          },
-          onState: (s) => {
-            console.info("sender pc state:", s);
-            // ICE `failed` is the terminal spec state — retry is
-            // not possible from here. Only kick relay upload if a
-            // receiver is present AND the DC hasn't opened yet.
-            if (!session.dcOpen && session.receiverPresent && s === "failed") {
-              startRelayUpload(`ICE state: ${s}`);
-            }
-          },
-        });
-        try {
-          await session.peer.startOffer();
-        } catch (e) {
-          els.sessionState.textContent = `offer failed: ${e.message}`;
-        }
+      if (fromId && !session.peers.has(fromId)) {
+        startPeerForReceiver(session, fromId);
       }
       return;
     }
-
-    if (session.peer && (frame.type === "sdp" || frame.type === "ice")) {
+    if (frame.type === "sdp" || frame.type === "ice" || frame.type === "kex_pub") {
+      const peer = fromId ? session.peers.get(fromId) : null;
+      if (!peer) return;
       try {
-        await session.peer.handleFrame(frame);
+        if (frame.type === "kex_pub") {
+          await peer.handleKexPub(frame);
+        } else {
+          await peer.wrpc.handleFrame(frame);
+        }
       } catch (e) {
-        console.warn("sender handleFrame:", e);
+        console.warn(`sender handleFrame for ${fromId}:`, e);
       }
+      return;
     }
   });
 
@@ -933,6 +911,225 @@ function startSendSession(files) {
     if (sendSession !== session) return;
     els.sessionState.textContent = "server unreachable";
   });
+}
+
+// Concatenate two byte arrays (Uint8Array or ArrayBuffer) into one.
+function concatBytes(a, b) {
+  const aa = a instanceof Uint8Array ? a : new Uint8Array(a);
+  const bb = b instanceof Uint8Array ? b : new Uint8Array(b);
+  const out = new Uint8Array(aa.length + bb.length);
+  out.set(aa, 0);
+  out.set(bb, aa.length);
+  return out;
+}
+
+// Base64url (no padding) encode a byte array — matches
+// bitmule_crypto::ShareLink::to_b64_url on the native side.
+function b64UrlEncode(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let bin = "";
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function updateSendCounters() {
+  if (!sendSession) return;
+  if (els.sessionActiveCount) els.sessionActiveCount.textContent = String(sendSession.activeCount);
+  if (els.sessionTotalCount) els.sessionTotalCount.textContent = String(sendSession.totalCount);
+}
+
+// Spawn a per-receiver peer task. Called on peer_hello with a fresh
+// from_receiver_id. Owns its own RTCPeerConnection + Ephemeral + DC.
+// Handles the full modern wire: KEX over WS → key_wrap → meta_enc
+// → AEAD chunks → recv_done/done_ack.
+function startPeerForReceiver(session, receiverId) {
+  session.totalCount++;
+  session.activeCount++;
+  updateSendCounters();
+  els.sessionState.textContent = `receiver joined (${receiverId.slice(0,8)}…) — negotiating`;
+  els.sessionState.classList.add("transferring");
+
+  const peer = {
+    receiverId,
+    wrapKey: null,
+    metaKey: null,
+    chunkIdx: 0,
+    metaSent: false,
+    complete: false,
+    dc: null,
+  };
+
+  // Fresh ephemeral X25519 keypair for THIS peer's KEX.
+  peer.ephemeral = new window.bitmule.Ephemeral();
+
+  peer.wrpc = createPeer({
+    role: "sender",
+    ws: session.ws,
+    onOpen: async (dc) => {
+      peer.dc = dc;
+      // If KEX hasn't completed yet, defer meta_enc until it does.
+      if (peer.wrapKey && peer.metaKey && !peer.metaSent) {
+        await sendMetaAndChunksForPeer(session, peer);
+      }
+    },
+    onMessage: (data) => {
+      // Receiver's DC messages arrive here. In the AEAD wire, they're
+      // JSON control frames: `request_ranges`, `recv_done`. We ignore
+      // request_ranges (we already stream the whole file); we care
+      // about recv_done → send done_ack + close.
+      if (typeof data !== "string") return;
+      let f;
+      try { f = JSON.parse(data); } catch { return; }
+      if (f.type === "recv_done") {
+        try { peer.dc && peer.dc.send(JSON.stringify({ type: "done_ack" })); }
+        catch (e) { console.warn("done_ack send failed:", e); }
+        peer.complete = true;
+        session.activeCount = Math.max(0, session.activeCount - 1);
+        updateSendCounters();
+        try { peer.wrpc.close(); } catch {}
+        session.peers.delete(peer.receiverId);
+        // Stop-after-first toggle: if on, tear down the whole session
+        // once the first peer completes (mirrors CLI Complete mode).
+        if (els.stopAfterFirst && els.stopAfterFirst.checked) {
+          els.sessionState.textContent = "delivered to first receiver — session closed (stop-after-first on)";
+          closeSendSession();
+        } else {
+          els.sessionState.textContent =
+            `delivered to ${session.totalCount - session.activeCount} · active ${session.activeCount}`;
+        }
+      }
+    },
+    onState: (s) => {
+      if (s === "pc:failed") {
+        console.warn(`peer ${peer.receiverId.slice(0,8)}… failed`);
+        if (!peer.complete) {
+          session.activeCount = Math.max(0, session.activeCount - 1);
+          updateSendCounters();
+          session.peers.delete(peer.receiverId);
+        }
+      }
+    },
+  });
+
+  // Ship our own KexPub immediately, concurrent with SDP exchange.
+  const pubBytes = peer.ephemeral.publicBytes();
+  const macBytes = session.shareKey.macEphemeralPub(pubBytes);
+  wsSendFromSender(session.ws, {
+    type: "kex_pub",
+    pub_hex: hexEncode(pubBytes),
+    mac_hex: hexEncode(macBytes),
+  }, receiverId);
+
+  // Handler for the receiver's KexPub arriving via WS. Verifies MAC,
+  // derives wrap_key + meta_key, wraps bulk_key + ships key_wrap.
+  peer.handleKexPub = async (frame) => {
+    if (peer.wrapKey) return; // idempotent
+    const peerPub = hexDecode(frame.pub_hex);
+    const peerMac = hexDecode(frame.mac_hex);
+    if (!peerPub || !peerMac) { console.warn("kex_pub: bad hex"); return; }
+    const expectedMac = session.shareKey.macEphemeralPub(peerPub);
+    let diff = 0;
+    for (let i = 0; i < 32; i++) diff |= (expectedMac[i] ^ peerMac[i]);
+    if (diff !== 0) {
+      console.warn(`kex_pub MAC verify failed for peer ${peer.receiverId.slice(0,8)}`);
+      return;
+    }
+    const sk = peer.ephemeral.deriveSharedSecret(peerPub);
+    peer.wrapKey = sk.wrapKey(session.sessionIdBytes);
+    peer.metaKey = sk.metaKey(session.sessionIdBytes);
+    // Wrap the shared bulk_key under this peer's wrap_key + ship
+    // key_wrap over WS so the receiver can decrypt subsequent chunks.
+    const wrapped = peer.wrapKey.wrapBulkKey(session.bulkKey);
+    wsSendFromSender(session.ws, {
+      type: "key_wrap",
+      nonce_hex: hexEncode(wrapped.nonce),
+      enc_b_hex: hexEncode(wrapped.ct),
+    }, peer.receiverId);
+    // If DC opened before KEX finished, fire meta_enc + chunks now.
+    if (peer.dc && !peer.metaSent) {
+      await sendMetaAndChunksForPeer(session, peer);
+    }
+  };
+
+  // Kick off the SDP offer. createPeer's startOffer handles createOffer
+  // + setLocalDescription + ws.send. Offer/answer + ICE will flow
+  // through wrpc.handleFrame, and DC-open fires onOpen above.
+  peer.wrpc.startOffer().catch((e) => {
+    console.warn(`startOffer for ${peer.receiverId.slice(0,8)} failed:`, e);
+  });
+
+  session.peers.set(receiverId, peer);
+}
+
+// Send a sender-originated frame with envelope `to_receiver_id`
+// so the server's per-peer router dispatches it correctly.
+function wsSendFromSender(ws, obj, toReceiverId) {
+  const withEnv = Object.assign({}, obj, { to_receiver_id: toReceiverId });
+  try { ws.send(JSON.stringify(withEnv)); } catch (e) {
+    console.warn("ws send failed:", e);
+  }
+}
+
+// Per-peer meta_enc + AEAD chunk stream. Requires peer.dc open and
+// peer.metaKey/bulkKey ready. Idempotent via peer.metaSent flag.
+async function sendMetaAndChunksForPeer(session, peer) {
+  if (peer.metaSent) return;
+  const file = session.files && session.files[0];
+  if (!file || !peer.dc) return;
+  const chunkBytes = 16 * 1024;
+  const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / chunkBytes);
+  // Build MetaFrame JSON, AEAD-encrypt via metaKey with sessionIdBytes AAD.
+  const metaPlain = JSON.stringify({
+    type: "meta", name: file.name, size: file.size,
+    chunkBytes, totalChunks,
+  });
+  const metaEnc = peer.metaKey.encryptMeta(
+    session.sessionIdBytes,
+    new TextEncoder().encode(metaPlain),
+  );
+  peer.dc.send(JSON.stringify({
+    type: "meta_enc",
+    nonce_hex: hexEncode(metaEnc.nonce),
+    ct_hex: hexEncode(metaEnc.ct),
+  }));
+  peer.metaSent = true;
+
+  // Stream file: slice → encryptChunk(idx, plain) → dc.send(binary).
+  // Simple backpressure via bufferedAmount vs 4 MiB high-water.
+  const HIGH = 4 * 1024 * 1024;
+  const LOW  = 1 * 1024 * 1024;
+  const awaitDrain = () => new Promise((resolve) => {
+    const check = () => {
+      if (peer.dc.bufferedAmount <= LOW) { peer.dc.removeEventListener("bufferedamountlow", check); resolve(); }
+    };
+    peer.dc.bufferedAmountLowThreshold = LOW;
+    peer.dc.addEventListener("bufferedamountlow", check);
+  });
+
+  let offset = 0;
+  let idx = 0;
+  while (offset < file.size) {
+    if (session.peers.get(peer.receiverId) !== peer) return; // torn down
+    const end = Math.min(offset + chunkBytes, file.size);
+    const plain = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+    const ct = session.bulkKey.encryptChunk(BigInt(idx), plain);
+    while (peer.dc.bufferedAmount > HIGH) await awaitDrain();
+    peer.dc.send(ct);
+    offset = end;
+    idx++;
+    // Live progress in the shared session-state line (single-peer
+    // view; per-peer progress would need extra UI). Coalesces via
+    // the counters block for the multipeer story.
+    if (idx % 16 === 0) {
+      const pct = Math.floor((offset / file.size) * 100);
+      els.sessionState.textContent =
+        `sending to ${peer.receiverId.slice(0,8)}… ${pct}% (${fmtSize(offset)} / ${fmtSize(file.size)})`;
+    }
+  }
+  peer.chunkIdx = idx;
+  // Chunks done. Receiver will send recv_done on its side once it's
+  // decrypted everything, and our onMessage handler above ships
+  // done_ack + closes the peer.
 }
 
 // send-mode DOM wiring

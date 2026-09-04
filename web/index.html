@@ -64,6 +64,17 @@
           <div id="session-state" class="session-state">
             waiting for receiver…
           </div>
+          <div class="session-controls">
+            <label class="session-toggle">
+              <input id="stop-after-first" type="checkbox" />
+              stop after first complete download
+            </label>
+            <div id="session-counters" class="session-counters" aria-live="polite">
+              Active: <span id="session-active-count">0</span>
+              &nbsp;·&nbsp;
+              Total: <span id="session-total-count">0</span>
+            </div>
+          </div>
           <button id="cancel-session" class="cancel-btn" type="button">
             Cancel
           </button>
