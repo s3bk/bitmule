@@ -52,13 +52,15 @@ interface BitmuleError {
 // Progress callbacks fire from a background tokio task; the mobile
 // shell must marshal them onto the UI thread. Kotlin: Coroutine on
 // Dispatchers.Main. Swift: DispatchQueue.main.async.
-callback interface ProgressListener {
-  void on_progress(u64 received, u64 total, string name);
+[Trait, WithForeign]
+interface ProgressListener {
+    void on_progress(u64 sent, u64 total, string name);
 };
 
 // Fires once, as soon as the share URL is minted (before transfer
 // starts). Same marshaling contract as ProgressListener.
-callback interface UrlListener {
+[Trait, WithForeign]
+interface UrlListener {
   void on_url(string url, string session_hex, string file_name, u64 file_size);
 };
 

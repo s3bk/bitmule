@@ -29,12 +29,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "io-u
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-uniffi = { version = "0.28", features = ["tokio"] }
+uniffi = { version = "0.32", features = ["tokio"] }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+uniffi = { version = "0.32", features = ["build"] }
 
 [features]
 default = []

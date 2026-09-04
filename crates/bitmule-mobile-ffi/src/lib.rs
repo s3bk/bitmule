@@ -16,6 +16,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::fmt::Debug;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
@@ -88,11 +89,13 @@ pub struct SendOutcome {
     pub peers_served: u64,
 }
 
-pub trait ProgressListener: Send + Sync {
+#[uniffi::trait_interface]
+pub trait ProgressListener: Send + Sync + Debug {
     fn on_progress(&self, received: u64, total: u64, name: String);
 }
 
-pub trait UrlListener: Send + Sync {
+#[uniffi::trait_interface]
+pub trait UrlListener: Send + Sync + Debug {
     fn on_url(&self, url: String, session_hex: String, file_name: String, file_size: u64);
 }
 
