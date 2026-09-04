@@ -17,7 +17,7 @@ mod identity;
 #[command(name = "bitmule", version, about, long_about = None)]
 struct Cli {
     /// Signaling+relay server URL.
-    #[arg(long, default_value = "http://localhost:8443")]
+    #[arg(long, default_value = "https://bitmule.qdat.net")]
     server: String,
 
     #[command(subcommand)]
