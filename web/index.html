@@ -222,6 +222,15 @@
           <span id="server-status" class="status-value pending">connecting…</span>
         </div>
       </section>
+      <!-- On-screen debug log for iOS Safari, which has no accessible
+           dev console without a Mac tether. Toggle via the summary
+           element; last ~60 lines from main.js's `dlog()` land here. -->
+      <section id="debug" class="debug" aria-live="polite">
+        <details>
+          <summary class="debug-summary">Debug log</summary>
+          <pre id="debug-log" class="debug-log"></pre>
+        </details>
+      </section>
     </main>
     <script src="./vendor/qrcode.js"></script>
     <script type="module" src="./main.js"></script>

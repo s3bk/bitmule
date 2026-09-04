@@ -120,6 +120,7 @@ const els = {
   recvMode: document.getElementById("receive-mode"),
   requestMode: document.getElementById("request-mode"),
   invitedSendMode: document.getElementById("invited-send-mode"),
+  debugLog: document.getElementById("debug-log"),
 
   // send
   dropzone: document.getElementById("dropzone"),
@@ -201,6 +202,26 @@ function renderQrInto(el, text) {
 
 function renderQr(text) { renderQrInto(els.sessionQr, text); }
 
+// On-screen debug log for iOS Safari, which has no accessible console
+// without a Mac tether. Keeps the last N lines in a <pre> the user can
+// expand from the "Debug log" details block; also mirrors to
+// console.log so desktop DevTools shows the same stream.
+const DLOG_MAX_LINES = 200;
+const dlogBuf = [];
+function dlog(...parts) {
+  const ts = new Date().toISOString().slice(11, 23);
+  const line = `${ts}  ${parts.map((p) =>
+    typeof p === "string" ? p : (() => { try { return JSON.stringify(p); } catch { return String(p); } })()
+  ).join(" ")}`;
+  dlogBuf.push(line);
+  if (dlogBuf.length > DLOG_MAX_LINES) dlogBuf.splice(0, dlogBuf.length - DLOG_MAX_LINES);
+  if (els.debugLog) {
+    els.debugLog.textContent = dlogBuf.join("\n");
+    els.debugLog.scrollTop = els.debugLog.scrollHeight;
+  }
+  try { console.log("[dlog]", ...parts); } catch {}
+}
+
 // ---- WebRTC signaling adapter ------------------------------------------
 //
 // Shared by both roles. Wraps an RTCPeerConnection and speaks four frame
@@ -217,7 +238,8 @@ function createPeer({ role, ws, onOpen, onMessage, onState }) {
   // Debug output for the DTLS/ICE cross-side diagnosis (2026-09-02, Seb).
   // Every ICE state, DTLS state, and signaling state gets logged with
   // enough context to correlate against the native side's log lines.
-  const dbg = (...args) => console.log(`[bitmule ${role}]`, ...args);
+  // Also mirrored to on-screen dlog() for iOS Safari (no dev console).
+  const dbg = (...args) => { console.log(`[bitmule ${role}]`, ...args); dlog(`[${role}]`, ...args); };
   pc.addEventListener("iceconnectionstatechange", () =>
     dbg("iceConnectionState =>", pc.iceConnectionState));
   pc.addEventListener("icegatheringstatechange", () =>
@@ -858,6 +880,7 @@ async function startSendSession(files) {
   };
 
   ws.addEventListener("open", () => {
+    dlog("[ws] open, sending hello role=sender wire_version=2");
     ws.send(JSON.stringify({ type: "hello", role: "sender", wire_version: 2 }));
     // Idle text — waits for a receiver. No fallback timer.
     els.sessionState.textContent = "waiting for receiver…";
@@ -871,6 +894,7 @@ async function startSendSession(files) {
     } catch {
       return;
     }
+    if (frame && frame.type) dlog(`[ws→sender] frame type=${frame.type}${frame.role ? " role=" + frame.role : ""}${frame.from_receiver_id ? " from=" + String(frame.from_receiver_id).slice(0,8) : ""}`);
 
     // Server-side notification that a new receiver joined mid-session.
     // If we've already started a relay upload, catch the newcomer up by
@@ -932,13 +956,15 @@ async function startSendSession(files) {
     }
   });
 
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (ev) => {
+    dlog(`[ws] close code=${ev.code} reason=${ev.reason || "(none)"}`);
     if (sendSession !== session) return;
     if (!els.sessionState.classList.contains("transferring")) {
       els.sessionState.textContent = "socket closed — cancel to send another";
     }
   });
   ws.addEventListener("error", () => {
+    dlog("[ws] error event");
     if (sendSession !== session) return;
     els.sessionState.textContent = "server unreachable";
   });
@@ -1011,6 +1037,7 @@ function startPeerForReceiver(session, receiverId) {
   session.totalCount++;
   session.activeCount++;
   updateSendCounters();
+  dlog(`[peer] start for receiver ${receiverId.slice(0,8)}, active=${session.activeCount} total=${session.totalCount}`);
   els.sessionState.textContent = `receiver joined (${receiverId.slice(0,8)}…) — negotiating`;
   els.sessionState.classList.add("transferring");
 

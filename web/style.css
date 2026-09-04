@@ -293,3 +293,31 @@ font-size: 32px;
   color: #0a0d14;
   border-color: var(--accent-2);
 }
+
+.debug {
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--fg-dim, #888);
+}
+.debug-summary {
+  cursor: pointer;
+  padding: 4px 0;
+  user-select: none;
+}
+.debug-log {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--fg-dim, #aaa);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.35;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-x: auto;
+  white-space: pre;
+  word-wrap: normal;
+  -webkit-overflow-scrolling: touch;
+}
