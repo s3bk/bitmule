@@ -23,7 +23,7 @@
 //! - M2b-7: receiver-side request_ranges + persistence for reconnect.
 //! - M2b-8: unify --complete / --multi behind ServeMode; relay-path adapt.
 
-use crate::crypto::BulkKey;
+use crate::crypto::{BulkKey, MetaKey, ShareKey, WrapKey};
 use crate::str0m_client::parse_ws_frame_with_from_id;
 use crate::{SignalFrame, Ws};
 use anyhow::{anyhow, Result};
@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use str0m::{channel::ChannelId, Rtc};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -246,5 +247,79 @@ pub(crate) fn ws_enqueue_targeted(
     let text = serde_json::to_string(&v).map_err(|e| anyhow!("frame reencode: {e}"))?;
     outbox_tx.send(Message::Text(text.into())).map_err(|e| anyhow!("outbox closed: {e}"))?;
     Ok(())
+}
+
+// -------------------------------------------------------------------
+// M2b-5: sender-side shared state + per-peer task spawn on peer_hello.
+//
+// Scope of this slice (per docs/multipeer.md line 21):
+//   - Type definitions: SenderShared, PeerSession.
+//   - Per-peer task-spawn entry: `spawn_peer_task` (in str0m_client.rs
+//     where the private handshake helpers live).
+//   - Long-lived orchestrator entry: `send_serve` (in str0m_client.rs).
+//
+// Explicitly NOT in this slice:
+//   - Block-serve loop / request_ranges wire (M2b-6).
+//   - Receiver-side request_ranges + persistence (M2b-7).
+//   - cmd_send wiring to send_serve; --multi CLI flag (M2b-8).
+//
+// The single-peer `send_connect` path stays untouched — send_serve runs
+// alongside as a parallel entry so we don't destabilize the working
+// wire-transport while multipeer scaffolds up.
+// -------------------------------------------------------------------
+
+/// Sender-side state that every per-peer task needs read-only access to.
+/// Cheap-cloned into each PeerSession as `Arc<SenderShared>`.
+///
+/// `bulk_key` is the SAME B for every peer — URL commitment binds one B
+/// per file. `share_key` stays live so per-peer KEX MAC verification
+/// can call `share_key.mac_ephemeral_pub`. `session_id_bytes` is derived
+/// once from the session hex and reused for HKDF salting.
+#[allow(dead_code)]
+pub struct SenderShared {
+    pub share_key: ShareKey,
+    pub bulk_key: BulkKey,
+    pub session_id_bytes: [u8; 32],
+    pub wire_version: u32,
+}
+
+/// Per-peer serving state. Owned by the per-peer task's async block —
+/// constructed inside `spawn_peer_task` and filled in as the handshake
+/// progresses (wrap_key + meta_key land after KEX; the block-serve loop
+/// in M2b-6 will consume the whole struct).
+///
+/// M2b-5 uses these fields inline in the task body; the struct exists
+/// now so M2b-6's block-serve refactor doesn't need to touch types.
+#[allow(dead_code)]
+pub struct PeerSession {
+    pub receiver_id: ReceiverId,
+    pub rtc: Rtc,
+    pub channel_id: ChannelId,
+    /// Filled after KEX completes; None before the peer's KexPub lands.
+    pub wrap_key: Option<WrapKey>,
+    pub meta_key: Option<MetaKey>,
+    pub covered: Arc<Mutex<HashSet<u64>>>,
+    pub shared: Arc<SenderShared>,
+}
+
+/// Handle returned by `send_serve` — long-lived orchestrator over the
+/// sender-side multipeer stack. Holds the shared WS router+writer, the
+/// per-peer task map, and the shared SocketPool alive for the run.
+///
+/// M2b-5: fields wired but no consumer yet (cmd_send stays on
+/// send_connect). M2b-6+ will drive the orchestrator from cmd_send and
+/// exercise the --complete exit predicate over `peers`.
+#[allow(dead_code)]
+pub struct SenderOrchestrator {
+    pub shared: Arc<SenderShared>,
+    pub peers: Arc<Mutex<HashMap<String, PeerHandle>>>,
+    /// Held so the WS reader half stays owned by the router task.
+    /// `pub(crate)` — WsRouterHandle is internal plumbing.
+    pub(crate) router: WsRouterHandle,
+    /// Held so per-peer tasks can enqueue outbound frames.
+    pub(crate) writer: WsWriterHandle,
+    /// Orchestrator loop task — reads unrouted (peer_hello) frames and
+    /// spawns per-peer tasks. Exits on WS close.
+    pub loop_task: tokio::task::JoinHandle<Result<()>>,
 }
 

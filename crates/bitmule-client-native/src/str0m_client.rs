@@ -25,7 +25,7 @@ use str0m::{
     net::{Protocol, Receive},
     Candidate, Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, sync::mpsc};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, sync::broadcast};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
@@ -37,6 +37,12 @@ use crate::crypto::{BulkKey, Ephemeral, MetaKey, ShareKey, WrapKey};
 /// agent tracks known local candidates by their bound address, so we
 /// need per-interface accuracy on the destination field or it drops
 /// the packet as "unknown interface" (observed 2026-09-02 on Seb's box).
+///
+/// `Clone` for the M2b-5 broadcast-fanout path: each subscribed per-peer
+/// Rtc gets its own copy and runs `Rtc::accepts()` locally to drop or
+/// consume. Cost is one Vec<u8> clone per peer per packet; bytes are
+/// ≤4 KiB and N is few tens of peers, so fine — see docs/multipeer.md §5.
+#[derive(Clone)]
 pub struct PoolRecv {
     pub bytes: Vec<u8>,
     pub source: SocketAddr,
@@ -44,22 +50,59 @@ pub struct PoolRecv {
 }
 
 /// One UdpSocket per host-candidate interface, all bound to the SAME
-/// port. Recv is fan-in via a shared mpsc — per-socket recv-loop tasks
-/// forward every packet with the destination correctly set to the bound
-/// address of the socket that received it. Send routes by source IP:
-/// str0m's Transmit outputs carry `source: SocketAddr` and we dispatch
-/// to the matching socket so the outbound src-address matches the local
-/// candidate str0m thinks it's using.
+/// port. Recv is fan-in via a shared broadcast channel — per-socket
+/// recv-loop tasks forward every packet with the destination correctly
+/// set to the bound address of the socket that received it. Send routes
+/// by source IP: str0m's Transmit outputs carry `source: SocketAddr` and
+/// we dispatch to the matching socket so the outbound src-address matches
+/// the local candidate str0m thinks it's using.
+///
+/// M2b-5: fan-in is `tokio::sync::broadcast` (not mpsc) so multiple
+/// per-peer Rtcs can each subscribe and run `Rtc::accepts()` locally.
+/// Legacy single-consumer callers (`send_connect`, `recv_connect`) use
+/// the pre-subscribed `recv_rx` via `SocketPool::recv()` — same shape
+/// as before, with a Lagged-drop warning inserted since broadcast is
+/// bounded (mpsc was unbounded).
 pub struct SocketPool {
     sockets: HashMap<IpAddr, Arc<UdpSocket>>,
-    recv_rx: mpsc::UnboundedReceiver<PoolRecv>,
+    /// Held so late subscribers via `subscribe()` still get a live channel;
+    /// dropping this closes the broadcast for every receiver.
+    recv_tx: broadcast::Sender<PoolRecv>,
+    /// Pre-subscribed receiver for the legacy single-consumer `recv()` path.
+    recv_rx: broadcast::Receiver<PoolRecv>,
     _recv_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Broadcast capacity for pool packets (packet count, not bytes).
+/// 1024 gives generous headroom vs a slow subscriber blocking str0m's
+/// send_addr timing; a Lagged consumer just skips forward + logs, and
+/// str0m's DTLS/SCTP retransmit handles the missing packet.
+const POOL_BROADCAST_CAP: usize = 1024;
+
 impl SocketPool {
-    /// Async recv over ALL sockets in the pool via the shared mpsc.
+    /// Async recv on the pre-subscribed receiver — single-consumer callers
+    /// use this (send_connect, recv_connect legacy path). Lagged errors
+    /// log + continue; Closed returns None (same shape as the old mpsc).
     pub async fn recv(&mut self) -> Option<PoolRecv> {
-        self.recv_rx.recv().await
+        use broadcast::error::RecvError;
+        loop {
+            match self.recv_rx.recv().await {
+                Ok(pr) => return Some(pr),
+                Err(RecvError::Lagged(n)) => {
+                    warn!("pool.recv lagged: dropped {n} packets (single-consumer)");
+                    continue;
+                }
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// Fresh subscriber for M2b-5 per-peer Rtcs. Each peer task gets its
+    /// own `broadcast::Receiver<PoolRecv>` + runs `Rtc::accepts()` locally
+    /// to drop or consume. See `docs/multipeer.md` §"Startup + peer lifecycle".
+    #[allow(dead_code)]
+    pub fn subscribe(&self) -> broadcast::Receiver<PoolRecv> {
+        self.recv_tx.subscribe()
     }
 
     /// Send to `dest` from the socket bound to `source_ip`. If no socket
@@ -169,8 +212,12 @@ async fn build_socket_pool() -> Result<SocketPool> {
     }
     let port = port.expect("at least one socket bound → port set");
 
-    // Spawn one recv task per socket that forwards packets into the pool's mpsc.
-    let (recv_tx, recv_rx) = mpsc::unbounded_channel::<PoolRecv>();
+    // Spawn one recv task per socket that forwards packets into the pool's
+    // broadcast channel. M2b-5: broadcast (not mpsc) so per-peer Rtcs can
+    // each subscribe. Pre-subscribe `recv_rx` here so the legacy
+    // single-consumer path still works via `SocketPool::recv()` even before
+    // any peer task calls `subscribe()`.
+    let (recv_tx, recv_rx) = broadcast::channel::<PoolRecv>(POOL_BROADCAST_CAP);
     let mut recv_tasks = Vec::new();
     for (ip, sock) in &sockets {
         let sock = sock.clone();
@@ -186,6 +233,11 @@ async fn build_socket_pool() -> Result<SocketPool> {
                             source,
                             destination: dest,
                         };
+                        // broadcast::send Errs only when there are NO
+                        // receivers at all; recv_rx on the pool + any
+                        // per-peer subscribers keep the channel live.
+                        // If the count really hits zero, the pool has
+                        // been abandoned — exit the recv task.
                         if tx.send(pr).is_err() { break; }
                     }
                     Err(e) => {
@@ -197,15 +249,14 @@ async fn build_socket_pool() -> Result<SocketPool> {
         });
         recv_tasks.push(task);
     }
-    drop(recv_tx);
-    Ok(SocketPool { sockets, recv_rx, _recv_tasks: recv_tasks })
+    Ok(SocketPool { sockets, recv_tx, recv_rx, _recv_tasks: recv_tasks })
 }
 
 /// Build a fresh Rtc seeded with host candidates from `pool.bound_addrs()`.
 /// Multiple Rtcs can share one SocketPool this way — each gets the same
 /// set of local candidates. `dispatch_pool_recv_to_rtcs` routes inbound
 /// packets to the owning Rtc via `Rtc::accepts()`.
-fn build_rtc_with_pool_candidates(pool: &SocketPool) -> Rtc {
+pub(crate) fn build_rtc_with_pool_candidates(pool: &SocketPool) -> Rtc {
     let mut rtc = Rtc::new(Instant::now());
     for addr in pool.bound_addrs() {
         match Candidate::host(addr, "udp") {
@@ -1613,4 +1664,484 @@ fn constant_time_eq_bytes<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
     let mut diff: u8 = 0;
     for i in 0..N { diff |= a[i] ^ b[i]; }
     diff == 0
+}
+
+// ---- M2b-5: per-peer task spawn + long-lived sender orchestrator --------
+//
+// Structure (see docs/multipeer.md §"Startup + peer lifecycle"):
+//
+//   send_serve
+//     ├── build_socket_pool                 (shared across peers)
+//     ├── open_ws + spawn_ws_router/writer  (single WS, N peer inboxes)
+//     ├── send Hello{role: sender}
+//     └── orchestrator loop task
+//           on unrouted_rx PeerHello:
+//             version check + dup check → spawn_peer_task
+//
+//   spawn_peer_task
+//     ├── build_rtc_with_pool_candidates(&pool)  (per-peer Rtc)
+//     ├── pool.subscribe()                       (broadcast fanout)
+//     ├── register per-peer inbox with router
+//     ├── watch::channel for shutdown
+//     └── spawn peer_session_run
+//
+//   peer_session_run
+//     handshake body (mirrors send_connect's tail):
+//       select! on {inbox_rx, pool_rx (accepts+handle_input+drain), shutdown, timeout}
+//       → KEX: send own KexPub, verify peer's KexPub, derive wrap_key+meta_key
+//       → wrap shared bulk_key + send KeyWrap
+//       → send SDP offer, accept peer's answer
+//       → wait for DC open
+//     M2b-5 END: park on shutdown_rx.changed() (block-serve loop is M2b-6)
+//
+// Deliberate non-goals for this slice:
+//   - cmd_send does not call send_serve (that's M2b-8; --multi flag).
+//   - Block-serve loop (RequestRanges → chunks) lives in M2b-6.
+//   - Receiver-side stays untouched.
+
+use crate::multipeer::{
+    ws_enqueue_targeted, PeerHandle, PeerRegistration, PeerSession,
+    SenderOrchestrator, SenderShared, WsRouterHandle,
+};
+use bitmule_core::ReceiverId;
+use std::collections::HashSet;
+use tokio::sync::{mpsc, watch, Mutex};
+
+/// Spawn a per-peer serving task on receipt of a peer_hello. Registers
+/// the peer's inbox with the WS router, subscribes the peer to the
+/// pool's broadcast fanout, and hands the constructed PeerSession to
+/// `peer_session_run` on a fresh task.
+///
+/// Returns a `PeerHandle` that the orchestrator stores in its peers
+/// map for progress reporting + shutdown signalling.
+#[allow(dead_code)]
+pub(crate) async fn spawn_peer_task(
+    receiver_id: ReceiverId,
+    shared: Arc<SenderShared>,
+    pool: Arc<SocketPool>,
+    outbox_tx: mpsc::UnboundedSender<Message>,
+    router_register: &mpsc::UnboundedSender<PeerRegistration>,
+) -> Result<PeerHandle> {
+    let rid_hex = receiver_id.as_hex();
+
+    // Per-peer Rtc against the shared pool. `add_channel` MUST happen
+    // before the offer is generated (active side) so the DC's m-line
+    // lands in the SDP.
+    let mut rtc = build_rtc_with_pool_candidates(&pool);
+    let mut change = rtc.sdp_api();
+    let channel_id = change.add_channel("bitmule".into());
+    let (offer, pending) = change
+        .apply()
+        .ok_or_else(|| anyhow!("peer {} sdp_api produced no offer", rid_hex))?;
+
+    // Per-peer inbox mpsc for signaling frames routed by from_receiver_id.
+    //
+    // FIXME(m2b-5): tiny registration race — mpsc `send` returns before the
+    // router has processed the registration, so any Ice/KexPub for this
+    // peer that arrives on the WS before the router's next iteration will
+    // be dispatched to `unrouted_rx` (the orchestrator loop) and dropped
+    // as "unexpected unrouted frame". In practice the receiver's KexPub +
+    // SDP answer take multiple ms of RTT while the registration takes µs,
+    // so the race window is ~always closed. If we start seeing "orchestrator
+    // dropping unexpected unrouted frame" logs mid-handshake, land a
+    // synchronous `oneshot<()>` ack from the router that we await here.
+    let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SignalFrame>();
+    router_register
+        .send(PeerRegistration { receiver_id: rid_hex.clone(), inbox_tx })
+        .map_err(|e| anyhow!("router register (peer {rid_hex}): {e}"))?;
+
+    // Per-peer pool subscription — this peer's Rtc will call
+    // `Rtc::accepts()` on each broadcast packet locally.
+    let pool_rx = pool.subscribe();
+
+    // Per-peer shutdown signal. Parent flips shutdown_tx→true to stop
+    // this peer without touching the others.
+    let (shutdown_tx, shutdown_rx) = watch::channel::<bool>(false);
+    let covered = Arc::new(Mutex::new(HashSet::<u64>::new()));
+
+    let session = PeerSession {
+        receiver_id,
+        rtc,
+        channel_id,
+        wrap_key: None,
+        meta_key: None,
+        covered: covered.clone(),
+        shared,
+    };
+
+    let shutdown_rx_task = shutdown_rx.clone();
+    let outbox_task = outbox_tx.clone();
+    let pool_task = pool.clone();
+    let task = tokio::spawn(async move {
+        peer_session_run(
+            session,
+            pool_task,
+            offer,
+            pending,
+            inbox_rx,
+            pool_rx,
+            outbox_task,
+            shutdown_rx_task,
+        )
+        .await
+    });
+
+    Ok(PeerHandle {
+        receiver_id,
+        covered,
+        shutdown_rx,
+        _shutdown_tx: shutdown_tx,
+        task,
+    })
+}
+
+/// Per-peer serving task body. Runs handshake (KEX + SDP + DC-open),
+/// then parks on shutdown_rx.changed() until the orchestrator flips
+/// the signal. M2b-6 replaces the park with the block-serve loop.
+///
+/// Mirrors the tail of `send_connect` but reads signaling frames from
+/// the router-supplied `inbox_rx` (already filtered by
+/// `from_receiver_id == self.receiver_id`) instead of the shared
+/// unrouted stream, and writes via `outbox_tx` with
+/// `to_receiver_id = Some(self.receiver_id)`. Runs `Rtc::accepts()` on
+/// each broadcast packet locally to drop foreign traffic without ever
+/// touching the wrong Rtc.
+#[allow(dead_code)]
+async fn peer_session_run(
+    mut session: PeerSession,
+    pool: Arc<SocketPool>,
+    offer: SdpOffer,
+    pending: str0m::change::SdpPendingOffer,
+    mut inbox_rx: mpsc::UnboundedReceiver<SignalFrame>,
+    mut pool_rx: broadcast::Receiver<PoolRecv>,
+    outbox_tx: mpsc::UnboundedSender<Message>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let rid_hex = session.receiver_id.as_hex();
+    info!(peer = %rid_hex, "peer task starting handshake");
+
+    // Kick str0m to drain any startup outputs (mainly Timeout).
+    let mut next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
+
+    // KEX: send our ephemeral immediately, wait for peer's KexPub in
+    // the loop below (concurrent with SDP exchange).
+    let local_ephemeral = Ephemeral::generate();
+    let local_pub = local_ephemeral.public_bytes();
+    let local_mac = session.shared.share_key.mac_ephemeral_pub(&local_pub);
+    ws_enqueue_targeted(
+        &outbox_tx,
+        &SignalFrame::KexPub {
+            pub_hex: hex_encode(&local_pub),
+            mac_hex: hex_encode(&local_mac),
+        },
+        Some(&rid_hex),
+    )?;
+
+    let mut ephemeral_holder = Some(local_ephemeral);
+    let mut wrap_key: Option<WrapKey> = None;
+    let mut meta_key: Option<MetaKey> = None;
+    let mut key_wrap_sent = false;
+    let mut offer_holder: Option<SdpOffer> = Some(offer);
+    let mut pending_holder: Option<str0m::change::SdpPendingOffer> = Some(pending);
+    let mut opened = false;
+    let channel_id = session.channel_id;
+
+    // Send offer immediately — sender-active side owns the offer, and
+    // the multipeer protocol does NOT require an incoming peer_hello on
+    // this channel to trigger it (the orchestrator already saw the
+    // peer_hello and spawned us; the peer's next signalling event is
+    // its KexPub + SDP answer routed via inbox_rx).
+    {
+        let offer = offer_holder.take().expect("offer set on entry");
+        let offer_sdp = offer.to_sdp_string();
+        debug!(peer = %rid_hex, "OFFER SDP:\n{}", offer_sdp);
+        ws_enqueue_targeted(
+            &outbox_tx,
+            &SignalFrame::Sdp { kind: "offer".into(), sdp: offer_sdp },
+            Some(&rid_hex),
+        )?;
+    }
+
+    while !opened {
+        // If shutdown fires before DC-open, bail cleanly without error —
+        // orchestrator torn us down (or --complete satisfied by another peer).
+        if *shutdown_rx.borrow() {
+            info!(peer = %rid_hex, "shutdown before DC-open — exiting peer task");
+            return Ok(());
+        }
+        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+
+        tokio::select! {
+            maybe_frame = inbox_rx.recv() => {
+                let frame = match maybe_frame {
+                    Some(f) => f,
+                    None => bail!("peer {rid_hex} inbox closed before DC-open"),
+                };
+                match frame {
+                    SignalFrame::Ice { candidate: Some(c) } => {
+                        if let Some(remote) = parse_ice_candidate(&c).await {
+                            session.rtc.add_remote_candidate(remote);
+                            next_timeout = drain_rtc_capture_open(&mut session.rtc, &pool, channel_id, &mut opened).await?;
+                        }
+                    }
+                    SignalFrame::Sdp { kind, sdp } if kind == "answer" => {
+                        debug!(peer = %rid_hex, "ANSWER SDP:\n{}", sdp);
+                        let ans = SdpAnswer::from_sdp_string(&sdp)
+                            .map_err(|e| anyhow!("peer {rid_hex} parse answer: {e}"))?;
+                        let pending_taken = pending_holder.take()
+                            .ok_or_else(|| anyhow!("peer {rid_hex} answer arrived twice"))?;
+                        session.rtc.sdp_api().accept_answer(pending_taken, ans)
+                            .map_err(|e| anyhow!("peer {rid_hex} accept_answer: {e}"))?;
+                        next_timeout = drain_rtc_capture_open(&mut session.rtc, &pool, channel_id, &mut opened).await?;
+                    }
+                    SignalFrame::KexPub { pub_hex, mac_hex } => {
+                        if wrap_key.is_some() {
+                            warn!(peer = %rid_hex, "duplicate KexPub — ignoring");
+                            continue;
+                        }
+                        let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                        let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
+                        let expected_mac = session.shared.share_key.mac_ephemeral_pub(&peer_pub);
+                        if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                            bail!("peer {rid_hex} KexPub MAC verify failed — does not know share key");
+                        }
+                        let eph = ephemeral_holder.take()
+                            .ok_or_else(|| anyhow!("peer {rid_hex} local ephemeral gone before KexPub arrived"))?;
+                        let s = eph.derive_shared_secret(&peer_pub)?;
+                        wrap_key = Some(s.wrap_key(&session.shared.session_id_bytes));
+                        meta_key = Some(s.meta_key(&session.shared.session_id_bytes));
+                        info!(peer = %rid_hex, "KEX complete");
+                    }
+                    _ => {
+                        debug!(peer = %rid_hex, "peer task ignoring frame (pre-DC-open)");
+                    }
+                }
+            }
+
+            maybe_pr = pool_rx.recv() => {
+                use broadcast::error::RecvError;
+                let pr = match maybe_pr {
+                    Ok(p) => p,
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(peer = %rid_hex, "pool rx lagged {n} — str0m re-tx will handle");
+                        continue;
+                    }
+                    Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
+                };
+                // Local accepts-check: broadcast fans EVERY packet to
+                // EVERY peer; each peer's Rtc filters via `accepts()`.
+                let mut rtcs: [&mut Rtc; 1] = [&mut session.rtc];
+                match dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)? {
+                    Some(_idx) => {
+                        next_timeout = drain_rtc_capture_open(&mut session.rtc, &pool, channel_id, &mut opened).await?;
+                    }
+                    None => {
+                        // Foreign packet — belongs to another peer's Rtc.
+                        // Silent drop is correct; another peer's task will
+                        // accept it on its own broadcast subscription.
+                    }
+                }
+            }
+
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!(peer = %rid_hex, "shutdown signalled — exiting peer task");
+                    return Ok(());
+                }
+            }
+
+            _ = tokio::time::sleep(dur) => {
+                session.rtc.handle_input(Input::Timeout(Instant::now()))
+                    .map_err(|e| anyhow!("peer {rid_hex} handle_input timeout: {e}"))?;
+                next_timeout = drain_rtc_capture_open(&mut session.rtc, &pool, channel_id, &mut opened).await?;
+            }
+        }
+
+        // Once wrap_key is derived, wrap the shared bulk_key and send
+        // KeyWrap. Bulk key is SAME B for every peer — URL commitment.
+        if wrap_key.is_some() && !key_wrap_sent {
+            let wk = wrap_key.as_ref().unwrap();
+            let (nonce, ct) = wk.wrap_bulk_key(&session.shared.bulk_key)?;
+            ws_enqueue_targeted(
+                &outbox_tx,
+                &SignalFrame::KeyWrap {
+                    enc_b_hex: hex_encode(&ct),
+                    nonce_hex: hex_encode(&nonce),
+                },
+                Some(&rid_hex),
+            )?;
+            key_wrap_sent = true;
+            info!(peer = %rid_hex, "bulk key wrapped + sent");
+        }
+    }
+
+    let wrap_key = wrap_key.ok_or_else(|| anyhow!("peer {rid_hex} DC opened before KEX completed"))?;
+    let meta_key = meta_key.ok_or_else(|| anyhow!("peer {rid_hex} DC opened before KEX completed"))?;
+    session.wrap_key = Some(wrap_key);
+    session.meta_key = Some(meta_key);
+    info!(peer = %rid_hex, "DC open — parking on shutdown_rx until M2b-6 block-serve lands");
+
+    // Sanity: keep session's covered map alive on the task's stack so
+    // parent-side Arc reads see the empty set during progress polls
+    // before block-serve populates it.
+    let _keep_session = session;
+
+    // M2b-5 end-state: park on shutdown. M2b-6 replaces this with the
+    // request_ranges → chunk-serve loop.
+    let _ = shutdown_rx.changed().await;
+    info!(peer = %rid_hex, "peer task exiting");
+    Ok(())
+}
+
+/// Long-lived sender-side entry point for the multipeer path. Opens WS,
+/// wires router+writer, sends Hello, then spawns the orchestrator loop
+/// task that receives peer_hello notifications and spawns per-peer
+/// serving tasks. Returns a `SenderOrchestrator` handle whose fields
+/// hold the pool + router + writer + peers map alive for the run.
+///
+/// M2b-5 wires the orchestrator + peer-spawn primitives; no caller yet.
+/// cmd_send stays on send_connect until M2b-8.
+#[allow(dead_code)]
+pub async fn send_serve(
+    server_url: &str,
+    share_key: ShareKey,
+    pre_generated_bulk_key: BulkKey,
+) -> Result<SenderOrchestrator> {
+    let session_hex = share_key.session_id_hex();
+    info!(session = %session_hex, "opening multipeer sender WS + shared pool");
+
+    let ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
+    let pool = Arc::new(build_socket_pool().await?);
+
+    let (sink, stream) = ws.split();
+    let writer = crate::multipeer::spawn_ws_writer(sink);
+    let router = crate::multipeer::spawn_ws_router(stream);
+
+    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
+    let shared = Arc::new(SenderShared {
+        share_key,
+        bulk_key: pre_generated_bulk_key,
+        session_id_bytes,
+        wire_version: crate::WIRE_VERSION,
+    });
+
+    // Sender-side Hello — no to_receiver_id (server broadcasts).
+    ws_enqueue_targeted(
+        &writer.outbox_tx,
+        &SignalFrame::Hello {
+            role: Role::Sender.as_str().to_owned(),
+            receiver_id: None,
+            wire_version: Some(shared.wire_version),
+        },
+        None,
+    )?;
+
+    let peers: Arc<Mutex<HashMap<String, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Orchestrator loop: consume unrouted frames (PeerHello notifications
+    // from the signaling server). Spawn per-peer task on each new one;
+    // ignore duplicates; bail on version mismatch as send_connect does.
+    let peers_loop = peers.clone();
+    let shared_loop = shared.clone();
+    let outbox_loop = writer.outbox_tx.clone();
+    let register_loop = router.register_tx.clone();
+    let pool_loop = pool.clone();
+    // Move the unrouted receiver into the loop task; the WsRouterHandle
+    // gave it to us by value in the handle struct.
+    // NOTE: WsRouterHandle::unrouted_rx is owned by the handle; take it
+    // via a small dance so the returned SenderOrchestrator still holds
+    // the handle for its shutdown_tx + join.
+    let WsRouterHandle {
+        register_tx,
+        mut unrouted_rx,
+        shutdown_tx: router_shutdown_tx,
+        task: router_task,
+    } = router;
+    let _ = register_loop; // register_tx used inside loop via `register_tx.clone()`
+    let register_for_loop = register_tx.clone();
+    let loop_task = tokio::spawn(async move {
+        while let Some(frame) = unrouted_rx.recv().await {
+            let (rid_hex_opt, wire_v) = match &frame {
+                SignalFrame::PeerHello { receiver_id, wire_version, .. } => {
+                    (receiver_id.clone(), *wire_version)
+                }
+                _ => {
+                    debug!("orchestrator: dropping unexpected unrouted frame");
+                    continue;
+                }
+            };
+            let rid_hex = match rid_hex_opt {
+                Some(r) => r,
+                None => {
+                    warn!("orchestrator: peer_hello without receiver_id — dropping");
+                    continue;
+                }
+            };
+            match wire_v {
+                Some(v) if v == shared_loop.wire_version => { /* ok */ }
+                Some(v) => {
+                    warn!(
+                        "peer {rid_hex} speaks wire version {v}, we speak {} — dropping peer",
+                        shared_loop.wire_version
+                    );
+                    continue;
+                }
+                None => {
+                    warn!("peer {rid_hex} did not advertise wire version — dropping peer");
+                    continue;
+                }
+            }
+            {
+                let peers_g = peers_loop.lock().await;
+                if peers_g.contains_key(&rid_hex) {
+                    debug!("duplicate peer_hello for {rid_hex} — ignoring");
+                    continue;
+                }
+            }
+            let receiver_id = match ReceiverId::from_hex(&rid_hex) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("peer_hello receiver_id parse ({rid_hex}): {e} — dropping");
+                    continue;
+                }
+            };
+            match spawn_peer_task(
+                receiver_id,
+                shared_loop.clone(),
+                pool_loop.clone(),
+                outbox_loop.clone(),
+                &register_for_loop,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    let mut peers_g = peers_loop.lock().await;
+                    peers_g.insert(rid_hex, handle);
+                }
+                Err(e) => {
+                    warn!("spawn_peer_task failed for {rid_hex}: {e}");
+                }
+            }
+        }
+        Ok(())
+    });
+
+    // Re-assemble the router handle for the SenderOrchestrator (peers
+    // + loop own the register_tx clones + unrouted_rx moved-into-loop).
+    let router = WsRouterHandle {
+        register_tx,
+        // unrouted_rx was moved into loop_task; replace with a dead one
+        // so the handle still type-checks (shutdown path uses shutdown_tx).
+        unrouted_rx: mpsc::unbounded_channel::<SignalFrame>().1,
+        shutdown_tx: router_shutdown_tx,
+        task: router_task,
+    };
+
+    Ok(SenderOrchestrator {
+        shared,
+        peers,
+        router,
+        writer,
+        loop_task,
+    })
 }
