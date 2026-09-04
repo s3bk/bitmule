@@ -1735,20 +1735,17 @@ pub(crate) async fn spawn_peer_task(
         .ok_or_else(|| anyhow!("peer {} sdp_api produced no offer", rid_hex))?;
 
     // Per-peer inbox mpsc for signaling frames routed by from_receiver_id.
-    //
-    // FIXME(m2b-5): tiny registration race — mpsc `send` returns before the
-    // router has processed the registration, so any Ice/KexPub for this
-    // peer that arrives on the WS before the router's next iteration will
-    // be dispatched to `unrouted_rx` (the orchestrator loop) and dropped
-    // as "unexpected unrouted frame". In practice the receiver's KexPub +
-    // SDP answer take multiple ms of RTT while the registration takes µs,
-    // so the race window is ~always closed. If we start seeing "orchestrator
-    // dropping unexpected unrouted frame" logs mid-handshake, land a
-    // synchronous `oneshot<()>` ack from the router that we await here.
+    // Await the router's ack before proceeding so the dispatch map is
+    // live before any Ice/KexPub for this peer can arrive on the WS —
+    // closes the µs-scale race where a fast peer's first frame could
+    // otherwise land on `unrouted_rx` and get dropped. `spawn_peer_task`
+    // paying a two-µs oneshot roundtrip is a good trade.
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SignalFrame>();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
     router_register
-        .send(PeerRegistration { receiver_id: rid_hex.clone(), inbox_tx })
+        .send(PeerRegistration { receiver_id: rid_hex.clone(), inbox_tx, ack: ack_tx })
         .map_err(|e| anyhow!("router register (peer {rid_hex}): {e}"))?;
+    ack_rx.await.map_err(|_| anyhow!("router dropped ack for peer {rid_hex} — router task exited?"))?;
 
     // Per-peer pool subscription — this peer's Rtc will call
     // `Rtc::accepts()` on each broadcast packet locally.

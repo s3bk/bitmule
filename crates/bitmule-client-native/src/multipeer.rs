@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use str0m::{channel::ChannelId, Rtc};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Serving mode selected by the CLI.
@@ -129,10 +129,19 @@ pub enum CoveredNote {
 /// about to be spawned. Un-registration on peer-task exit is implicit
 /// (the receiver half of the mpsc dropping causes send failures which
 /// the router silently discards).
+///
+/// `ack` fires once the router has inserted this peer into its
+/// dispatch map. Callers await it before letting the peer task
+/// proceed — closes the µs-scale race between mpsc-register and the
+/// router's next iteration where a fast receiver's first frame could
+/// otherwise land on `unrouted_rx` and get dropped. `spawn_peer_task`
+/// is allowed to be a little slow — trade the two-µs oneshot roundtrip
+/// for handshake correctness under a hot signaling server.
 #[allow(dead_code)]
 pub(crate) struct PeerRegistration {
     pub receiver_id: String,
     pub inbox_tx: mpsc::UnboundedSender<SignalFrame>,
+    pub ack: oneshot::Sender<()>,
 }
 
 /// Handle to the running WS router task. Task returns the reclaimed
@@ -185,6 +194,10 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
                 }
                 Some(reg) = register_rx.recv() => {
                     peers.insert(reg.receiver_id, reg.inbox_tx);
+                    // Ack after insert so `spawn_peer_task`'s await
+                    // returns only once dispatch is live. Silently
+                    // drop if the caller dropped its rx (canceled).
+                    let _ = reg.ack.send(());
                 }
                 maybe_msg = stream.next() => {
                     let parsed = match parse_ws_frame_with_from_id(maybe_msg) {
