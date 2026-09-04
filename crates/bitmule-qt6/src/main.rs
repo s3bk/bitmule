@@ -381,21 +381,19 @@ impl UploaderApi {
             update_recv_state(&state, &url, |s| { s.status = "receiving".into(); });
             refresh_from_bg(&qpointer, &state);
             // Callback runs on tokio worker threads and must be Send;
-            // QPointer is !Send, so the callback only pushes progress
-            // over a channel and a drainer task (which owns qpointer
-            // on the qt-event-loop side) applies the update.
-            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<(String, f64)>();
-            let state_drain = state.clone();
-            let url_drain = url.clone();
-            let qpointer_drain = qpointer.clone();
-            qmetaobject::future::execute_async(async move {
-                while let Some((name_s, prog)) = prog_rx.recv().await {
-                    update_recv_state(&state_drain, &url_drain, |s| {
-                        s.name = name_s;
-                        s.progress = prog;
-                    });
-                    refresh_from_bg(&qpointer_drain, &state_drain);
-                }
+            // QPointer is !Send. queued_callback returns a
+            // Send+Sync+Clone closure that marshals the call back onto
+            // the qt event-loop thread, where it's safe to touch
+            // QPointer + qmetaobject state.
+            let state_ui = state.clone();
+            let url_ui = url.clone();
+            let qpointer_ui = qpointer.clone();
+            let on_progress_ui = qmetaobject::queued_callback(move |(name_s, prog): (String, f64)| {
+                update_recv_state(&state_ui, &url_ui, |s| {
+                    s.name = name_s;
+                    s.progress = prog;
+                });
+                refresh_from_bg(&qpointer_ui, &state_ui);
             });
             let last_pct = std::sync::Arc::new(std::sync::Mutex::new(0u8));
             let result = bitmule_client_native::recv_file(
@@ -414,7 +412,7 @@ impl UploaderApi {
                     *lp = pct;
                     drop(lp);
                     let prog = if total > 0 { received as f64 / total as f64 } else { 0.0 };
-                    let _ = prog_tx.send((name.to_string(), prog));
+                    on_progress_ui((name.to_string(), prog));
                 },
             ).await;
             match result {
