@@ -5,10 +5,85 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use url::Url;
 
-// Simulated async share function
+/// Prepare a bitmule share for the first file in `files` and spawn the
+/// send task in the background. Returns the share URL as soon as the
+/// commitment hash finishes — the actual transfer keeps running in a
+/// detached tokio task in `ServeMode::Multi` until the app exits.
+///
+/// Multiple files: only the first is sent for now; bitmule's wire is
+/// one-file-per-session. Follow-up: iterate + return a list of URLs
+/// or zip on the fly.
 async fn share(files: Vec<PathBuf>) -> Url {
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    Url::parse(&format!("https://share.example.com/item/{}", files.len())).unwrap()
+    use bitmule_client_native::{send_file_multi, ServeMode};
+    use bitmule_crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
+    use tokio::io::AsyncReadExt;
+
+    const SERVER: &str = "https://bitmule.qdat.net";
+    let err_url = |msg: &str| {
+        Url::parse(&format!("about:blank#error={}", urlencoding_min(msg)))
+            .unwrap_or_else(|_| Url::parse("about:blank").unwrap())
+    };
+
+    let path = match files.into_iter().next() {
+        Some(p) => p,
+        None => return err_url("no file selected"),
+    };
+
+    // Stat + commitment: stream-hash the file with a fresh bulk_key to
+    // produce SHA256(data || bulk_key), the URL-committed signature.
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return err_url("not a regular file"),
+        Err(e) => return err_url(&format!("stat: {e}")),
+    };
+    let _ = meta;
+
+    let share_key = ShareKey::random();
+    let bulk_key = BulkKey::random();
+    let signature = {
+        let mut f = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => return err_url(&format!("open: {e}")),
+        };
+        let mut hasher = CommitmentHasher::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match f.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) => return err_url(&format!("read: {e}")),
+            }
+        }
+        hasher.finalize(&bulk_key)
+    };
+
+    let link = ShareLink::new(share_key.clone(), signature);
+    let url_str = format!("{}/#{}", SERVER.trim_end_matches('/'), link.to_b64_url());
+
+    // Fire-and-forget the send task. Multi mode = runs until app exit.
+    // Any receiver who opens the URL gets a fresh KEX + AEAD stream.
+    let path_clone = path.clone();
+    tokio::spawn(async move {
+        if let Err(e) = send_file_multi(
+            SERVER, share_key, bulk_key, path_clone, ServeMode::Multi,
+        ).await {
+            eprintln!("bitmule send failed: {e:#}");
+        }
+    });
+
+    Url::parse(&url_str).unwrap_or_else(|_| err_url("URL build"))
+}
+
+/// Minimal percent-encoding for stuffing an error message into a URL
+/// fragment. Not RFC-3986-complete; only escapes what would break
+/// `Url::parse` on the return path.
+fn urlencoding_min(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u32),
+        })
+        .collect()
 }
 
 #[derive(QObject, Default)]

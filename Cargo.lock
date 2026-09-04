@@ -630,6 +630,9 @@ dependencies = [
 name = "bitmule-qt6"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "bitmule-client-native",
+ "bitmule-crypto",
  "c_str_macro",
  "qmetaobject",
  "tokio",
