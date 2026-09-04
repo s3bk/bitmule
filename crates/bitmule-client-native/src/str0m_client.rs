@@ -105,24 +105,44 @@ impl SocketPool {
         self.recv_tx.subscribe()
     }
 
-    /// Send to `dest` from the socket bound to `source_ip`. If no socket
-    /// matches, falls back to the first available socket + logs a warning
-    /// (indicates a str0m Transmit for a source we didn't bind).
+    /// Send to `dest` from the socket bound to `source_ip`. Filters out
+    /// pair-mismatched sends BEFORE the syscall — Seb's rule: if the
+    /// local socket can't reach the destination, don't even try.
     ///
-    /// Transient send failures (EINVAL / ENETUNREACH / EHOSTUNREACH /
-    /// EAFNOSUPPORT) are logged and swallowed as `Ok(())` — str0m's ICE
-    /// state machine handles per-pair failures on its own by trying
-    /// other pairs. Observed with Firefox emitting an srflx candidate
-    /// to a public IP that no local socket can route to; without this
-    /// swallow the whole peer task errors on the first STUN write and
-    /// the transfer never gets a chance to fall back to a working pair.
+    /// Rejected pre-flight (silently, at debug):
+    ///   - loopback source → non-loopback dest (127.x can't route out)
+    ///   - non-loopback source → loopback dest (127.x is same-host only)
+    ///   - link-local source → non-link-local dest (169.254.x scope)
+    /// If no socket matches the source IP at all, that's a str0m
+    /// Transmit for a source we didn't bind — log warn, drop.
+    ///
+    /// Any residual send error (kernel EINVAL / ENETUNREACH /
+    /// EHOSTUNREACH / EADDRNOTAVAIL from a pair the pre-flight didn't
+    /// catch) is logged and swallowed — str0m's ICE state machine
+    /// retries other pairs on its own.
     pub async fn send_from(&self, source: SocketAddr, dest: SocketAddr, bytes: &[u8]) -> Result<()> {
-        let sock = match self.sockets.get(&source.ip()) {
+        let src_ip = source.ip();
+        let dst_ip = dest.ip();
+        let src_loopback = src_ip.is_loopback();
+        let dst_loopback = dst_ip.is_loopback();
+        let is_v4_link_local = |ip: IpAddr| match ip {
+            IpAddr::V4(v4) => v4.octets()[0] == 169 && v4.octets()[1] == 254,
+            IpAddr::V6(_) => false,
+        };
+        if src_loopback != dst_loopback {
+            debug!("send_from {source} → {dest}: loopback scope mismatch, skipping");
+            return Ok(());
+        }
+        if is_v4_link_local(src_ip) != is_v4_link_local(dst_ip) {
+            debug!("send_from {source} → {dest}: link-local scope mismatch, skipping");
+            return Ok(());
+        }
+
+        let sock = match self.sockets.get(&src_ip) {
             Some(s) => s.clone(),
             None => {
-                warn!("no socket for source IP {} — falling back to any", source.ip());
-                self.sockets.values().next().cloned()
-                    .ok_or_else(|| anyhow!("socket pool is empty"))?
+                warn!("no socket for source IP {src_ip} — dropping send to {dest}");
+                return Ok(());
             }
         };
         if let Err(e) = sock.send_to(bytes, dest).await {
@@ -132,7 +152,7 @@ impl SocketPool {
                 | ErrorKind::NetworkUnreachable
                 | ErrorKind::HostUnreachable
                 | ErrorKind::AddrNotAvailable => {
-                    warn!("send_to {dest} from {source}: {e} — ignoring, str0m will retry another pair");
+                    debug!("send_to {dest} from {source}: {e} — ignoring, str0m will retry another pair");
                 }
                 _ => {
                     return Err(anyhow::Error::from(e))
