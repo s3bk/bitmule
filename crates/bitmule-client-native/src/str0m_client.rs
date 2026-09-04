@@ -824,6 +824,17 @@ async fn drain_rtc_capture_data(
                         // Decrypt this chunk with idx-derived nonce. SCTP is
                         // ordered so incrementing recv_idx per binary frame
                         // matches the sender's send-side idx exactly.
+                        // Log first 3, every 25th, and the tail few so a
+                        // decrypt_chunk failure can be correlated with the
+                        // wire-size progression against the sender log.
+                        let expected_last_idx = meta_opt.as_ref().and_then(|m| {
+                            if m.size == 0 { None }
+                            else { Some((m.size + CHUNK_BYTES as u64 - 1) / CHUNK_BYTES as u64 - 1) }
+                        });
+                        let near_tail = expected_last_idx.is_some_and(|last| *recv_idx + 3 >= last);
+                        if *recv_idx < 3 || *recv_idx % 25 == 0 || near_tail {
+                            info!("chunk RX idx={} data_len={}", *recv_idx, data.len());
+                        }
                         let plain = bulk_key.decrypt_chunk(*recv_idx, &data)
                             .with_context(|| format!(
                                 "decrypt_chunk idx={} data_len={}",

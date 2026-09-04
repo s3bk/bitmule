@@ -1178,6 +1178,7 @@ async function sendMetaAndChunksForPeer(session, peer) {
 
   let offset = 0;
   let idx = 0;
+  console.info(`[send] peer=${peer.receiverId.slice(0,8)} file.size=${file.size} chunkBytes=${chunkBytes} expected_chunks=${Math.ceil(file.size / chunkBytes)}`);
   while (offset < file.size) {
     if (session.peers.get(peer.receiverId) !== peer) return; // torn down
     const end = Math.min(offset + chunkBytes, file.size);
@@ -1185,6 +1186,14 @@ async function sendMetaAndChunksForPeer(session, peer) {
     const ct = session.bulkKey.encryptChunk(BigInt(idx), plain);
     while (peer.dc.bufferedAmount > HIGH) await awaitDrain();
     peer.dc.send(ct);
+    // Log first 3, last 3, and every 25th chunk so a receiver-side
+    // 'decrypt_chunk idx=N data_len=X' error can be correlated with
+    // what the sender actually put on the wire.
+    const willEndLoopAfterThis = (end === file.size);
+    const expectedChunks = Math.ceil(file.size / chunkBytes);
+    if (idx < 3 || idx % 25 === 0 || willEndLoopAfterThis || idx >= expectedChunks - 3) {
+      console.info(`[send] dc.send idx=${idx} plain_len=${plain.length} ct_len=${ct.length} offset_after=${end}/${file.size}`);
+    }
     offset = end;
     idx++;
     // Live progress in the shared session-state line (single-peer
