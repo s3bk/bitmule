@@ -1355,9 +1355,10 @@ function wireSendMode() {
       els.dropzone.classList.remove("dragover");
     });
   });
-  els.dropzone.addEventListener("drop", (e) => {
-    const files = e.dataTransfer?.files;
-    if (files && files.length) startSendSession(Array.from(files));
+  els.dropzone.addEventListener("drop", async (e) => {
+    if (!e.dataTransfer) return;
+    const files = await flattenDroppedItems(e.dataTransfer);
+    if (files.length) startSendSession(files);
   });
 
   els.copyBtn.addEventListener("click", async () => {
@@ -2056,12 +2057,13 @@ function wireInvitedSendMode() {
       els.invitedDropzone.classList.remove("dragover");
     });
   });
-  els.invitedDropzone.addEventListener("drop", (e) => {
-    const files = e.dataTransfer?.files;
-    if (files && files.length) {
+  els.invitedDropzone.addEventListener("drop", async (e) => {
+    if (!e.dataTransfer) return;
+    const files = await flattenDroppedItems(e.dataTransfer);
+    if (files.length) {
       const hex = currentSessionHex();
       if (!hex) return;
-      startInvitedSendSession(hex, Array.from(files));
+      startInvitedSendSession(hex, files);
     }
   });
   els.invitedCancel.addEventListener("click", () => {
@@ -2371,6 +2373,88 @@ function stopClipboardWatcher() {
   clearInterval(clipboardWatchTimer);
   clipboardWatchTimer = null;
   console.info("clipboard watcher: off");
+}
+
+// ============================================================
+// F5 — drag-drop folder walker.
+//
+// `DataTransfer.files` on a folder-drop hands back a File whose
+// `.arrayBuffer()` throws NotFoundError — the entry is a directory
+// pseudo-file, not a real file. To handle a folder drop we have
+// to walk via `DataTransferItem.webkitGetAsEntry()` and resolve
+// each FileSystemFileEntry through `.file(cb)`. We tag each
+// resulting File with `webkitRelativePath` (via a Proxy since the
+// property is normally read-only on File) so the zip writer
+// preserves the drop-root name at the top of the archive.
+// ============================================================
+
+async function readDirEntries(dirReader) {
+  // readEntries only returns a batch at a time (typically ~100);
+  // keep reading until it returns empty.
+  const all = [];
+  while (true) {
+    const batch = await new Promise((resolve, reject) =>
+      dirReader.readEntries(resolve, reject));
+    if (!batch.length) return all;
+    all.push(...batch);
+  }
+}
+
+async function walkEntry(entry, prefix, out) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) =>
+      entry.file(resolve, reject));
+    const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    // File's webkitRelativePath is read-only in the platform. Wrap
+    // in a Proxy so downstream code reading .webkitRelativePath
+    // sees our path without touching the real prototype.
+    out.push(new Proxy(file, {
+      get(target, prop) {
+        if (prop === "webkitRelativePath") return relPath;
+        const v = target[prop];
+        return typeof v === "function" ? v.bind(target) : v;
+      }
+    }));
+    return;
+  }
+  if (entry.isDirectory) {
+    const reader = entry.createReader();
+    const children = await readDirEntries(reader);
+    const nextPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+    for (const child of children) await walkEntry(child, nextPrefix, out);
+  }
+}
+
+// Flatten a drop event's dataTransfer.items into a flat Array<File>.
+// Handles a mix of file + folder drops. Folders expand recursively
+// and every descendant file's webkitRelativePath preserves the tree
+// shape (with the drop-root dir name at the top).
+async function flattenDroppedItems(dataTransfer) {
+  const items = dataTransfer.items;
+  if (!items || !items.length) {
+    // Fallback: no items list — use the raw files (single-file drops).
+    return Array.from(dataTransfer.files || []);
+  }
+  const entries = [];
+  for (const item of items) {
+    if (item.kind !== "file") continue;
+    // Prefer webkitGetAsEntry (returns FileSystemEntry supporting
+    // directory walk); fall back to getAsFile() if the browser
+    // doesn't implement the entry API.
+    const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+    if (entry) {
+      entries.push(entry);
+    } else {
+      const f = item.getAsFile();
+      if (f) entries.push({ __rawFile: f });
+    }
+  }
+  const out = [];
+  for (const entry of entries) {
+    if (entry.__rawFile) { out.push(entry.__rawFile); continue; }
+    await walkEntry(entry, "", out);
+  }
+  return out;
 }
 
 // ============================================================
