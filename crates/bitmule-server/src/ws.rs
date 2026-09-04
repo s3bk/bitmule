@@ -223,7 +223,35 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                                 }
                             }
                         }
-                        r.route_to_sender(&s);
+                        // Inject from_receiver_id if the receiver didn't set
+                        // it — the sender-side multipeer WS router uses this
+                        // to dispatch SDP answers, Ice, KexPub etc. to the
+                        // right per-peer inbox. Anti-spoof check above still
+                        // stands for the case where the receiver DID claim
+                        // an id (must match its registered id).
+                        let outgoing = if claimed.is_none() {
+                            if let Some(rid) = receiver_id.as_ref() {
+                                match serde_json::from_str::<serde_json::Value>(&s) {
+                                    Ok(mut v) => {
+                                        if let Some(obj) = v.as_object_mut() {
+                                            obj.insert(
+                                                "from_receiver_id".to_string(),
+                                                serde_json::Value::String(rid.as_hex()),
+                                            );
+                                            v.to_string()
+                                        } else {
+                                            s.clone()
+                                        }
+                                    }
+                                    Err(_) => s.clone(),
+                                }
+                            } else {
+                                s.clone()
+                            }
+                        } else {
+                            s.clone()
+                        };
+                        r.route_to_sender(&outgoing);
                     }
                 }
             }
