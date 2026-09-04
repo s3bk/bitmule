@@ -65,6 +65,35 @@ function isHex64(s) {
   return typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
 }
 
+// M2b: URL fragment is either a legacy 64-char hex session id or an
+// 86-char base64url ShareLink (share_key || signature) for the modern
+// send-initiated flow. Returns null if neither shape matches. On
+// modern URLs, `shareKey` + `signature` come back parsed via the
+// wasm module — falls back to null if wasm not loaded yet.
+function parseSessionFragment(rawHash) {
+  const h = (rawHash || "").replace(/^#/, "");
+  if (!h) return null;
+  if (isHex64(h)) {
+    return { kind: "hex", sessionHex: h, shareKey: null, signature: null };
+  }
+  // Send-initiated ShareLink shape: 86 base64url chars decoding to 64 bytes
+  // = 32-byte share_key || 32-byte signature. Require the wasm module
+  // to parse — mirrors bitmule::ShareLink::from_b64_url on the native side.
+  if (/^[A-Za-z0-9_-]{86}$/.test(h) && window.bitmule && window.bitmule.ShareLink) {
+    try {
+      const link = window.bitmule.ShareLink.fromB64Url(h);
+      const signature = link.signature;
+      const shareKey = link.takeShareKey();
+      const sessionHex = shareKey.sessionIdHex();
+      return { kind: "sharelink", sessionHex, shareKey, signature };
+    } catch (e) {
+      console.warn("parseSessionFragment: ShareLink parse failed", e);
+      return null;
+    }
+  }
+  return null;
+}
+
 function randomHex32() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -494,39 +523,153 @@ function makeRelayReceiver(session, { onProgress, onFile }) {
   };
 }
 
+// ---- hex helpers (KEX / KeyWrap / meta_enc wire) ---------------------
+
+function hexEncode(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let s = "";
+  for (let i = 0; i < arr.length; i++) s += arr[i].toString(16).padStart(2, "0");
+  return s;
+}
+
+function hexDecode(s) {
+  if (typeof s !== "string" || s.length % 2 !== 0) return null;
+  const n = s.length / 2;
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const b = parseInt(s.substr(i * 2, 2), 16);
+    if (Number.isNaN(b)) return null;
+    out[i] = b;
+  }
+  return out;
+}
+
 // Receiver-side accumulator. One outbound Blob per file.
-function makeReceiver({ onProgress, onFile }) {
+//
+// M2b: `keys` (optional) enables the modern AEAD wire — pass
+// `{ metaKey, bulkKey, sessionIdBytes, dc }` and the receiver will:
+//   - decrypt `meta_enc` under metaKey with sessionIdBytes as AAD
+//   - decrypt each binary chunk under bulkKey using idx-derived nonce
+//   - emit `request_ranges [0, total_chunks)` on `dc` after meta lands
+//   - emit `recv_done` on `dc` after all chunks received
+//   - accept `done_ack` alongside legacy `done` as end signal
+// Without `keys`, falls back to the pre-AEAD plaintext wire.
+function makeReceiver({ onProgress, onFile, keys } = {}) {
   let meta = null;
   let chunks = [];
   let received = 0;
+  let recvIdx = 0;
+  let requestSent = false;
+  let recvDoneSent = false;
+
+  const finalize = () => {
+    if (!meta) return;
+    const blob = new Blob(chunks, { type: "application/octet-stream" });
+    onFile && onFile(meta.name, blob, meta.size);
+    meta = null;
+    chunks = [];
+    received = 0;
+    recvIdx = 0;
+    requestSent = false;
+    recvDoneSent = false;
+  };
+
+  const maybeSendRequestRanges = () => {
+    if (!keys || !keys.dc || requestSent || !meta) return;
+    // total_chunks derived from meta.size + chunkBytes so we ask for
+    // exactly the range the sender needs to serve.
+    const chunkBytes = meta.chunkBytes || 16 * 1024;
+    const totalChunks = meta.size === 0
+      ? 0
+      : Math.ceil(meta.size / chunkBytes);
+    if (totalChunks > 0) {
+      const frame = JSON.stringify({
+        type: "request_ranges",
+        ranges: [{ start: 0, end: totalChunks }],
+      });
+      try { keys.dc.send(frame); } catch (e) {
+        console.warn("request_ranges send failed:", e);
+      }
+    }
+    requestSent = true;
+  };
+
+  const maybeSendRecvDone = () => {
+    if (!keys || !keys.dc || recvDoneSent || !meta) return;
+    const chunkBytes = meta.chunkBytes || 16 * 1024;
+    const totalChunks = meta.size === 0
+      ? 0
+      : Math.ceil(meta.size / chunkBytes);
+    if (recvIdx >= totalChunks) {
+      try { keys.dc.send(JSON.stringify({ type: "recv_done" })); }
+      catch (e) { console.warn("recv_done send failed:", e); }
+      recvDoneSent = true;
+    }
+  };
 
   return function onMessage(data) {
     if (typeof data === "string") {
       let frame;
-      try {
-        frame = JSON.parse(data);
-      } catch {
-        return;
-      }
+      try { frame = JSON.parse(data); } catch { return; }
+
       if (frame.type === "meta") {
+        // Legacy plaintext meta — pre-AEAD wire.
         meta = frame;
         chunks = [];
         received = 0;
-      } else if (frame.type === "done") {
-        if (!meta) return;
-        const blob = new Blob(chunks, { type: "application/octet-stream" });
-        onFile && onFile(meta.name, blob, meta.size);
-        meta = null;
+        recvIdx = 0;
+        return;
+      }
+      if (frame.type === "meta_enc") {
+        if (!keys || !keys.metaKey) {
+          console.warn("meta_enc arrived but receiver has no metaKey");
+          return;
+        }
+        const nonce = hexDecode(frame.nonce_hex);
+        const ct = hexDecode(frame.ct_hex);
+        if (!nonce || !ct) { console.warn("meta_enc: bad hex"); return; }
+        let plain;
+        try {
+          plain = keys.metaKey.decryptMeta(keys.sessionIdBytes, nonce, ct);
+        } catch (e) { console.warn("meta_enc decrypt:", e); return; }
+        try {
+          meta = JSON.parse(new TextDecoder().decode(plain));
+        } catch (e) { console.warn("meta_enc JSON parse:", e); return; }
+        // Normalize `chunkBytes` casing — native emits camelCase.
+        if (meta.chunkBytes == null && meta.chunk_bytes != null) {
+          meta.chunkBytes = meta.chunk_bytes;
+        }
         chunks = [];
         received = 0;
+        recvIdx = 0;
+        maybeSendRequestRanges();
+        return;
+      }
+      if (frame.type === "done" || frame.type === "done_ack") {
+        finalize();
+        return;
       }
       return;
     }
     // Binary frame — ArrayBuffer per DC.binaryType = "arraybuffer".
     if (data instanceof ArrayBuffer) {
-      chunks.push(data);
-      received += data.byteLength;
+      if (keys && keys.bulkKey) {
+        let plain;
+        try {
+          plain = keys.bulkKey.decryptChunk(BigInt(recvIdx), new Uint8Array(data));
+        } catch (e) {
+          console.warn(`decryptChunk idx=${recvIdx} failed:`, e);
+          return;
+        }
+        chunks.push(plain);
+        received += plain.byteLength;
+        recvIdx += 1;
+      } else {
+        chunks.push(data);
+        received += data.byteLength;
+      }
       if (meta) onProgress && onProgress(received, meta.size, meta.name);
+      maybeSendRecvDone();
     }
   };
 }
@@ -845,7 +988,7 @@ function closeRecvSession() {
   }
 }
 
-function startRecvSession(sessionHex) {
+function startRecvSession(sessionHex, fragment) {
   closeRecvSession();
 
   els.recvSessionId.textContent = sessionHex.slice(0, 8) + "…";
@@ -866,7 +1009,28 @@ function startRecvSession(sessionHex) {
 
   // Receiver preps its peer connection immediately so the SDP offer can
   // be answered as soon as it arrives.
-  const session = { sessionHex, receiverId, ws, peer: null };
+  //
+  // M2b crypto state — populated only for modern ShareLink URLs when
+  // window.bitmule is loaded. Handshake progression:
+  //   1. On WS open: send Hello + PeerHello + our own KexPub with MAC.
+  //   2. On WS `kex_pub` from sender: verify MAC, derive wrap+meta keys.
+  //   3. On WS `key_wrap` from sender: unwrap bulk_key.
+  //   4. Once bulkKey + metaKey are ready + DC is open, hand them to
+  //      makeReceiver via the `keys` opt so it can decrypt meta_enc +
+  //      chunks and emit request_ranges / recv_done on the DC.
+  const crypto = (fragment && fragment.kind === "sharelink" && window.bitmule)
+    ? {
+        shareKey: fragment.shareKey,
+        sessionIdBytes: hexDecode(sessionHex),
+        ephemeral: new window.bitmule.Ephemeral(),
+        wrapKey: null,
+        metaKey: null,
+        bulkKey: null,
+        ownKexPubSent: false,
+      }
+    : null;
+
+  const session = { sessionHex, receiverId, ws, peer: null, crypto };
   recvSession = session;
 
   const commonProgress = (received, total, name) => {
@@ -892,9 +1056,14 @@ function startRecvSession(sessionHex) {
     a.click();
   };
 
+  // Keys handed to makeReceiver once KEX + KeyWrap complete. The
+  // receiver's onMessage is bound to a mutable holder so it can pick
+  // up the keys the moment they land without re-plumbing everything.
+  const keysHolder = { metaKey: null, bulkKey: null, sessionIdBytes: null, dc: null };
   const recvOnMessage = makeReceiver({
     onProgress: commonProgress,
     onFile: (n, b, s) => commonOnFile(n, b, s, "WebRTC"),
+    keys: crypto ? keysHolder : undefined,
   });
 
   // Relay-path receiver runs alongside the DC receiver. Whichever path
@@ -907,10 +1076,11 @@ function startRecvSession(sessionHex) {
   session.peer = createPeer({
     role: "receiver",
     ws,
-    onOpen: () => {
+    onOpen: (dc) => {
       els.recvState.textContent =
         "direct channel open — ready to receive";
       els.recvState.classList.add("transferring");
+      keysHolder.dc = dc;
     },
     onMessage: recvOnMessage,
     onState: (s) => {
@@ -925,12 +1095,30 @@ function startRecvSession(sessionHex) {
         type: "hello",
         role: "receiver",
         receiver_id: receiverId,
+        wire_version: 2,
       })
     );
     // The peer_hello triggers the sender to spin up its RTC + send offer.
     ws.send(
-      JSON.stringify({ type: "peer_hello", receiver_id: receiverId })
+      JSON.stringify({ type: "peer_hello", receiver_id: receiverId, wire_version: 2 })
     );
+    // M2b: on modern URLs, ship our KexPub immediately — same
+    // concurrent-with-SDP flow the native client uses.
+    if (crypto) {
+      keysHolder.sessionIdBytes = crypto.sessionIdBytes;
+      try {
+        const pubBytes = crypto.ephemeral.publicBytes();
+        const macBytes = crypto.shareKey.macEphemeralPub(pubBytes);
+        ws.send(JSON.stringify({
+          type: "kex_pub",
+          pub_hex: hexEncode(pubBytes),
+          mac_hex: hexEncode(macBytes),
+        }));
+        crypto.ownKexPubSent = true;
+      } catch (e) {
+        console.warn("KEX pub send failed:", e);
+      }
+    }
     els.recvState.textContent =
       "connected — waiting for sender to negotiate direct channel";
   });
@@ -948,6 +1136,43 @@ function startRecvSession(sessionHex) {
         await session.peer.handleFrame(frame);
       } catch (e) {
         console.warn("recv handleFrame:", e);
+      }
+      return;
+    }
+    if (frame.type === "kex_pub" && crypto && !crypto.wrapKey) {
+      // Verify sender's ephemeral pub with MAC-under-A, then derive
+      // shared secret + wrap/meta keys. Ephemeral.deriveSharedSecret
+      // consumes self so the private zeroizes after.
+      const peerPub = hexDecode(frame.pub_hex);
+      const peerMac = hexDecode(frame.mac_hex);
+      if (!peerPub || !peerMac) { console.warn("kex_pub: bad hex"); return; }
+      const expectedMac = crypto.shareKey.macEphemeralPub(peerPub);
+      // Constant-time-ish compare (JS length is fixed 32 here).
+      let diff = 0;
+      for (let i = 0; i < 32; i++) diff |= (expectedMac[i] ^ peerMac[i]);
+      if (diff !== 0) {
+        console.warn("kex_pub: MAC verify failed — sender doesn't know share key");
+        return;
+      }
+      try {
+        const sk = crypto.ephemeral.deriveSharedSecret(peerPub);
+        crypto.wrapKey = sk.wrapKey(crypto.sessionIdBytes);
+        crypto.metaKey = sk.metaKey(crypto.sessionIdBytes);
+        keysHolder.metaKey = crypto.metaKey;
+      } catch (e) {
+        console.warn("KEX derive failed:", e);
+      }
+      return;
+    }
+    if (frame.type === "key_wrap" && crypto && crypto.wrapKey && !crypto.bulkKey) {
+      const nonce = hexDecode(frame.nonce_hex);
+      const ct = hexDecode(frame.enc_b_hex);
+      if (!nonce || !ct) { console.warn("key_wrap: bad hex"); return; }
+      try {
+        crypto.bulkKey = crypto.wrapKey.unwrapBulkKey(nonce, ct);
+        keysHolder.bulkKey = crypto.bulkKey;
+      } catch (e) {
+        console.warn("key_wrap unwrap failed:", e);
       }
       return;
     }
@@ -1341,8 +1566,14 @@ function currentSessionHex() {
   return isHex64(h) ? h : null;
 }
 
+// Prefers the modern ShareLink shape; falls back to legacy 64-hex.
+function currentSessionFragment() {
+  return parseSessionFragment(location.hash);
+}
+
 function applyRoute() {
-  const hex = currentSessionHex();
+  const fragment = currentSessionFragment();
+  const hex = fragment ? fragment.sessionHex : null;
   const isSendPath = location.pathname === "/send" || location.pathname === "/send/";
 
   // Reset everything
@@ -1366,7 +1597,7 @@ function applyRoute() {
     // Receive mode
     els.recvMode.hidden = false;
     els.tagline.textContent = "receiving";
-    startRecvSession(hex);
+    startRecvSession(hex, fragment);
   } else {
     // Landing / send mode
     els.sendMode.hidden = false;
