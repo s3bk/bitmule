@@ -79,6 +79,9 @@
               Total: <span id="session-total-count">0</span>
             </div>
           </div>
+          <!-- F01: per-peer progress list. One row per receiver
+               currently connected; updated live as chunks flush. -->
+          <ul id="peer-progress-list" class="peer-progress-list" aria-live="polite"></ul>
           <button id="cancel-session" class="cancel-btn" type="button">
             Cancel
           </button>

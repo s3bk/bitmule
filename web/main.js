@@ -133,6 +133,7 @@ const els = {
   stopAfterFirst: document.getElementById("stop-after-first"),
   sessionActiveCount: document.getElementById("session-active-count"),
   sessionTotalCount: document.getElementById("session-total-count"),
+  peerProgressList: document.getElementById("peer-progress-list"),
 
   // F00 options menu
   optMultiSend: document.getElementById("opt-multi-send"),
@@ -907,6 +908,7 @@ async function startSendSession(files) {
         }
         try { peer.wrpc.close(); } catch {}
         session.peers.delete(fromId);
+        removePeerProgressRow(fromId);
         updateSendCounters();
         if (session.activeCount === 0) {
           els.sessionState.textContent = "waiting for receiver…";
@@ -967,6 +969,40 @@ function updateSendCounters() {
   if (els.sessionTotalCount) els.sessionTotalCount.textContent = String(sendSession.totalCount);
 }
 
+// F01: per-peer progress rendering. One <li> per peer, keyed by
+// receiver_id. Reads live from session.peers state; the sender's
+// chunk-loop bumps peer.bytesSent + peer.bytesTotal on each write.
+function upsertPeerProgressRow(peer, statusText) {
+  if (!els.peerProgressList) return;
+  const id = "peer-row-" + peer.receiverId;
+  let row = document.getElementById(id);
+  if (!row) {
+    row = document.createElement("li");
+    row.id = id;
+    row.className = "peer-progress-row";
+    row.innerHTML = `
+      <span class="peer-progress-id"></span>
+      <span class="peer-progress-bar"><span class="peer-progress-bar-fill"></span></span>
+      <span class="peer-progress-status"></span>
+    `;
+    row.querySelector(".peer-progress-id").textContent = peer.receiverId.slice(0, 8) + "…";
+    els.peerProgressList.appendChild(row);
+  }
+  const total = peer.bytesTotal || 0;
+  const sent = peer.bytesSent || 0;
+  const pct = total > 0 ? Math.min(100, Math.floor((sent / total) * 100)) : 0;
+  row.querySelector(".peer-progress-bar-fill").style.width = pct + "%";
+  const st = statusText != null
+    ? statusText
+    : (total > 0 ? `${pct}% (${fmtSize(sent)} / ${fmtSize(total)})` : "connecting…");
+  row.querySelector(".peer-progress-status").textContent = st;
+}
+
+function removePeerProgressRow(receiverId) {
+  const row = document.getElementById("peer-row-" + receiverId);
+  if (row) row.remove();
+}
+
 // Spawn a per-receiver peer task. Called on peer_hello with a fresh
 // from_receiver_id. Owns its own RTCPeerConnection + Ephemeral + DC.
 // Handles the full modern wire: KEX over WS → key_wrap → meta_enc
@@ -986,7 +1022,10 @@ function startPeerForReceiver(session, receiverId) {
     metaSent: false,
     complete: false,
     dc: null,
+    bytesSent: 0,
+    bytesTotal: (session.files && session.files[0]) ? session.files[0].size : 0,
   };
+  upsertPeerProgressRow(peer, "connecting…");
 
   // Fresh ephemeral X25519 keypair for THIS peer's KEX.
   peer.ephemeral = new window.bitmule.Ephemeral();
@@ -1013,6 +1052,8 @@ function startPeerForReceiver(session, receiverId) {
         try { peer.dc && peer.dc.send(JSON.stringify({ type: "done_ack" })); }
         catch (e) { console.warn("done_ack send failed:", e); }
         peer.complete = true;
+        upsertPeerProgressRow(peer, "✓ complete");
+        setTimeout(() => removePeerProgressRow(peer.receiverId), 4000);
         session.activeCount = Math.max(0, session.activeCount - 1);
         updateSendCounters();
         try { peer.wrpc.close(); } catch {}
@@ -1149,13 +1190,17 @@ async function sendMetaAndChunksForPeer(session, peer) {
     // Live progress in the shared session-state line (single-peer
     // view; per-peer progress would need extra UI). Coalesces via
     // the counters block for the multipeer story.
-    if (idx % 16 === 0) {
+    peer.bytesSent = offset;
+    if (idx % 8 === 0) {
+      upsertPeerProgressRow(peer);
       const pct = Math.floor((offset / file.size) * 100);
       els.sessionState.textContent =
         `sending to ${peer.receiverId.slice(0,8)}… ${pct}% (${fmtSize(offset)} / ${fmtSize(file.size)})`;
     }
   }
   peer.chunkIdx = idx;
+  peer.bytesSent = file.size;
+  upsertPeerProgressRow(peer, "delivered, awaiting ack");
   // Chunks done. Receiver will send recv_done on its side once it's
   // decrypted everything, and our onMessage handler above ships
   // done_ack + closes the peer.
