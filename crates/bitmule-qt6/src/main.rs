@@ -203,7 +203,7 @@ impl UploaderApi {
             copy_to_clipboard(&url_str);
 
             // Update UI safely on main thread
-            if let Some(mut api) = qpointer.as_pinned() {
+            if let Some(api) = qpointer.as_pinned() {
                 {
                     let mut a = api.borrow_mut();
                     a.share_url = QString::from(url_str);
@@ -249,7 +249,7 @@ impl UploaderApi {
         if let Ok(mut q) = self.fetch_queue_urls.lock() {
             q.retain(|x| x != &u);
             self.fetch_queue = QStringList::from(
-                q.iter().map(QString::from).collect::<Vec<_>>()
+                q.iter().map(|s| QString::from(s.as_str())).collect::<Vec<_>>()
             );
         }
         self.fetch_queue_changed();
@@ -306,16 +306,16 @@ impl UploaderApi {
                 }
                 if let Ok(mut q) = queue_urls.lock() { q.push(trimmed.clone()); }
                 // Push into the QStringList property on the UI thread.
-                if let Some(mut api) = qpointer.as_pinned() {
+                if let Some(api) = qpointer.as_pinned() {
                     let snap: Vec<QString> = queue_urls.lock()
-                        .map(|q| q.iter().map(QString::from).collect())
+                        .map(|q| q.iter().map(|s| QString::from(s.as_str())).collect())
                         .unwrap_or_default();
                     api.borrow_mut().fetch_queue = QStringList::from(snap);
                     api.borrow_mut().fetch_queue_changed();
                 }
                 if auto {
-                    let u_q = QString::from(&trimmed);
-                    if let Some(mut api) = qpointer.as_pinned() {
+                    let u_q = QString::from(trimmed.as_str());
+                    if let Some(api) = qpointer.as_pinned() {
                         let _ = api.borrow_mut().open_fetch_url(u_q);
                     }
                 }
