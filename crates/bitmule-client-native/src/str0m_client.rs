@@ -2312,21 +2312,29 @@ async fn peer_session_run(
                         &mut dc_in,
                     )
                     .await?;
-                    drain_until_buffer_empty_peer(
+                    // Fire RecvDone to the orchestrator BEFORE the tail
+                    // drain — the peer has the file, that's the durable
+                    // signal Complete mode needs. Post-DoneAck the
+                    // receiver may tear down its SCTP before we finish
+                    // buffered-amount draining, so a drain error here is
+                    // wire hygiene, not a transfer failure: log-and-swallow
+                    // so the peer task exits Ok and `await_complete` sees
+                    // the note we already sent.
+                    let _ = note_tx.send(CoveredNote::RecvDone {
+                        receiver_id: session.receiver_id,
+                    });
+                    if let Err(e) = drain_until_buffer_empty_peer(
                         &mut session.rtc,
                         &pool,
                         session.channel_id,
                         &mut pool_rx,
                         &mut dc_in,
                     )
-                    .await?;
+                    .await
+                    {
+                        warn!(peer = %rid_hex, "post-DoneAck drain: {e} — treating as clean, receiver already has the file");
+                    }
                     info!(peer = %rid_hex, "recv_done + DoneAck exchanged — exiting peer task");
-                    // M2b-8: notify orchestrator this peer got the file
-                    // so `await_complete` can fire the mode-aware exit
-                    // (Complete: shut down siblings; Multi: keep serving).
-                    let _ = note_tx.send(CoveredNote::RecvDone {
-                        receiver_id: session.receiver_id,
-                    });
                     recv_done = true;
                     break;
                 }
@@ -2566,7 +2574,11 @@ async fn drain_rtc_capture_dc_frames(
 
 /// Peer-task equivalent of `drain_until_buffer_empty` — waits for SCTP to
 /// flush any queued writes before returning. Called after DoneAck so the
-/// task can exit without truncating the ack on the wire.
+/// task can exit without truncating the ack on the wire. Bounded at 2s:
+/// if the receiver's SCTP has already gone away it may never ACK the
+/// last write and `buffered_amount` never reaches 0. The RecvDone note
+/// has already fired to the orchestrator by this point, so failing to
+/// drain is wire hygiene, not a correctness concern.
 async fn drain_until_buffer_empty_peer(
     rtc: &mut Rtc,
     pool: &SocketPool,
@@ -2574,6 +2586,7 @@ async fn drain_until_buffer_empty_peer(
     pool_rx: &mut broadcast::Receiver<PoolRecv>,
     dc_in: &mut Vec<(bool, Vec<u8>)>,
 ) -> Result<()> {
+    let hard_deadline = Instant::now() + std::time::Duration::from_secs(2);
     let mut next_timeout = drain_rtc_capture_dc_frames(rtc, pool, channel_id, dc_in).await?;
     loop {
         let buffered = {
@@ -2585,7 +2598,12 @@ async fn drain_until_buffer_empty_peer(
         if buffered == 0 {
             return Ok(());
         }
-        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
+        if Instant::now() >= hard_deadline {
+            bail!("drain deadline: {buffered} bytes still buffered after 2s");
+        }
+        let dur = (next_timeout - Instant::now())
+            .max(std::time::Duration::from_millis(1))
+            .min(hard_deadline - Instant::now());
         tokio::select! {
             maybe_pr = pool_rx.recv() => {
                 use broadcast::error::RecvError;

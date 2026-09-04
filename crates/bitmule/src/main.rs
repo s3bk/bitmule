@@ -235,11 +235,25 @@ where
         link.to_b64_url()
     );
 
+    // Default sender is the multipeer stack via send_serve. `--multi`
+    // picks ServeMode::Multi (never exits); the default is
+    // ServeMode::Complete (exits after the first peer completes) —
+    // same one-shot UX as the legacy single-peer send_file it replaces.
+    // Relay-only mode (--relay) has no multipeer equivalent yet; fall
+    // back to the legacy send_file path to keep server-relay transfers
+    // working. --auto currently maps to WebRTC via send_serve (no
+    // 3s→relay fallback yet; add later if needed).
     let handle = tokio::spawn(async move {
-        if multi {
-            send_file_multi(&server, share_key, bulk_key, path, ServeMode::Multi).await
-        } else {
-            send_file(&server, share_key, bulk_key, &path, mode, on_progress).await
+        match (multi, mode) {
+            (_, TransportMode::Relay) => {
+                send_file(&server, share_key, bulk_key, &path, mode, on_progress).await
+            }
+            (true, _) => {
+                send_file_multi(&server, share_key, bulk_key, path, ServeMode::Multi).await
+            }
+            (false, _) => {
+                send_file_multi(&server, share_key, bulk_key, path, ServeMode::Complete).await
+            }
         }
     });
 
@@ -271,10 +285,16 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool)
 
     println!("session: {}", session_hex);
     println!("share:   {share_url}");
-    if multi {
-        println!("mode:    multi-peer (WebRTC, never exits — Ctrl-C to stop)");
-    } else {
-        println!("mode:    {}", mode_label(mode));
+    match (multi, mode) {
+        (_, TransportMode::Relay) => {
+            println!("mode:    relay only (legacy single-peer)");
+        }
+        (true, _) => {
+            println!("mode:    multi-peer (WebRTC, never exits — Ctrl-C to stop)");
+        }
+        (false, _) => {
+            println!("mode:    complete (WebRTC, exits after first receiver has the file)");
+        }
     }
     println!("sending {} ({} bytes)…", path.display(), file_size);
     use std::io::Write;
