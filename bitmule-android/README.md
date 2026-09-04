@@ -23,7 +23,8 @@ cargo ndk -t aarch64-linux-android \
 cargo run --features=cli --bin uniffi-bindgen -- generate \
     --library ../../target/aarch64-linux-android/release/libbitmule_mobile_ffi.so \
     --language kotlin \
-    --out-dir ../../bitmule-android/app/src/main/java
+    --out-dir ../../bitmule-android/app/src/main/java \
+    --no-format
 
 # 3. Build the APK.
 cd ../../bitmule-android
