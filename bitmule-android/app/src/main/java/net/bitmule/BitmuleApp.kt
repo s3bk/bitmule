@@ -47,7 +47,13 @@ fun BitmuleApp(
     onConsumedUrl: () -> Unit,
 ) {
     var tab by remember { mutableStateOf(if (initialUrl != null) 1 else 0) }
-    Column(modifier = Modifier.fillMaxSize()) {
+    // `safeDrawingPadding()` inset shifts the whole tree below the
+    // display cutout / status bar / IME so the TabRow isn't clipped
+    // by the camera notch on phones with a top cutout (where the
+    // tap area was being swallowed by the notch region).
+    Column(modifier = Modifier
+        .fillMaxSize()
+        .safeDrawingPadding()) {
         TabRow(selectedTabIndex = tab) {
             Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Send") })
             Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Receive") })
