@@ -2114,13 +2114,17 @@ let clipboardWatchTimer = null;
 let lastClipboardText = "";
 const fetchQueueLinks = new Map(); // url → { status: "pending"|"downloading"|"done" }
 
+// Prefix check for clipboard-detected links. Per Seb 2026-09-04: only
+// accept URLs starting with `https://bitmule.qdat.net/#`. Anything
+// else — different origin, http (not https), missing hash — is
+// ignored to keep the queue from filling with random hash-shaped URLs.
+// parseSessionFragment does the definitive validation on the fragment
+// itself; this is just a fast prefilter on the URL.
 function isValidBitmuleUrl(text) {
   if (typeof text !== "string") return false;
   const trimmed = text.trim();
-  // Rough check: matches http(s)://…/#<hex-or-b64url>. parseSessionFragment
-  // does the definitive validation; this is just a fast prefilter.
-  const m = trimmed.match(/^(https?:\/\/[^\s#]+)(#[A-Za-z0-9_\-=]{20,})$/);
-  return !!m;
+  return trimmed.startsWith("https://bitmule.qdat.net/#")
+    && trimmed.length > "https://bitmule.qdat.net/#".length;
 }
 
 function isOurOwnLink(url) {
