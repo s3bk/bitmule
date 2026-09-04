@@ -327,9 +327,9 @@ pub struct PeerSession {
 /// sender-side multipeer stack. Holds the shared WS router+writer, the
 /// per-peer task map, and the shared SocketPool alive for the run.
 ///
-/// M2b-5: fields wired but no consumer yet (cmd_send stays on
-/// send_connect). M2b-6+ will drive the orchestrator from cmd_send and
-/// exercise the --complete exit predicate over `peers`.
+/// M2b-8 grows `note_rx` for peer-task → orchestrator notifications
+/// (RecvDone, TaskError) so `await_complete` can drive the mode-aware
+/// exit predicate.
 #[allow(dead_code)]
 pub struct SenderOrchestrator {
     pub shared: Arc<SenderShared>,
@@ -342,5 +342,81 @@ pub struct SenderOrchestrator {
     /// Orchestrator loop task — reads unrouted (peer_hello) frames and
     /// spawns per-peer tasks. Exits on WS close.
     pub loop_task: tokio::task::JoinHandle<Result<()>>,
+    /// M2b-8: per-peer notifications back to the orchestrator. Peer
+    /// tasks send `RecvDone` after the sender→receiver DoneAck exchange
+    /// completes cleanly, and `TaskError` on abnormal exit. `await_complete`
+    /// consumes this to drive mode-aware exit (Complete: shut down all
+    /// peers when the first one finishes; Multi: log + continue).
+    pub(crate) note_rx: mpsc::UnboundedReceiver<CoveredNote>,
+}
+
+impl SenderOrchestrator {
+    /// Drive the orchestrator to its mode-dependent end state.
+    ///
+    /// - `ServeMode::Complete`: return `Ok(())` the moment the first
+    ///   peer's DoneAck exchange completes. Signals every other peer
+    ///   task to shut down cleanly + drains the WS router+writer.
+    ///   Semantic match to docs/multipeer.md §"--complete early exit
+    ///   predicate": get the file to A destination, not exit after N
+    ///   minutes.
+    /// - `ServeMode::Multi`: never returns Ok. Runs until either the
+    ///   WS closes (orchestrator loop exits, propagated as Err) or
+    ///   `stop_and_shutdown` is called on the handle. `TaskError`
+    ///   notes are logged but don't terminate the sender.
+    pub async fn await_complete(&mut self) -> Result<()> {
+        use tracing::{info, warn};
+        let mode = self.shared.mode;
+        loop {
+            let note = match self.note_rx.recv().await {
+                Some(n) => n,
+                None => {
+                    // Every peer-task sender clone dropped without note.
+                    // Happens if the orchestrator loop dies before any
+                    // peer connects (WS close) — propagate as error.
+                    return Err(anyhow!("all peer-note senders dropped without RecvDone"));
+                }
+            };
+            match note {
+                CoveredNote::RecvDone { receiver_id } => {
+                    let rid_hex = receiver_id.as_hex();
+                    match mode {
+                        ServeMode::Complete => {
+                            info!(peer = %rid_hex, "peer completed — shutting down orchestrator (Complete mode)");
+                            self.shutdown_all_peers().await;
+                            return Ok(());
+                        }
+                        ServeMode::Multi => {
+                            info!(peer = %rid_hex, "peer completed — continuing to serve (Multi mode)");
+                        }
+                    }
+                }
+                CoveredNote::TaskError { receiver_id, error } => {
+                    warn!(peer = %receiver_id.as_hex(), "peer task errored: {error} — other peers keep serving");
+                }
+            }
+        }
+    }
+
+    /// Signal every currently-registered peer task to shut down cleanly,
+    /// then await their exits. Used by `await_complete` on Complete-mode
+    /// success and by callers who want to stop a Multi-mode server.
+    pub async fn shutdown_all_peers(&self) {
+        use tracing::{debug, warn};
+        // Take ownership of the peer handles (empties the map) so we can
+        // move each `task` into an await without holding the mutex.
+        let handles: Vec<PeerHandle> = {
+            let mut peers = self.peers.lock().await;
+            peers.drain().map(|(_k, v)| v).collect()
+        };
+        for handle in handles {
+            let rid = handle.receiver_id.as_hex();
+            let _ = handle._shutdown_tx.send(true);
+            match handle.task.await {
+                Ok(Ok(())) => debug!(peer = %rid, "peer task joined clean"),
+                Ok(Err(e)) => warn!(peer = %rid, "peer task exited with err: {e}"),
+                Err(je) => warn!(peer = %rid, "peer task join panic: {je}"),
+            }
+        }
+    }
 }
 

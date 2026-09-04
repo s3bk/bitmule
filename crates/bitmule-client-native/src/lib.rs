@@ -23,7 +23,8 @@ pub mod str0m_client;
 pub mod crypto;
 pub mod pipeline;
 pub mod multipeer;
-pub use str0m_client::{LiveSession, recv_file, send_file};
+pub use str0m_client::{LiveSession, recv_file, send_file, send_file_multi};
+pub use multipeer::ServeMode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;

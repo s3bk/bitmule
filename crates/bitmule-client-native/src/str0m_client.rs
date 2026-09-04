@@ -1252,6 +1252,32 @@ pub async fn send_file(
     }
 }
 
+/// M2b-8: multipeer send entry — opens the shared-WS + shared-pool
+/// orchestrator and serves `file_path` to every peer that connects
+/// under URL `server_url_http`.
+///
+/// - `ServeMode::Complete`: returns `Ok(())` as soon as the first peer
+///   completes its DoneAck exchange. Every other in-flight peer task
+///   is cleanly signalled to shut down before this returns.
+/// - `ServeMode::Multi`: never returns `Ok`. Runs until the underlying
+///   WS closes (returned as Err) or the caller aborts the future.
+///
+/// Relay incompatibility: the multipeer stack requires WebRTC — the
+/// per-peer serve loop lives inside WebRTC data channels and there's
+/// no relay-equivalent right now. If relay-multi is needed, the option
+/// (a) shape from docs/multipeer.md §"Open questions" (single-B-shared
+/// KEX over relay) can land in a follow-up; not in M2b-8.
+pub async fn send_file_multi(
+    server_url_http: &str,
+    share_key: ShareKey,
+    bulk_key: BulkKey,
+    file_path: PathBuf,
+    mode: crate::multipeer::ServeMode,
+) -> Result<()> {
+    let mut orch = send_serve(server_url_http, share_key, bulk_key, file_path, mode).await?;
+    orch.await_complete().await
+}
+
 /// Receive one file for `session_id`. Same dispatch shape as [`send_file`].
 ///
 /// `expected_signature` — when `Some`, the on-disk file is stream-hashed
@@ -1808,7 +1834,7 @@ fn constant_time_eq_bytes<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
 //   - Receiver-side stays untouched.
 
 use crate::multipeer::{
-    ws_enqueue_targeted, DcControlFrame, PeerHandle, PeerRegistration, PeerSession,
+    ws_enqueue_targeted, CoveredNote, DcControlFrame, PeerHandle, PeerRegistration, PeerSession,
     SenderOrchestrator, SenderShared, WsRouterHandle,
 };
 use bitmule_core::ReceiverId;
@@ -1823,12 +1849,14 @@ use tokio::sync::{mpsc, watch, Mutex};
 /// Returns a `PeerHandle` that the orchestrator stores in its peers
 /// map for progress reporting + shutdown signalling.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_peer_task(
     receiver_id: ReceiverId,
     shared: Arc<SenderShared>,
     pool: Arc<SocketPool>,
     outbox_tx: mpsc::UnboundedSender<Message>,
     router_register: &mpsc::UnboundedSender<PeerRegistration>,
+    note_tx: mpsc::UnboundedSender<CoveredNote>,
 ) -> Result<PeerHandle> {
     let rid_hex = receiver_id.as_hex();
 
@@ -1877,8 +1905,12 @@ pub(crate) async fn spawn_peer_task(
     let shutdown_rx_task = shutdown_rx.clone();
     let outbox_task = outbox_tx.clone();
     let pool_task = pool.clone();
+    // Clone receiver_id for the task's error-path note; the task also
+    // sends the receiver_id via the RecvDone note on clean exit.
+    let receiver_id_for_note = receiver_id;
+    let note_tx_for_task = note_tx.clone();
     let task = tokio::spawn(async move {
-        peer_session_run(
+        let result = peer_session_run(
             session,
             pool_task,
             offer,
@@ -1887,8 +1919,19 @@ pub(crate) async fn spawn_peer_task(
             pool_rx,
             outbox_task,
             shutdown_rx_task,
+            note_tx_for_task.clone(),
         )
-        .await
+        .await;
+        // On abnormal exit, notify the orchestrator so `await_complete`
+        // can log + keep other peers alive. Clean exits already sent
+        // RecvDone from inside the block-serve loop; don't double-notify.
+        if let Err(ref e) = result {
+            let _ = note_tx_for_task.send(CoveredNote::TaskError {
+                receiver_id: receiver_id_for_note,
+                error: format!("{e:#}"),
+            });
+        }
+        result
     });
 
     Ok(PeerHandle {
@@ -1912,6 +1955,7 @@ pub(crate) async fn spawn_peer_task(
 /// each broadcast packet locally to drop foreign traffic without ever
 /// touching the wrong Rtc.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 async fn peer_session_run(
     mut session: PeerSession,
     pool: Arc<SocketPool>,
@@ -1921,6 +1965,7 @@ async fn peer_session_run(
     mut pool_rx: broadcast::Receiver<PoolRecv>,
     outbox_tx: mpsc::UnboundedSender<Message>,
     mut shutdown_rx: watch::Receiver<bool>,
+    note_tx: mpsc::UnboundedSender<CoveredNote>,
 ) -> Result<()> {
     let rid_hex = session.receiver_id.as_hex();
     info!(peer = %rid_hex, "peer task starting handshake");
@@ -2202,6 +2247,12 @@ async fn peer_session_run(
                     )
                     .await?;
                     info!(peer = %rid_hex, "recv_done + DoneAck exchanged — exiting peer task");
+                    // M2b-8: notify orchestrator this peer got the file
+                    // so `await_complete` can fire the mode-aware exit
+                    // (Complete: shut down siblings; Multi: keep serving).
+                    let _ = note_tx.send(CoveredNote::RecvDone {
+                        receiver_id: session.receiver_id,
+                    });
                     recv_done = true;
                     break;
                 }
@@ -2549,6 +2600,12 @@ pub async fn send_serve(
 
     let peers: Arc<Mutex<HashMap<String, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    // M2b-8: peer-task → orchestrator note channel. Peer tasks send
+    // RecvDone after a clean DoneAck exchange and TaskError on abnormal
+    // exit. `SenderOrchestrator::await_complete` consumes this to drive
+    // the mode-aware exit predicate.
+    let (note_tx, note_rx) = mpsc::unbounded_channel::<CoveredNote>();
+
     // Orchestrator loop: consume unrouted frames (PeerHello notifications
     // from the signaling server). Spawn per-peer task on each new one;
     // ignore duplicates; bail on version mismatch as send_connect does.
@@ -2557,6 +2614,7 @@ pub async fn send_serve(
     let outbox_loop = writer.outbox_tx.clone();
     let register_loop = router.register_tx.clone();
     let pool_loop = pool.clone();
+    let note_tx_loop = note_tx.clone();
     // Move the unrouted receiver into the loop task; the WsRouterHandle
     // gave it to us by value in the handle struct.
     // NOTE: WsRouterHandle::unrouted_rx is owned by the handle; take it
@@ -2622,6 +2680,7 @@ pub async fn send_serve(
                 pool_loop.clone(),
                 outbox_loop.clone(),
                 &register_for_loop,
+                note_tx_loop.clone(),
             )
             .await
             {
@@ -2648,11 +2707,19 @@ pub async fn send_serve(
         task: router_task,
     };
 
+    // Drop the seed note_tx clone we minted at the top so
+    // note_rx.recv() returns None once every peer-task tx clone
+    // exits (belt-and-braces: `await_complete` treats that None as
+    // "orchestrator dead, propagate Err" — fine because it should
+    // never occur under normal Complete/Multi lifecycles).
+    drop(note_tx);
+
     Ok(SenderOrchestrator {
         shared,
         peers,
         router,
         writer,
         loop_task,
+        note_rx,
     })
 }

@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
-use bitmule_client_native::{recv_file, send_file, TransportMode};
+use bitmule_client_native::{recv_file, send_file, send_file_multi, ServeMode, TransportMode};
 use clap::{Parser, Subcommand};
 use qrcode::{render::unicode, QrCode};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,13 @@ enum Command {
         /// Force server relay only (skip WebRTC).
         #[arg(long)]
         relay: bool,
+        /// Multi-peer serving: keep the sender live and hand the same
+        /// URL to any number of receivers over time (Ctrl-C to stop).
+        /// Implies WebRTC (relay path not supported in --multi yet).
+        /// Without this flag, `bitmule send` exits as soon as one
+        /// receiver has the whole file (ServeMode::Complete).
+        #[arg(long, conflicts_with = "relay")]
+        multi: bool,
     },
     /// Receive a file. With SESSION (a hex or a share URL), connects to
     /// an existing session initiated by a sender. Without SESSION,
@@ -120,8 +127,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Send { path, webrtc, relay } => {
-            cmd_send(&cli.server, path, resolve_mode(webrtc, relay)).await
+        Command::Send { path, webrtc, relay, multi } => {
+            cmd_send(&cli.server, path, resolve_mode(webrtc, relay), multi).await
         }
         Command::Recv { session, out, webrtc, relay } => {
             cmd_recv(&cli.server, session, out, resolve_mode(webrtc, relay)).await
@@ -167,7 +174,7 @@ async fn commit_file(path: &Path, bulk_key: &BulkKey) -> Result<[u8; 32]> {
     Ok(hasher.finalize(bulk_key))
 }
 
-async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()> {
+async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode, multi: bool) -> Result<()> {
     let meta = tokio::fs::metadata(&path).await
         .with_context(|| format!("stat {}", path.display()))?;
     if !meta.is_file() {
@@ -189,10 +196,26 @@ async fn cmd_send(server: &str, path: PathBuf, mode: TransportMode) -> Result<()
     );
     println!("session: {}", session_hex);
     println!("share:   {share}");
-    println!("mode:    {}", mode_label(mode));
+    if multi {
+        println!("mode:    multi-peer (WebRTC, never exits — Ctrl-C to stop)");
+    } else {
+        println!("mode:    {}", mode_label(mode));
+    }
     println!("sending {} ({} bytes)…", path.display(), meta.len());
     use std::io::Write;
     std::io::stdout().flush().ok();
+
+    if multi {
+        // M2b-8: multipeer serve. Runs until Ctrl-C (WS closes on
+        // disconnect, propagated as Err from await_complete). Complete
+        // is the exit predicate the CALLER opts out of by passing
+        // --multi; without --multi we still route through legacy
+        // send_file for the tested single-peer path.
+        send_file_multi(server, share_key, bulk_key, path, ServeMode::Multi).await?;
+        eprintln!();
+        println!("multi-peer server exited.");
+        return Ok(());
+    }
 
     let name_for_progress = path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
