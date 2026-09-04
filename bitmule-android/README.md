@@ -24,7 +24,7 @@ cargo run --features=cli --bin uniffi-bindgen -- generate \
 
 # 3. Build the APK.
 cd ../../bitmule-android
-./gradlew :app:assembleDebug
+gradle build :app:assembleDebug
 ```
 
 APK lands at `app/build/outputs/apk/debug/app-debug.apk`.

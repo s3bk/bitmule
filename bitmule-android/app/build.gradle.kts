@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "net.bitmule"
-        minSdk = 26          // WebRTC + Compose comfortable floor.
+        minSdk = 33          // WebRTC + Compose comfortable floor.
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
