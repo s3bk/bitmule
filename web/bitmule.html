@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>bitmule</title>
+<title>bit Mule</title>
+<link rel="icon" type="image/svg+xml" href="/icons/icon256.webp" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -46,9 +47,9 @@
   }
 
   html[data-theme="beige"]{
-    --color-bg:            #E8DCC3;
-    --color-surface:       #E0D0AE;
-    --color-surface-alt:   #D6C39B;
+    --color-bg:            #FFFBF3;
+    --color-surface:       #FFF2E2;
+    --color-surface-alt:   #FFFAE1;
     --color-border:        rgba(59, 42, 20, 0.18);
     --color-border-strong: rgba(59, 42, 20, 0.34);
     --color-text:          #2B1E12;
@@ -56,7 +57,7 @@
     --color-text-faint:    #8A7455;
     --color-accent:        #7A3B1E;
     --color-accent-dim:    #5C2C15;
-    --color-accent-wash:   rgba(122, 59, 30, 0.09);
+    --color-accent-wash:   rgba(30, 96, 122, 0.09);
     --color-accent-2:      #55613F;
   }
 
@@ -106,15 +107,20 @@
     padding-bottom:16px;
     margin-bottom:34px;
   }
-  .wordmark{
+  .wordmark {
+      font-weight:500;
+      letter-spacing:-0.01em;
+      color:var(--color-text);
+  }
+  div.wordmark{
     font-family:'Newsreader', serif;
     font-size:clamp(26px,3.6vw,34px);
-    font-weight:500;
-    letter-spacing:-0.01em;
-    color:var(--color-text);
     line-height:1.1;
   }
-  .wordmark span{color:var(--color-accent);}
+  .wordmark span{
+      color:var(--color-accent);
+      margin-left: 0.5ex;
+  }
   .tagline{
     font-size:13px;
     color:var(--color-text-muted);
@@ -138,9 +144,8 @@ html[data-theme="beige"] .logo {
     mix-blend-mode: multiply;
 }
   html[data-theme="purple"] .logo {
-    background-image: url("icons/icon_bw_500.webp");
-    mix-blend-mode: plus-lighter;
-    filter: invert(1);
+    background-image: url("icons/icon_bw2_500.webp");
+    mix-blend-mode: luminosity;
   }
   html[data-theme="green"] .logo {
     background-image: url("icons/icon_color.webp");
@@ -163,7 +168,6 @@ html[data-theme="beige"] .logo {
     align-items:center;
     gap:6px;
     background:var(--color-surface);
-    border:1px solid var(--color-border);
     border-radius:20px;
     padding:5px 10px 5px 6px;
     font-family:'Inter', sans-serif;
@@ -360,7 +364,7 @@ html[data-theme="beige"] .logo {
 
   <header>
     <div>
-      <div class="wordmark">bit<span>mule</span></div>
+      <div class="wordmark">bit<span>Mule</span></div>
       <div class="tagline">Carries your files. Never reads what it's carrying.</div>
     </div>
     <div class="theme-chooser">
@@ -378,7 +382,7 @@ html[data-theme="beige"] .logo {
   <section class="page-section">
     <div class="section-head"><h2>What is it?</h2></div>
     <p class="lede">
-      <b>bitmule</b> is an end-to-end encrypted file transfer tool. Send something directly, peer-to-peer,
+        <span class="wordmark">bit<span>Mule</span></span> is an end-to-end encrypted file transfer tool. Send something directly, peer-to-peer,
       for free — or subscribe to hosted uploads and a hosted inbox so you can send and receive without
       either device staying online. Desktop, CLI, web and mobile all speak the same protocol, and the
       server is built to never see what's inside your files, encrypted or not.
@@ -554,8 +558,8 @@ html[data-theme="beige"] .logo {
   </section>
 
   <footer>
-    <span>bitmule — a mule for your bits. It carries the crate; it never asks what's inside.</span>
-    <span>Have a feature request, or found something that doesn't work as described? <a href="#">Tell us</a>.</span>
+    <div><span class="wordmark">bit<span>Mule</span></span> — a mule for your bits. It carries the crate; it never asks what's inside.</div>
+    <div>Have a feature request, or found something that doesn't work as described? <a href="#">Tell us</a>.</div>
   </footer>
 
 </div>
