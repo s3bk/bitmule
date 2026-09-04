@@ -2,6 +2,31 @@ namespace bitmule_mobile_ffi {
   // Semver of this FFI surface. Bump on any breaking change so the
   // Kotlin / Swift shell can bail fast on mismatched .so vs bindings.
   string ffi_version();
+
+  // Pure-function URL splitter for the paste-and-preview flow so the
+  // shell can validate a link before committing to a full recv.
+  [Throws=BitmuleError]
+  ParsedShareUrl parse_share_url(string url);
+
+  // Async full receive: negotiate → stream → decrypt → verify.
+  [Throws=BitmuleError, Async]
+  RecvOutcome recv_file(string url, string out_dir, ProgressListener on_progress);
+
+  // Async full send. Emits `on_url` with the share URL as soon as
+  // it's minted (before the transfer starts), so the caller can
+  // display + copy + QR the URL while the transfer runs in the
+  // background. Returns when the transfer completes.
+  //
+  // `multi=false` = ServeMode::Complete (exits after first receiver
+  // completes). `multi=true` = ServeMode::Multi (keeps the URL live
+  // for additional receivers until the caller cancels).
+  [Throws=BitmuleError, Async]
+  SendOutcome send_file(string server, string file_path, boolean multi, UrlListener on_url);
+
+  // PNG bytes for a QR-code render of `text`. Pure function; shell
+  // decodes with BitmapFactory (Android) / UIImage (iOS).
+  [Throws=BitmuleError]
+  bytes qr_png_bytes(string text, u32 pixel_scale);
 };
 
 // A share URL parsed into its component parts. Mirrors the fragment
@@ -31,6 +56,12 @@ callback interface ProgressListener {
   void on_progress(u64 received, u64 total, string name);
 };
 
+// Fires once, as soon as the share URL is minted (before transfer
+// starts). Same marshaling contract as ProgressListener.
+callback interface UrlListener {
+  void on_url(string url, string session_hex, string file_name, u64 file_size);
+};
+
 // Result of a completed receive. Contains the final on-disk path
 // (relative to the caller-supplied out_dir) plus the transferred
 // file's declared size. The mobile shell uses `path` to hand the
@@ -41,17 +72,12 @@ dictionary RecvOutcome {
   string name;
 };
 
-// The primary receive entrypoint. Parses the URL, negotiates WebRTC
-// against the signaling server, streams + decrypts chunks into
-// `out_dir`, verifies the transferred signature, and returns the
-// final file path.
-[Async]
-namespace bitmule_mobile_ffi_recv {
-  [Throws=BitmuleError]
-  RecvOutcome recv_file(string url, string out_dir, ProgressListener on_progress);
-
-  // Pure-function URL splitter for the paste-and-preview flow so the
-  // shell can validate a link before committing to a full recv.
-  [Throws=BitmuleError]
-  ParsedShareUrl parse_share_url(string url);
+// Result of a completed send. `share_url` matches what fired via
+// `UrlListener.on_url` earlier — repeated here so a caller that
+// discarded the listener value can still recover it. `peers_served`
+// is 1 in Complete mode, N in Multi mode.
+dictionary SendOutcome {
+  string share_url;
+  string session_hex;
+  u64 peers_served;
 };

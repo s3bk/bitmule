@@ -25,11 +25,13 @@ name = "bitmule_mobile_ffi"
 [dependencies]
 bitmule-client-native = { path = "../bitmule-client-native" }
 bitmule-crypto = { path = "../bitmule-crypto" }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "io-util", "fs"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uniffi = { version = "0.28", features = ["tokio"] }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
