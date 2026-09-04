@@ -595,18 +595,48 @@ fn write_options(opts: &OptionsSnapshot) -> std::io::Result<()> {
     std::fs::write(&path, s)
 }
 
-/// Cross-platform clipboard copy via `arboard`. Returns false and
-/// logs on failure (no display, missing xsel/xclip/wl-clipboard on
-/// Linux, permission denied on macOS/Windows). Non-fatal — the
-/// user's next click on the Copy button retries.
+/// Cross-platform clipboard copy via `arboard`.
+///
+/// Linux caveat: X11/Wayland clipboards go dead the instant the
+/// setting process drops its selection ownership. A synchronous
+/// `Clipboard::new()?.set_text(t)?` returns in ~1 ms, so clipboard
+/// managers (clipman, parcellite, gnome-shell clipboard-indicator)
+/// often miss the paint — the content is gone before they poll.
+///
+/// Fix: spawn a detached thread that owns the Clipboard and calls
+/// `SetExtLinux::wait()`. `wait()` blocks the thread until another
+/// process claims the selection (typically seconds — user paste,
+/// user selects other text, next app copy), keeping the content
+/// alive for the clipboard-manager pickup window. Non-Linux: use
+/// the plain set_text (macOS + Windows retain the clipboard past
+/// process exit natively).
+///
+/// Non-blocking to the caller either way; returns true when the
+/// thread spawn succeeds. Actual paste-success is best-effort.
 fn copy_to_clipboard(text: &str) -> bool {
-    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("clipboard copy failed: {e}");
-            false
+    let t = text.to_string();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        {
+            use arboard::SetExtLinux;
+            match arboard::Clipboard::new() {
+                Ok(mut c) => {
+                    if let Err(e) = c.set().wait().text(t) {
+                        eprintln!("clipboard set().wait() failed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("clipboard init failed: {e}"),
+            }
         }
-    }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match arboard::Clipboard::new().and_then(|mut c| c.set_text(t)) {
+                Ok(()) => {}
+                Err(e) => eprintln!("clipboard copy failed: {e}"),
+            }
+        }
+    });
+    true
 }
 
 /// Render `text` as a QR bitmap and encode it as a
