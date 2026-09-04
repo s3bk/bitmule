@@ -93,19 +93,28 @@ struct UploaderApi {
     // State properties
     is_busy: qt_property!(bool; NOTIFY is_busy_changed),
     share_url: qt_property!(QString; NOTIFY share_url_changed),
+    /// `data:image/svg+xml;base64,...` — bind directly on an Image
+    /// source in QML to display the share URL as a scannable QR code.
+    /// Empty string when no URL is set.
+    qr_data_url: qt_property!(QString; NOTIFY qr_data_url_changed),
     file_list: qt_property!(QStringList; NOTIFY file_list_changed),
 
     // Signals
     is_busy_changed: qt_signal!(),
     share_url_changed: qt_signal!(),
+    qr_data_url_changed: qt_signal!(),
     file_list_changed: qt_signal!(),
 
     // Shared paths state
     paths: Rc<RefCell<Vec<PathBuf>>>,
 
-    // Invokable method from QML
+    // Invokable methods from QML
     add_files: qt_method!(fn(&mut self, urls: QVariantList)),
     trigger_share: qt_method!(fn(&mut self)),
+    /// Copy the current share_url to the system clipboard. QML calls
+    /// this from a Copy button; it also fires automatically inside
+    /// trigger_share the moment the URL is produced.
+    copy_share_url: qt_method!(fn(&mut self) -> bool),
 }
 
 impl UploaderApi {
@@ -137,17 +146,76 @@ impl UploaderApi {
         // Run async operation
         qmetaobject::future::execute_async(async move {
             let url = share(paths).await;
+            let url_str = url.to_string();
+            let qr = qr_data_url_for(&url_str);
+
+            // Copy to clipboard before touching the UI so the user
+            // sees the URL appear and can already paste it. Failures
+            // (no display, missing xdg utilities) are non-fatal — a
+            // Copy button in the QML will let the user try again.
+            copy_to_clipboard(&url_str);
 
             // Update UI safely on main thread
             if let Some(mut api) = qpointer.as_pinned() {
-                api.borrow_mut().share_url = QString::from(url.to_string());
+                {
+                    let mut a = api.borrow_mut();
+                    a.share_url = QString::from(url_str);
+                    a.qr_data_url = QString::from(qr);
+                    a.is_busy = false;
+                }
                 api.borrow_mut().share_url_changed();
-
-                api.borrow_mut().is_busy = false;
+                api.borrow_mut().qr_data_url_changed();
                 api.borrow_mut().is_busy_changed();
             }
         });
     }
+
+    fn copy_share_url(&mut self) -> bool {
+        let url = self.share_url.to_string();
+        if url.is_empty() { return false; }
+        copy_to_clipboard(&url)
+    }
+}
+
+/// Cross-platform clipboard copy via `arboard`. Returns false and
+/// logs on failure (no display, missing xsel/xclip/wl-clipboard on
+/// Linux, permission denied on macOS/Windows). Non-fatal — the
+/// user's next click on the Copy button retries.
+fn copy_to_clipboard(text: &str) -> bool {
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("clipboard copy failed: {e}");
+            false
+        }
+    }
+}
+
+/// Render `text` as a QR SVG and encode it as a `data:image/svg+xml;
+/// base64,...` URL suitable for direct binding to a QML Image.source.
+/// Returns an empty string when the input is empty or QR generation
+/// fails (typically because the payload is too large for QR at any
+/// error-correction level).
+fn qr_data_url_for(text: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use qrcode::render::svg;
+    use qrcode::QrCode;
+
+    if text.is_empty() { return String::new(); }
+    let code = match QrCode::new(text.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("qr generation failed: {e}");
+            return String::new();
+        }
+    };
+    let svg_str = code
+        .render()
+        .min_dimensions(240, 240)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg_str))
 }
 
 #[tokio::main]

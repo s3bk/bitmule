@@ -62,11 +62,54 @@ Window {
             onClicked: api.trigger_share()
         }
 
-        // Status / URL Display
+        // Busy indicator while share is being prepared.
         Text {
-            text: api.is_busy ? "Uploading..." : (api.share_url ? "Shared URL: " + api.share_url : "")
+            text: "Uploading..."
+            visible: api.is_busy
             Layout.alignment: Qt.AlignHCenter
             font.pixelSize: 12
+        }
+
+        // Share URL + copy button + QR code, all bound to the same
+        // api.share_url. Hidden until a URL exists so an empty state
+        // doesn't clutter the layout.
+        ColumnLayout {
+            Layout.fillWidth: true
+            spacing: 6
+            visible: api.share_url.length > 0
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+
+                // Read-only TextField so the URL is selectable +
+                // Ctrl-C-copyable. selectByMouse gives drag-select.
+                TextField {
+                    id: shareUrlField
+                    Layout.fillWidth: true
+                    text: api.share_url
+                    readOnly: true
+                    selectByMouse: true
+                    font.pixelSize: 12
+                    horizontalAlignment: TextInput.AlignLeft
+                }
+
+                Button {
+                    text: "Copy"
+                    onClicked: api.copy_share_url()
+                }
+            }
+
+            // Scannable QR of the share URL — bound directly to a
+            // data:image/svg+xml;base64 URL produced Rust-side.
+            Image {
+                source: api.qr_data_url
+                Layout.alignment: Qt.AlignHCenter
+                Layout.preferredWidth: 240
+                Layout.preferredHeight: 240
+                fillMode: Image.PreserveAspectFit
+                smooth: false
+            }
         }
     }
 }

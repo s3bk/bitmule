@@ -10,3 +10,6 @@ c_str_macro = "*"
 bitmule-client-native = { path = "../bitmule-client-native" }
 bitmule-crypto = { path = "../bitmule-crypto" }
 anyhow = "1"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+arboard = "3"
+base64 = "0.22"
