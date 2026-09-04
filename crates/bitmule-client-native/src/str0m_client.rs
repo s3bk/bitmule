@@ -833,7 +833,9 @@ async fn drain_rtc_capture_data(
                         });
                         let near_tail = expected_last_idx.is_some_and(|last| *recv_idx + 3 >= last);
                         if *recv_idx < 3 || *recv_idx % 25 == 0 || near_tail {
-                            info!("chunk RX idx={} data_len={}", *recv_idx, data.len());
+                            let head = data.get(..8).map(hex_encode).unwrap_or_default();
+                            let tail = data.len().checked_sub(8).and_then(|i| data.get(i..)).map(hex_encode).unwrap_or_default();
+                            info!("chunk RX idx={} data_len={} head={} tail={}", *recv_idx, data.len(), head, tail);
                         }
                         let plain = bulk_key.decrypt_chunk(*recv_idx, &data)
                             .with_context(|| format!(
