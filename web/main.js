@@ -1887,6 +1887,22 @@ function applyRoute() {
   const hex = fragment ? fragment.sessionHex : null;
   const isSendPath = location.pathname === "/send" || location.pathname === "/send/";
 
+  // Self-download guard: if the fragment matches a session THIS tab is
+  // currently serving (as sender OR as request-files receiver-with-URL),
+  // don't switch modes. Otherwise the user clicking / pasting their
+  // own share URL would tear down the active send and immediately try
+  // to download from themselves. No-op the route.
+  if (hex) {
+    if (sendSession && sendSession.sessionHex === hex) {
+      console.info("applyRoute: hash matches active send session — leaving as-is");
+      return;
+    }
+    if (requestSession && requestSession.sessionHex === hex) {
+      console.info("applyRoute: hash matches active request session — leaving as-is");
+      return;
+    }
+  }
+
   // Reset everything
   closeSendSession();
   closeRecvSession();
