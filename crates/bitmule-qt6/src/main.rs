@@ -380,10 +380,24 @@ impl UploaderApi {
             };
             update_recv_state(&state, &url, |s| { s.status = "receiving".into(); });
             refresh_from_bg(&qpointer, &state);
-            let state_cb = state.clone();
-            let url_cb = url.clone();
-            let qpointer_cb = qpointer.clone();
-            let last_pct = Arc::new(Mutex::new(0u8));
+            // Callback runs on tokio worker threads and must be Send;
+            // QPointer is !Send, so the callback only pushes progress
+            // over a channel and a drainer task (which owns qpointer
+            // on the qt-event-loop side) applies the update.
+            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<(String, f64)>();
+            let state_drain = state.clone();
+            let url_drain = url.clone();
+            let qpointer_drain = qpointer.clone();
+            qmetaobject::future::execute_async(async move {
+                while let Some((name_s, prog)) = prog_rx.recv().await {
+                    update_recv_state(&state_drain, &url_drain, |s| {
+                        s.name = name_s;
+                        s.progress = prog;
+                    });
+                    refresh_from_bg(&qpointer_drain, &state_drain);
+                }
+            });
+            let last_pct = std::sync::Arc::new(std::sync::Mutex::new(0u8));
             let result = bitmule_client_native::recv_file(
                 &server,
                 share_key,
@@ -399,13 +413,8 @@ impl UploaderApi {
                     if pct == *lp { return; }
                     *lp = pct;
                     drop(lp);
-                    let name_s = name.to_string();
                     let prog = if total > 0 { received as f64 / total as f64 } else { 0.0 };
-                    update_recv_state(&state_cb, &url_cb, |s| {
-                        s.name = name_s;
-                        s.progress = prog;
-                    });
-                    refresh_from_bg(&qpointer_cb, &state_cb);
+                    let _ = prog_tx.send((name.to_string(), prog));
                 },
             ).await;
             match result {
