@@ -437,7 +437,7 @@ async function sendFileOverDC(dc, file, { onProgress, interruptAt } = {}) {
 // WS frame before the first chunk_relay so the receiver knows shape +
 // name.
 
-async function sendFileOverRelay(session, ws, file, { onProgress, progressState } = {}) {
+async function sendFileOverRelay(session, ws, file, { onProgress, progressState, container } = {}) {
   const chunkBytes = CONFIG.relayChunkBytes;
   const totalChunks = Math.ceil(file.size / chunkBytes);
   const meta = {
@@ -447,6 +447,7 @@ async function sendFileOverRelay(session, ws, file, { onProgress, progressState 
     chunkBytes,
     totalChunks,
   };
+  if (container) meta.container = container;
   try { ws.send(JSON.stringify(meta)); } catch {}
   if (progressState) {
     progressState.meta = meta;
@@ -543,7 +544,8 @@ function makeRelayReceiver(session, { onProgress, onFile }) {
     if (filled !== meta.totalChunks) return;
     done = true;
     const blob = new Blob(chunks, { type: "application/octet-stream" });
-    onFile && onFile(meta.name, blob, meta.size);
+    // F5: relay-side container flag mirrors the DC path.
+    onFile && onFile(meta.name, blob, meta.size, meta.container);
   }
 
   return {
@@ -611,7 +613,10 @@ function makeReceiver({ onProgress, onFile, keys } = {}) {
   const finalize = () => {
     if (!meta) return;
     const blob = new Blob(chunks, { type: "application/octet-stream" });
-    onFile && onFile(meta.name, blob, meta.size);
+    // F5: pass meta.container so the caller can route zip-store
+    // bundles to the extract dialog instead of the direct-download
+    // path. Absent field / legacy senders → undefined → single-file.
+    onFile && onFile(meta.name, blob, meta.size, meta.container);
     meta = null;
     chunks = [];
     received = 0;
@@ -789,7 +794,28 @@ async function startSendSession(files) {
     els.sessionState.textContent = "wasm not loaded — refresh and retry";
     return;
   }
-  const file = files && files[0];
+  if (!files || !files.length) return;
+
+  // F5: single-file streams as-is (container=null). Multi-file OR
+  // any pick with webkitRelativePath (dir picker) gets bundled
+  // into a store-mode zip Blob before the commitment hash runs;
+  // the receiver reads container="zip-store" and either downloads
+  // the bundle whole or unpacks client-side.
+  const needBundle = files.length > 1
+    || (files.length === 1 && !!files[0].webkitRelativePath);
+  let sendFile;
+  let container = null;
+  if (needBundle) {
+    els.sessionState.textContent = `bundling ${files.length} file(s) into store-mode zip…`;
+    const { blob: zipBlob, displayName } = await buildStoreZip(Array.from(files));
+    // Wrap as File so the downstream .name / .size / .slice() shape
+    // matches the single-file path.
+    sendFile = new File([zipBlob], displayName, { type: "application/zip" });
+    container = "zip-store";
+  } else {
+    sendFile = files[0];
+  }
+  const file = sendFile;
   if (!file) return;
 
   els.sessionState.textContent = "computing file commitment…";
@@ -822,6 +848,12 @@ async function startSendSession(files) {
 
   const session = {
     sessionHex: sessionHexRaw, link, ws, files, peer: null,
+    // F5: sendFile is the on-wire payload — either the original
+    // single File or a freshly-built store-mode zip Blob-as-File.
+    // container ships as the meta flag so the receiver knows to
+    // unpack.
+    sendFile,
+    container,
     // Modern crypto material — cheap to share across all peer tasks.
     shareKey, bulkKey, sessionIdBytes,
     // Multipeer state: map from receiver_id (envelope from_receiver_id)
@@ -853,7 +885,7 @@ async function startSendSession(files) {
   const startRelayUpload = async (reason) => {
     if (sendSession !== session) return;
     if (session.dcOpen || session.relayStarted) return;
-    const file = session.files && session.files[0];
+    const file = session.sendFile;
     if (!file) return;
     session.relayStarted = true;
     // Short low-drama arm text; sendFileOverRelay's onProgress
@@ -869,6 +901,7 @@ async function startSendSession(files) {
             `sending via relay ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
         },
         progressState: session.relayProgress,
+        container: session.container,
       });
       els.sessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
       document.body.dataset.transferStatus = 'complete';
@@ -1050,7 +1083,7 @@ function startPeerForReceiver(session, receiverId) {
     complete: false,
     dc: null,
     bytesSent: 0,
-    bytesTotal: (session.files && session.files[0]) ? session.files[0].size : 0,
+    bytesTotal: session.sendFile ? session.sendFile.size : 0,
     // request_ranges plumbing (M2b-7 resume support). Receiver emits
     // request_ranges after seeing meta_enc, telling us which chunk
     // window to send. We MUST honor it — a resuming receiver has
@@ -1191,15 +1224,18 @@ function wsSendFromSender(ws, obj, toReceiverId) {
 // peer.metaKey/bulkKey ready. Idempotent via peer.metaSent flag.
 async function sendMetaAndChunksForPeer(session, peer) {
   if (peer.metaSent) return;
-  const file = session.files && session.files[0];
+  const file = session.sendFile;
   if (!file || !peer.dc) return;
   const chunkBytes = 16 * 1024;
   const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / chunkBytes);
   // Build MetaFrame JSON, AEAD-encrypt via metaKey with sessionIdBytes AAD.
-  const metaPlain = JSON.stringify({
+  // F5: attach container flag when the sender bundled a zip-store.
+  const metaObj = {
     type: "meta", name: file.name, size: file.size,
     chunkBytes, totalChunks,
-  });
+  };
+  if (session.container) metaObj.container = session.container;
+  const metaPlain = JSON.stringify(metaObj);
   const metaEnc = peer.metaKey.encryptMeta(
     session.sessionIdBytes,
     new TextEncoder().encode(metaPlain),
@@ -1408,11 +1444,19 @@ function startRecvSession(sessionHex, fragment) {
     els.recvState.textContent =
       `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
   };
-  const commonOnFile = (name, blob, size, via) => {
+  const commonOnFile = (name, blob, size, container, via) => {
     if (recvSession !== session) return;
     const suffix = via ? ` (via ${via})` : "";
     els.recvState.textContent = `received ${name} (${fmtSize(size)})${suffix}`;
     document.body.dataset.transferStatus = 'complete';
+    // F5: zip-store containers go through the extract dialog instead
+    // of the auto-download path. Legacy senders (container absent) or
+    // unknown container values fall through to the single-file
+    // auto-download.
+    if (container === "zip-store") {
+      presentBundleDialog(name, blob, els.recvDownload);
+      return;
+    }
     const url = URL.createObjectURL(blob);
     els.recvDownload.hidden = false;
     els.recvDownload.innerHTML = "";
@@ -1431,7 +1475,7 @@ function startRecvSession(sessionHex, fragment) {
   const keysHolder = { metaKey: null, bulkKey: null, sessionIdBytes: null, dc: null };
   const recvOnMessage = makeReceiver({
     onProgress: commonProgress,
-    onFile: (n, b, s) => commonOnFile(n, b, s, "WebRTC"),
+    onFile: (n, b, s, c) => commonOnFile(n, b, s, c, "WebRTC"),
     keys: crypto ? keysHolder : undefined,
   });
 
@@ -1446,7 +1490,7 @@ function startRecvSession(sessionHex, fragment) {
   // we start piping relay frames to relayRecv.
   const relayRecv = makeRelayReceiver(sessionHex, {
     onProgress: commonProgress,
-    onFile: (n, b, s) => commonOnFile(n, b, s, "relay"),
+    onFile: (n, b, s, c) => commonOnFile(n, b, s, c, "relay"),
   });
   session.webrtcOk = false;
   session.webrtcFailed = false;
@@ -1695,11 +1739,16 @@ function startRequestSession() {
     els.requestState.textContent =
       `receiving ${name}: ${pct}% (${fmtSize(received)} / ${fmtSize(total)})`;
   };
-  const commonReqOnFile = (name, blob, size, via) => {
+  const commonReqOnFile = (name, blob, size, container, via) => {
     if (requestSession !== session) return;
     const suffix = via ? ` (via ${via})` : "";
     els.requestState.textContent = `received ${name} (${fmtSize(size)})${suffix}`;
     document.body.dataset.transferStatus = 'complete';
+    // F5: zip-store containers go through the extract dialog.
+    if (container === "zip-store") {
+      presentBundleDialog(name, blob, els.requestDownload);
+      return;
+    }
     const url = URL.createObjectURL(blob);
     els.requestDownload.hidden = false;
     els.requestDownload.innerHTML = "";
@@ -1713,11 +1762,11 @@ function startRequestSession() {
   };
   const recvOnMessage = makeReceiver({
     onProgress: commonReqProgress,
-    onFile: (n, b, s) => commonReqOnFile(n, b, s, "WebRTC"),
+    onFile: (n, b, s, c) => commonReqOnFile(n, b, s, c, "WebRTC"),
   });
   const relayRecv = makeRelayReceiver(sessionHex, {
     onProgress: commonReqProgress,
-    onFile: (n, b, s) => commonReqOnFile(n, b, s, "relay"),
+    onFile: (n, b, s, c) => commonReqOnFile(n, b, s, c, "relay"),
   });
 
   session.peer = createPeer({
@@ -1812,7 +1861,7 @@ function closeInvitedSession() {
   }
 }
 
-function startInvitedSendSession(sessionHex, files) {
+async function startInvitedSendSession(sessionHex, files) {
   closeInvitedSession();
 
   els.invitedDropzone.hidden = true;
@@ -1821,6 +1870,22 @@ function startInvitedSendSession(sessionHex, files) {
   els.invitedSessionState.classList.remove("transferring");
   renderQueueInto(els.invitedQueue, files);
 
+  // F5: same bundling shape as startSendSession — multi-pick or a
+  // webkitdirectory pick gets a store-mode zip, and container ships
+  // in the meta so the receiver unpacks.
+  const needBundle = files.length > 1
+    || (files.length === 1 && !!files[0].webkitRelativePath);
+  let sendFile;
+  let container = null;
+  if (needBundle) {
+    els.invitedSessionState.textContent = `bundling ${files.length} file(s) into store-mode zip…`;
+    const { blob: zipBlob, displayName } = await buildStoreZip(Array.from(files));
+    sendFile = new File([zipBlob], displayName, { type: "application/zip" });
+    container = "zip-store";
+  } else {
+    sendFile = files[0];
+  }
+
   const wsUrl = `${serverToWs(CONFIG.server)}/ws/${sessionHex}`;
   let ws;
   try { ws = new WebSocket(wsUrl); }
@@ -1828,6 +1893,7 @@ function startInvitedSendSession(sessionHex, files) {
 
   const session = {
     sessionHex, ws, files, peer: null,
+    sendFile, container,
     relayStarted: false, dcOpen: false, fallbackTimer: null,
     relayProgress: { meta: null, sentIdxs: [], done: false },
   };
@@ -1842,7 +1908,7 @@ function startInvitedSendSession(sessionHex, files) {
     session.fallbackTimer = setTimeout(async () => {
       if (invitedSession !== session) return;
       if (session.dcOpen || session.relayStarted) return;
-      const file = session.files && session.files[0];
+      const file = session.sendFile;
       if (!file) return;
       session.relayStarted = true;
       els.invitedSessionState.textContent =
@@ -1857,6 +1923,7 @@ function startInvitedSendSession(sessionHex, files) {
               `sending via relay ${file.name}: ${pct}% (${fmtSize(sent)} / ${fmtSize(total)})`;
           },
           progressState: session.relayProgress,
+          container: session.container,
         });
         els.invitedSessionState.textContent = `sent (via relay) ${file.name} (${fmtSize(file.size)})`;
         document.body.dataset.transferStatus = 'complete';
@@ -1893,7 +1960,7 @@ function startInvitedSendSession(sessionHex, files) {
               console.info("invited DC opened after relay-upload started; skipping DC stream");
               return;
             }
-            const file = session.files && session.files[0];
+            const file = session.sendFile;
             if (!file) return;
             els.invitedSessionState.textContent = `sending ${file.name}: 0%`;
             try {
@@ -2304,4 +2371,285 @@ function stopClipboardWatcher() {
   clearInterval(clipboardWatchTimer);
   clipboardWatchTimer = null;
   console.info("clipboard watcher: off");
+}
+
+// ============================================================
+// F5 — store-mode ZIP writer + reader.
+//
+// The wire's `container: "zip-store"` meta flag says "the payload
+// is a level-0 zip of the sender's picked files; the receiver may
+// unpack it." We handwrite the writer + reader here rather than
+// pull a library because store-mode is only ~80 lines of JS and
+// avoids a vendored dep. Deflate isn't needed — bitmule already
+// zstd-encrypts on the wire, so layering compression here would
+// waste CPU on ciphertext.
+// ============================================================
+
+// CRC32 IEEE polynomial (0xEDB88320 reversed). Precompute once.
+const CRC32_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32Bytes(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) {
+    c = CRC32_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// Build a store-mode (compression method 0) zip Blob from an array
+// of Files. Filenames land under each File's `webkitRelativePath`
+// when available (so a `webkitdirectory` dir pick preserves tree
+// shape), else just the file name. Returns { blob, displayName }.
+async function buildStoreZip(files) {
+  const encoder = new TextEncoder();
+  const parts = [];            // Blob parts for the zip (LFH + data ... + CD ... + EOCD)
+  const cdEntries = [];        // { nameBytes, crc, size, headerOffset }
+  let offset = 0;
+
+  for (const file of files) {
+    const rawName = (file.webkitRelativePath && file.webkitRelativePath.length)
+      ? file.webkitRelativePath
+      : (file.name || "file.bin");
+    // Zip spec uses forward slashes; belt-and-braces normalization.
+    const name = rawName.replaceAll("\\", "/");
+    const nameBytes = encoder.encode(name);
+    const data = new Uint8Array(await file.arrayBuffer());
+    const crc = crc32Bytes(data);
+    const size = data.length;
+
+    // Local File Header — 30 bytes fixed + name + no extra.
+    const lfh = new Uint8Array(30 + nameBytes.length);
+    const dv = new DataView(lfh.buffer);
+    dv.setUint32(0, 0x04034b50, true);   // signature
+    dv.setUint16(4, 20, true);           // version needed
+    dv.setUint16(6, 0, true);            // general purpose flags
+    dv.setUint16(8, 0, true);            // compression method (Stored)
+    dv.setUint16(10, 0, true);           // mod time (unused)
+    dv.setUint16(12, 0, true);           // mod date (unused)
+    dv.setUint32(14, crc, true);
+    dv.setUint32(18, size, true);        // compressed size == uncompressed for Stored
+    dv.setUint32(22, size, true);
+    dv.setUint16(26, nameBytes.length, true);
+    dv.setUint16(28, 0, true);           // extra length
+    lfh.set(nameBytes, 30);
+
+    parts.push(lfh, data);
+    cdEntries.push({ nameBytes, crc, size, headerOffset: offset });
+    offset += lfh.length + data.length;
+  }
+
+  // Central Directory — 46 bytes fixed per entry + name.
+  const cdStart = offset;
+  for (const e of cdEntries) {
+    const cd = new Uint8Array(46 + e.nameBytes.length);
+    const dv = new DataView(cd.buffer);
+    dv.setUint32(0, 0x02014b50, true);
+    dv.setUint16(4, 20, true);           // version made by
+    dv.setUint16(6, 20, true);           // version needed
+    dv.setUint16(8, 0, true);            // flags
+    dv.setUint16(10, 0, true);           // method
+    dv.setUint16(12, 0, true);
+    dv.setUint16(14, 0, true);
+    dv.setUint32(16, e.crc, true);
+    dv.setUint32(20, e.size, true);
+    dv.setUint32(24, e.size, true);
+    dv.setUint16(28, e.nameBytes.length, true);
+    dv.setUint16(30, 0, true);           // extra length
+    dv.setUint16(32, 0, true);           // comment length
+    dv.setUint16(34, 0, true);           // disk number
+    dv.setUint16(36, 0, true);           // internal attrs
+    dv.setUint32(38, 0, true);           // external attrs
+    dv.setUint32(42, e.headerOffset, true);
+    cd.set(e.nameBytes, 46);
+    parts.push(cd);
+    offset += cd.length;
+  }
+  const cdSize = offset - cdStart;
+
+  // End of Central Directory record.
+  const eocd = new Uint8Array(22);
+  const dv = new DataView(eocd.buffer);
+  dv.setUint32(0, 0x06054b50, true);
+  dv.setUint16(4, 0, true);              // disk num
+  dv.setUint16(6, 0, true);              // disk with cd
+  dv.setUint16(8, cdEntries.length, true);
+  dv.setUint16(10, cdEntries.length, true);
+  dv.setUint32(12, cdSize, true);
+  dv.setUint32(16, cdStart, true);
+  dv.setUint16(20, 0, true);             // comment length
+  parts.push(eocd);
+
+  const blob = new Blob(parts, { type: "application/zip" });
+  // Pick a display name: single-dir pick uses the tree root; else
+  // first stem + "and N more". Falls back to "bundle.zip".
+  let displayName = "bundle.zip";
+  const first = files[0];
+  if (files.length === 1) {
+    const base = (first.name || "bundle").replace(/\.[^.]+$/, "");
+    displayName = `${base}.zip`;
+  } else if (files.length > 1 && first && first.webkitRelativePath) {
+    const root = first.webkitRelativePath.split("/")[0];
+    if (root) displayName = `${root}.zip`;
+  }
+  if (displayName === "bundle.zip" && files.length > 1) {
+    const stem = (files[0].name || "bundle").replace(/\.[^.]+$/, "");
+    displayName = `${stem}-and-${files.length - 1}-more.zip`;
+  }
+  return { blob, displayName };
+}
+
+// Parse a store-mode zip Blob and return an array of entries.
+// Each entry: { name, blob, size, crcOk }. Only method=0 (Stored)
+// is supported — the sender-side builder emits Stored exclusively.
+async function parseStoreZip(zipBlob) {
+  const totalSize = zipBlob.size;
+  // Read the last 22..(22+65k) bytes to find the EOCD signature.
+  // Zip comment can be up to 65535 bytes; we cap the search at 66 KiB.
+  const tailStart = Math.max(0, totalSize - (22 + 65536));
+  const tailBuf = await zipBlob.slice(tailStart, totalSize).arrayBuffer();
+  const tail = new Uint8Array(tailBuf);
+  let eocdOffset = -1;
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (tail[i] === 0x50 && tail[i+1] === 0x4b && tail[i+2] === 0x05 && tail[i+3] === 0x06) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset < 0) throw new Error("EOCD not found — not a valid zip");
+  const eocdDv = new DataView(tail.buffer, tail.byteOffset + eocdOffset);
+  const cdEntries = eocdDv.getUint16(10, true);
+  const cdSize = eocdDv.getUint32(12, true);
+  const cdOffset = eocdDv.getUint32(16, true);
+
+  const cdBuf = await zipBlob.slice(cdOffset, cdOffset + cdSize).arrayBuffer();
+  const cd = new Uint8Array(cdBuf);
+  const decoder = new TextDecoder();
+
+  const entries = [];
+  let p = 0;
+  for (let i = 0; i < cdEntries; i++) {
+    const dv = new DataView(cd.buffer, cd.byteOffset + p);
+    if (dv.getUint32(0, true) !== 0x02014b50) throw new Error(`bad CD entry #${i}`);
+    const method = dv.getUint16(10, true);
+    const declaredCrc = dv.getUint32(16, true);
+    const compSize = dv.getUint32(20, true);
+    const uncompSize = dv.getUint32(24, true);
+    const nameLen = dv.getUint16(28, true);
+    const extraLen = dv.getUint16(30, true);
+    const commentLen = dv.getUint16(32, true);
+    const headerOffset = dv.getUint32(42, true);
+    const name = decoder.decode(cd.subarray(p + 46, p + 46 + nameLen));
+    p += 46 + nameLen + extraLen + commentLen;
+
+    if (method !== 0) {
+      throw new Error(`entry ${name}: compression method ${method}, only Stored (0) supported`);
+    }
+    // Read the LFH to find the actual data start (LFH's own name+extra
+    // may differ from CD's).
+    const lfhFixedBuf = await zipBlob.slice(headerOffset, headerOffset + 30).arrayBuffer();
+    const lfhDv = new DataView(lfhFixedBuf);
+    if (lfhDv.getUint32(0, true) !== 0x04034b50) throw new Error(`entry ${name}: bad LFH`);
+    const lfhNameLen = lfhDv.getUint16(26, true);
+    const lfhExtraLen = lfhDv.getUint16(28, true);
+    const dataStart = headerOffset + 30 + lfhNameLen + lfhExtraLen;
+    const dataEnd = dataStart + compSize;
+    // Skip directory entries (name ends with "/" and size 0).
+    if (uncompSize === 0 && name.endsWith("/")) continue;
+    const entryBlob = zipBlob.slice(dataStart, dataEnd);
+    // Best-effort CRC check for entries small enough to buffer.
+    let crcOk = true;
+    if (compSize <= 4 * 1024 * 1024) {
+      const bytes = new Uint8Array(await entryBlob.arrayBuffer());
+      crcOk = crc32Bytes(bytes) === declaredCrc;
+    }
+    entries.push({ name, blob: entryBlob, size: uncompSize, crcOk });
+  }
+  return entries;
+}
+
+// Trigger a browser download for a Blob under a specific name.
+function downloadBlobAs(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoke on next tick — some browsers race the click otherwise.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Render the F5 receiver dialog for a container="zip-store" bundle.
+// Two actions:
+//   - "Download bundle" downloads the raw zip as-is
+//   - "Extract & save individually" parses the zip client-side and
+//     drops per-entry download links into a list the user can grab.
+async function presentBundleDialog(name, blob, containerEl) {
+  containerEl.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.className = "bundle-dialog";
+
+  const heading = document.createElement("p");
+  heading.className = "bundle-heading";
+  heading.textContent = `Received ${name} — how would you like it?`;
+  wrap.appendChild(heading);
+
+  const row = document.createElement("div");
+  row.className = "bundle-actions";
+  const dlZipBtn = document.createElement("button");
+  dlZipBtn.className = "pick-btn";
+  dlZipBtn.type = "button";
+  dlZipBtn.textContent = "Download bundle";
+  dlZipBtn.addEventListener("click", () => downloadBlobAs(blob, name));
+
+  const extractBtn = document.createElement("button");
+  extractBtn.className = "pick-btn secondary";
+  extractBtn.type = "button";
+  extractBtn.textContent = "Extract & save individually";
+
+  const list = document.createElement("div");
+  list.className = "bundle-list";
+  list.hidden = true;
+
+  extractBtn.addEventListener("click", async () => {
+    extractBtn.disabled = true;
+    extractBtn.textContent = "Extracting…";
+    try {
+      const entries = await parseStoreZip(blob);
+      list.innerHTML = "";
+      for (const entry of entries) {
+        const link = document.createElement("a");
+        link.className = "download-link";
+        link.href = URL.createObjectURL(entry.blob);
+        link.download = entry.name.split("/").pop() || entry.name;
+        link.textContent = `${entry.name}${entry.crcOk ? "" : " (CRC mismatch)"} — ${fmtSize(entry.size)}`;
+        list.appendChild(link);
+      }
+      list.hidden = false;
+      extractBtn.textContent = `Extracted ${entries.length} file(s)`;
+    } catch (e) {
+      extractBtn.disabled = false;
+      extractBtn.textContent = "Extract failed — retry";
+      const err = document.createElement("p");
+      err.className = "bundle-error";
+      err.textContent = `unpack: ${e.message}`;
+      wrap.appendChild(err);
+    }
+  });
+
+  row.appendChild(dlZipBtn);
+  row.appendChild(extractBtn);
+  wrap.appendChild(row);
+  wrap.appendChild(list);
+  containerEl.hidden = false;
+  containerEl.appendChild(wrap);
 }
