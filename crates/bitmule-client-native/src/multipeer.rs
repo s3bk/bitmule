@@ -153,8 +153,12 @@ pub(crate) struct WsRouterHandle {
     pub register_tx: mpsc::UnboundedSender<PeerRegistration>,
     /// Frames whose `from_receiver_id` is absent or matches no
     /// registered peer land here. Peer_hello notifications from the
-    /// server are the primary content.
-    pub unrouted_rx: mpsc::UnboundedReceiver<SignalFrame>,
+    /// server are the primary content. Payload is `(frame, from)`
+    /// where `from` is the envelope-level `from_receiver_id` (server
+    /// injects it when relaying notifications) — the orchestrator
+    /// uses it to identify the peer since `PeerHello.receiver_id`
+    /// in the frame body is optional and often not set by the server.
+    pub unrouted_rx: mpsc::UnboundedReceiver<(SignalFrame, Option<String>)>,
     /// Set to `true` to ask the router to exit its select! loop after
     /// draining the current iteration. Router then returns the stream
     /// half back through `task`.
@@ -180,7 +184,7 @@ pub(crate) struct WsWriterHandle {
 #[allow(dead_code)]
 pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
     let (register_tx, mut register_rx) = mpsc::unbounded_channel::<PeerRegistration>();
-    let (unrouted_tx, unrouted_rx) = mpsc::unbounded_channel::<SignalFrame>();
+    let (unrouted_tx, unrouted_rx) = mpsc::unbounded_channel::<(SignalFrame, Option<String>)>();
     let (shutdown_tx, mut shutdown_rx) = watch::channel::<bool>(false);
 
     let task = tokio::spawn(async move {
@@ -212,7 +216,13 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
                             let _ = inbox.send(frame);
                         }
                         None => {
-                            let _ = unrouted_tx.send(frame);
+                            // Preserve `from` alongside the frame so the
+                            // orchestrator loop can pick up the envelope-
+                            // level from_receiver_id even when the frame
+                            // body's own receiver_id field is absent (which
+                            // is the common shape on server-relayed
+                            // peer_hello notifications).
+                            let _ = unrouted_tx.send((frame, from));
                         }
                     }
                 }

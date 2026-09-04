@@ -426,7 +426,7 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
                 // are rare) but fix when the router lives past send_connect in
                 // M2b-4 — probably a `health_rx: oneshot<Result<()>>` on the
                 // handle that select! can watch alongside `unrouted_rx`.
-                let frame = match maybe_frame {
+                let (frame, _from) = match maybe_frame {
                     Some(f) => f,
                     None => bail!("ws router terminated before DC opened"),
                 };
@@ -2625,8 +2625,8 @@ pub async fn send_serve(
     let _ = register_loop; // register_tx used inside loop via `register_tx.clone()`
     let register_for_loop = register_tx.clone();
     let loop_task = tokio::spawn(async move {
-        while let Some(frame) = unrouted_rx.recv().await {
-            let (rid_hex_opt, wire_v) = match &frame {
+        while let Some((frame, from)) = unrouted_rx.recv().await {
+            let (rid_body_opt, wire_v) = match &frame {
                 SignalFrame::PeerHello { receiver_id, wire_version, .. } => {
                     (receiver_id.clone(), *wire_version)
                 }
@@ -2635,10 +2635,14 @@ pub async fn send_serve(
                     continue;
                 }
             };
-            let rid_hex = match rid_hex_opt {
+            // Prefer envelope-level from_receiver_id (server always sets
+            // this on relayed peer_hello notifications). Fall back to the
+            // frame body's own `receiver_id` field — some server versions
+            // put it there — before giving up and dropping.
+            let rid_hex = match from.or(rid_body_opt) {
                 Some(r) => r,
                 None => {
-                    warn!("orchestrator: peer_hello without receiver_id — dropping");
+                    warn!("orchestrator: peer_hello without receiver_id (neither envelope nor body) — dropping");
                     continue;
                 }
             };
@@ -2698,7 +2702,7 @@ pub async fn send_serve(
         register_tx,
         // unrouted_rx was moved into loop_task; replace with a dead one
         // so the handle still type-checks (shutdown path uses shutdown_tx).
-        unrouted_rx: mpsc::unbounded_channel::<SignalFrame>().1,
+        unrouted_rx: mpsc::unbounded_channel::<(SignalFrame, Option<String>)>().1,
         shutdown_tx: router_shutdown_tx,
         task: router_task,
     };
