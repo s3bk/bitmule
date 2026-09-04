@@ -50,7 +50,7 @@
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::crypto::BulkKey;

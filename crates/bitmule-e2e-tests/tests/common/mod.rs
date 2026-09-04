@@ -29,7 +29,7 @@ pub struct Env {
     // matters for graceful shutdown: webdriver first, then the server.
     pub _webdriver: Option<Child>,
     pub _server: Option<Child>,
-    pub data_dir: TempDir,
+    pub _data_dir: TempDir,
 }
 
 impl Env {
@@ -62,7 +62,7 @@ impl Env {
             webdriver_url,
             _webdriver: webdriver_child,
             _server: server_child,
-            data_dir
+            _data_dir: data_dir
         })
     }
 }
@@ -207,21 +207,4 @@ pub async fn read_stdout_for_hex(child: &mut Child, timeout: Duration) -> Result
             Err(_) => bail!("timed out waiting for session URL on CLI stdout"),
         }
     }
-}
-
-/// Extract the 64-char session hex from `bitmule recv --server ...` stdout.
-/// The CLI prints a share link like `<server>/#<hex>` when it generates
-/// a fresh session.
-pub fn extract_session_hex(cli_output: &str) -> Result<String> {
-    for line in cli_output.lines() {
-        if let Some(hash) = line.split_once('#').map(|(_, h)| h.trim()) {
-            if hash.len() >= 64 {
-                let hex = &hash[..64];
-                if hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Ok(hex.to_string());
-                }
-            }
-        }
-    }
-    Err(anyhow!("no session hex in CLI output:\n{cli_output}"))
 }

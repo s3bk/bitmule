@@ -29,11 +29,10 @@ pub use multipeer::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 use tokio::{io::AsyncReadExt, sync::{mpsc, Mutex}};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 
 /// 16 KiB is the SCTP-safe universal message size (Firefox cap). Matches

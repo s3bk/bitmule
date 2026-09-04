@@ -595,7 +595,6 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
     let mut opened: Option<ChannelId> = None;
-    let mut buf = vec![0u8; 4096];
 
     while opened.is_none() || bulk_key.is_none() {
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
@@ -792,7 +791,6 @@ async fn channel_write_all(
     buf: &[u8],
 ) -> Result<()> {
     let mut next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
-    let mut recv_buf = vec![0u8; 4096];
 
     loop {
         let accepted = {
@@ -861,7 +859,6 @@ fn channel_set_low_threshold(rtc: &mut Rtc, id: ChannelId, threshold: usize) -> 
 /// session cleanly without truncating the tail.
 async fn drain_until_buffer_empty(session: &mut LiveSession) -> Result<()> {
     let mut next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
-    let mut recv_buf = vec![0u8; 4096];
     loop {
         let buffered = {
             let mut ch = session.rtc.channel(session.channel_id)
@@ -918,7 +915,6 @@ pub async fn recv_file_over_dc(
     let mut path_opt: Option<PathBuf> = None;
     let mut received: u64 = 0;
     let mut done = false;
-    let mut buf = vec![0u8; 4096];
     let mut recv_idx: u64 = 0;
     let mut resume_from_chunk: Option<u64> = None;
     // M2b-7: request_ranges / recv_done state.
@@ -1576,7 +1572,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
     session_id_bytes: &[u8; 32],
     sender_bulk: Option<BulkKey>,
 ) -> Result<(BulkKey, MetaKey)> {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::{StreamExt};
     // Local ephemeral, MAC'd with share_key so the peer can authenticate us.
     let local_ephemeral = Ephemeral::generate();
     let local_pub = local_ephemeral.public_bytes();
