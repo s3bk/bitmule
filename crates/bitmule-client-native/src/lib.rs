@@ -26,6 +26,15 @@ pub mod multipeer;
 pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
 pub use multipeer::ServeMode;
 
+/// Return value from [`recv_file`] — the on-disk path plus the wire's
+/// `container` flag so the caller can post-process (e.g. unzip a
+/// `Some("zip-store")` bundle) without re-parsing the meta frame.
+#[derive(Debug, Clone)]
+pub struct RecvComplete {
+    pub path: std::path::PathBuf,
+    pub container: Option<String>,
+}
+
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
 use bytes::Bytes;
@@ -260,7 +269,7 @@ pub async fn recv_file_over_relay(
     meta_key: &crate::crypto::MetaKey,
     session_id_bytes: &[u8; 32],
     mut on_progress: impl FnMut(u64, u64, &str) + Send,
-) -> Result<std::path::PathBuf> {
+) -> Result<crate::RecvComplete> {
     let http_base = server_url_http.trim_end_matches('/').to_string();
     let session_hex = session_id.as_hex();
     tokio::fs::create_dir_all(out_dir).await?;
@@ -361,7 +370,7 @@ pub async fn recv_file_over_relay(
                 f.flush().await?;
                 f.sync_all().await?;
                 on_progress(received_plain_bytes, m.size, &m.name);
-                return Ok(path);
+                return Ok(crate::RecvComplete { path, container: m.container.clone() });
             }
             _ => {}
         }

@@ -425,7 +425,11 @@ impl UploaderApi {
                 },
             ).await;
             match result {
-                Ok(staged_path) => {
+                Ok(staged_outcome) => {
+                    // F3 will read `staged_outcome.container` to unpack
+                    // zip-store bundles into a sibling dir. For F2 keep
+                    // the existing single-file promote flow.
+                    let staged_path = staged_outcome.path;
                     // recv_file returned Ok, which means AEAD verify
                     // already passed. Promote the file out of staging
                     // into out_dir. Only after the rename lands is the

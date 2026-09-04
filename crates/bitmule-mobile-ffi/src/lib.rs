@@ -125,7 +125,7 @@ pub async fn recv_file(
         .map_err(|e| BitmuleError::InvalidFragment { reason: format!("{e:#}") })?;
     let out_dir_path = PathBuf::from(&out_dir);
     let listener = on_progress.clone();
-    let final_path = native_recv(
+    let outcome = native_recv(
         &parsed.server,
         link.share_key,
         Some(link.signature),
@@ -137,6 +137,10 @@ pub async fn recv_file(
     )
     .await
     .map_err(BitmuleError::from)?;
+    // F4 will consume `outcome.container` on the Kotlin/Swift side to
+    // unpack multi-file zip bundles; for now the native FFI still hands
+    // the raw file path across to the caller.
+    let final_path = outcome.path;
     let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
     let name = final_path
         .file_name()

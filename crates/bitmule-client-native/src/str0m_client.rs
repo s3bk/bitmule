@@ -630,7 +630,7 @@ pub async fn recv_file_over_dc(
     session: &mut LiveSession,
     out_dir: &Path,
     mut on_progress: impl FnMut(u64, u64, &str) + Send,
-) -> Result<PathBuf> {
+) -> Result<crate::RecvComplete> {
     tokio::fs::create_dir_all(out_dir)
         .await
         .with_context(|| format!("mkdir -p {}", out_dir.display()))?;
@@ -776,7 +776,9 @@ pub async fn recv_file_over_dc(
         f.flush().await?;
         f.sync_all().await?;
     }
-    path_opt.ok_or_else(|| anyhow!("no meta received before done"))
+    let path = path_opt.ok_or_else(|| anyhow!("no meta received before done"))?;
+    let container = meta_opt.as_ref().and_then(|m| m.container.clone());
+    Ok(crate::RecvComplete { path, container })
 }
 
 /// Drain variant that dispatches Event::ChannelData(id, ..) into the
@@ -1007,7 +1009,7 @@ pub async fn recv_file(
     out_dir: &Path,
     mode: TransportMode,
     on_progress: impl FnMut(u64, u64, &str) + Send,
-) -> Result<PathBuf> {
+) -> Result<crate::RecvComplete> {
     // For DC + relay dispatch we need to hang on to the LiveSession's
     // bulk_key to run post-transfer verification. The relay path builds its
     // own transient session (crate::send_file_over_relay owns the crypto),
@@ -1016,12 +1018,12 @@ pub async fn recv_file(
     match mode {
         TransportMode::Webrtc => {
             let mut sess = recv_connect(server_url_http, share_key).await?;
-            let path = recv_file_over_dc(&mut sess, out_dir, on_progress).await?;
+            let outcome = recv_file_over_dc(&mut sess, out_dir, on_progress).await?;
             if let Some(sig) = expected_signature {
-                verify_transferred_signature(&path, &sig, sess.bulk_key.as_ref()
+                verify_transferred_signature(&outcome.path, &sig, sess.bulk_key.as_ref()
                     .ok_or_else(|| anyhow!("session has no bulk key at verify time"))?).await?;
             }
-            Ok(path)
+            Ok(outcome)
         }
         TransportMode::Relay => recv_file_relay(server_url_http, share_key, expected_signature, out_dir, on_progress).await,
     }
@@ -1093,7 +1095,7 @@ async fn recv_file_relay(
     expected_signature: Option<[u8; 32]>,
     out_dir: &Path,
     on_progress: impl FnMut(u64, u64, &str) + Send,
-) -> Result<PathBuf> {
+) -> Result<crate::RecvComplete> {
     let session_hex = share_key.session_id_hex();
     let session_id = SessionId::from_hex(&session_hex)
         .map_err(|e| anyhow!("session_id from hex: {e}"))?;
@@ -1109,15 +1111,15 @@ async fn recv_file_relay(
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
     let _ = out_tx; // relay recv only reads; sender kept alive so pumper's send half stays valid
-    let path = crate::recv_file_over_relay(
+    let outcome = crate::recv_file_over_relay(
         server_url_http, &session_id, out_dir, in_rx,
         &bulk_key, &meta_key, &session_id_bytes,
         on_progress,
     ).await?;
     if let Some(sig) = expected_signature {
-        verify_transferred_signature(&path, &sig, &bulk_key).await?;
+        verify_transferred_signature(&outcome.path, &sig, &bulk_key).await?;
     }
-    Ok(path)
+    Ok(outcome)
 }
 
 /// Simple ws pumper for the relay path — moves outgoing raw strings from

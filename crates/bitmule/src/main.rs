@@ -559,7 +559,7 @@ async fn cmd_recv(
     std::io::stdout().flush().ok();
 
     let mut last_pct = 0u64;
-    let path = recv_file(server, share_key, expected_signature, &out, mode, move |received, total, name| {
+    let outcome = recv_file(server, share_key, expected_signature, &out, mode, move |received, total, name| {
         if total == 0 { return }
         let pct = received * 100 / total;
         if pct != last_pct {
@@ -569,12 +569,107 @@ async fn cmd_recv(
         }
     }).await?;
     eprintln!();
+    let path = outcome.path;
     if expected_signature.is_some() {
         println!("received (signature verified): {}", path.display());
     } else {
         println!("received: {}", path.display());
     }
+
+    // F2: if the sender flagged a container, unpack it. Today the only
+    // container is "zip-store"; unknown values are surfaced but not
+    // touched so an older receiver on a newer container still lands the
+    // bytes on disk for the user to open manually.
+    if let Some(container) = outcome.container.as_deref() {
+        match container {
+            "zip-store" => {
+                let unpack_dir = unpack_dir_for(&path);
+                match unpack_zip_store(&path, &unpack_dir).await {
+                    Ok(entries) => {
+                        // Zip is redundant now — the caller wanted the files, not the archive.
+                        // Best-effort delete; log but don't fail if it stays.
+                        if let Err(e) = tokio::fs::remove_file(&path).await {
+                            eprintln!("(kept received zip at {} — remove failed: {e})", path.display());
+                        }
+                        println!("unpacked {} entr{} into {}",
+                            entries,
+                            if entries == 1 { "y" } else { "ies" },
+                            unpack_dir.display());
+                    }
+                    Err(e) => {
+                        eprintln!("warning: container=zip-store but unpack failed: {e:#}");
+                        eprintln!("(zip kept at {} for manual extraction)", path.display());
+                    }
+                }
+            }
+            other => {
+                eprintln!("warning: sender flagged container={other:?} but this receiver only knows \"zip-store\" — leaving file as-is");
+            }
+        }
+    }
     Ok(())
+}
+
+/// Sibling directory next to the received zip: `<parent>/<stem>/`.
+/// If the stem collides with an existing dir, add `-1`, `-2`, … until
+/// a fresh name is found. Returns a plain PathBuf; caller creates it.
+fn unpack_dir_for(zip_path: &Path) -> PathBuf {
+    let parent = zip_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = zip_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bundle".to_string());
+    let mut candidate = parent.join(&stem);
+    let mut n = 1u32;
+    while candidate.exists() {
+        candidate = parent.join(format!("{stem}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Unpack a store-mode (or any compression method — the `zip` crate handles
+/// all methods on read) archive into `dest`. Skips zip-slip entries (any
+/// entry whose enclosed path escapes `dest`). Returns the number of file
+/// entries extracted (directories are counted separately and not returned).
+async fn unpack_zip_store(zip_path: &Path, dest: &Path) -> Result<usize> {
+    let zip_path = zip_path.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<usize> {
+        std::fs::create_dir_all(&dest)
+            .with_context(|| format!("mkdir -p {}", dest.display()))?;
+        let file = std::fs::File::open(&zip_path)
+            .with_context(|| format!("open {}", zip_path.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("read zip archive {}", zip_path.display()))?;
+        let mut extracted: usize = 0;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)
+                .with_context(|| format!("zip entry #{i}"))?;
+            // enclosed_name() strips absolute prefixes AND rejects `..`
+            // traversal — the zip crate's canonical anti-zip-slip guard.
+            let Some(rel) = entry.enclosed_name() else {
+                eprintln!("(skipping unsafe zip entry name: {:?})", entry.name());
+                continue;
+            };
+            let out_path = dest.join(&rel);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path)
+                    .with_context(|| format!("mkdir {}", out_path.display()))?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("mkdir {}", parent.display()))?;
+                }
+                let mut out_file = std::fs::File::create(&out_path)
+                    .with_context(|| format!("create {}", out_path.display()))?;
+                std::io::copy(&mut entry, &mut out_file)
+                    .with_context(|| format!("extract {}", out_path.display()))?;
+                extracted += 1;
+            }
+        }
+        Ok(extracted)
+    }).await.context("zip unpack join")?
 }
 
 async fn identity_add(name: String, contact_base: String) -> Result<()> {
