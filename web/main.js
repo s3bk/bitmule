@@ -847,7 +847,7 @@ async function startSendSession(files) {
   };
 
   ws.addEventListener("open", () => {
-    ws.send(JSON.stringify({ type: "hello", role: "sender" }));
+    ws.send(JSON.stringify({ type: "hello", role: "sender", wire_version: 2 }));
     // Idle text — waits for a receiver. No fallback timer.
     els.sessionState.textContent = "waiting for receiver…";
   });
@@ -1568,8 +1568,8 @@ function startRequestSession() {
   });
 
   ws.addEventListener("open", () => {
-    ws.send(JSON.stringify({ type: "hello", role: "receiver", receiver_id: receiverId }));
-    ws.send(JSON.stringify({ type: "peer_hello", receiver_id: receiverId }));
+    ws.send(JSON.stringify({ type: "hello", role: "receiver", receiver_id: receiverId, wire_version: 2 }));
+    ws.send(JSON.stringify({ type: "peer_hello", receiver_id: receiverId, wire_version: 2 }));
   });
 
   ws.addEventListener("message", async (ev) => {
@@ -1581,7 +1581,7 @@ function startRequestSession() {
       // pick up on the offer trigger (our earlier peer_hello was sent
       // before they existed and got dropped by the relay).
       try {
-        ws.send(JSON.stringify({ type: "peer_hello", receiver_id: receiverId }));
+        ws.send(JSON.stringify({ type: "peer_hello", receiver_id: receiverId, wire_version: 2 }));
       } catch {}
       return;
     }
@@ -1670,7 +1670,7 @@ function startInvitedSendSession(sessionHex, files) {
   invitedSession = session;
 
   ws.addEventListener("open", () => {
-    ws.send(JSON.stringify({ type: "hello", role: "sender" }));
+    ws.send(JSON.stringify({ type: "hello", role: "sender", wire_version: 2 }));
     // Fallback: if the receiver's DC doesn't open within the timeout,
     // upload the file via server relay so the request-mode receiver on
     // the other end can pick it up. Same timer + progressState + resend
