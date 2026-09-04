@@ -91,8 +91,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                     return;
                 }
                 // Newcomer is sender; incumbents are all receivers.
-                let incumbent_frames: Vec<String> = r.receivers.values()
-                    .map(|entry| build_peer_hello("receiver", entry.wire_version))
+                // Each notification carries the incumbent receiver's id
+                // so the sender's per-peer router can pre-register.
+                let incumbent_frames: Vec<String> = r.receivers.iter()
+                    .map(|(rid, entry)| build_peer_hello("receiver", entry.wire_version, Some(rid)))
                     .collect();
                 r.sender = Some(self_entry.clone());
                 to_incumbent = if r.receivers.is_empty() {
@@ -100,7 +102,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                 } else {
                     Some((
                         Role::Receiver,
-                        build_peer_hello("sender", wire_version),
+                        // Sender→receiver notification: sender has no
+                        // receiver_id (unique-per-receiver-only concept).
+                        build_peer_hello("sender", wire_version, None),
                     ))
                 };
                 to_newcomer_frames = incumbent_frames;
@@ -115,13 +119,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                 };
                 // Newcomer is receiver; incumbent is at most one sender.
                 let incumbent_frames: Vec<String> = r.sender.as_ref()
-                    .map(|entry| vec![build_peer_hello("sender", entry.wire_version)])
+                    .map(|entry| vec![build_peer_hello("sender", entry.wire_version, None)])
                     .unwrap_or_default();
                 r.receivers.insert(rid, self_entry.clone());
                 to_incumbent = if r.sender.is_some() {
                     Some((
                         Role::Sender,
-                        build_peer_hello("receiver", wire_version),
+                        // Notification to the sender about the newcomer
+                        // receiver — INCLUDE the newcomer's id so the
+                        // sender-side router can register the per-peer
+                        // dispatch route.
+                        build_peer_hello("receiver", wire_version, Some(&rid)),
                     ))
                 } else {
                     None
@@ -263,14 +271,37 @@ async fn read_hello(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>,
 }
 
 /// Build a peer_hello notification frame. Wraps counterpart's role +
-/// wire_version so the recipient can bail on version mismatch. Kept as a
-/// helper so the two call sites (incumbent-notified, newcomer-notified)
-/// stay in sync.
-fn build_peer_hello(peer_role: &str, wire_version: Option<u32>) -> String {
-    match wire_version {
-        Some(v) => format!(r#"{{"type":"peer_hello","role":"{peer_role}","wire_version":{v}}}"#),
-        None => format!(r#"{{"type":"peer_hello","role":"{peer_role}"}}"#),
+/// wire_version so the recipient can bail on version mismatch. When
+/// `peer_receiver_id` is `Some` (server notifying the sender about a
+/// receiver), also injects `from_receiver_id` at the envelope level so
+/// the sender-side WS router can dispatch subsequent per-peer frames
+/// (KexPub, SDP answer, Ice) to the right peer task.
+///
+/// Kept as a helper so the two call sites (incumbent-notified,
+/// newcomer-notified) stay in sync.
+fn build_peer_hello(
+    peer_role: &str,
+    wire_version: Option<u32>,
+    peer_receiver_id: Option<&ReceiverId>,
+) -> String {
+    let mut v = serde_json::json!({
+        "type": "peer_hello",
+        "role": peer_role,
+    });
+    if let Some(ver) = wire_version {
+        v["wire_version"] = serde_json::Value::from(ver);
     }
+    if let Some(rid) = peer_receiver_id {
+        let hex = rid.as_hex();
+        // Include BOTH:
+        //   - `receiver_id` in the body (matches the receiver-emitted
+        //     PeerHello shape; some clients may still look here).
+        //   - `from_receiver_id` at the envelope level (the sender-side
+        //     WS router keys per-peer inbox dispatch off this field).
+        v["receiver_id"] = serde_json::Value::from(hex.clone());
+        v["from_receiver_id"] = serde_json::Value::from(hex);
+    }
+    v.to_string()
 }
 
 // Tag-along: PeerSink is re-exported for cross-module type reference in
