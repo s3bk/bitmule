@@ -191,14 +191,17 @@ fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
-/// Render `text` as a QR SVG and encode it as a `data:image/svg+xml;
-/// base64,...` URL suitable for direct binding to a QML Image.source.
-/// Returns an empty string when the input is empty or QR generation
-/// fails (typically because the payload is too large for QR at any
-/// error-correction level).
+/// Render `text` as a QR bitmap and encode it as a
+/// `data:image/png;base64,...` URL suitable for direct binding on a
+/// QML `Image.source`. PNG over SVG: smaller wire (~1–3KB vs
+/// ~7–20KB), single-pass decode in QML's image loader, no SVG parser
+/// spinup, pixel-exact — QR is a fixed grid, we don't need scaling.
+///
+/// Returns empty string when the input is empty or QR generation
+/// fails (payload too large for QR at any error-correction level).
 fn qr_data_url_for(text: &str) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use qrcode::render::svg;
+    use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder, Luma};
     use qrcode::QrCode;
 
     if text.is_empty() { return String::new(); }
@@ -209,13 +212,27 @@ fn qr_data_url_for(text: &str) -> String {
             return String::new();
         }
     };
-    let svg_str = code
-        .render()
-        .min_dimensions(240, 240)
-        .dark_color(svg::Color("#000000"))
-        .light_color(svg::Color("#ffffff"))
+    // `render::<Luma<u8>>` produces a grayscale ImageBuffer at
+    // one pixel per module + configurable quiet-zone/scale. 8 px
+    // per module keeps the PNG small while still landing at ~240 px
+    // for a typical URL. QML upscales pixel-exact via the Image
+    // source binding.
+    let img = code
+        .render::<Luma<u8>>()
+        .module_dimensions(8, 8)
         .build();
-    format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg_str))
+    let (w, h) = img.dimensions();
+    let mut png_bytes: Vec<u8> = Vec::new();
+    if let Err(e) = PngEncoder::new(&mut png_bytes).write_image(
+        img.as_raw(),
+        w,
+        h,
+        ExtendedColorType::L8,
+    ) {
+        eprintln!("qr png encode failed: {e}");
+        return String::new();
+    }
+    format!("data:image/png;base64,{}", STANDARD.encode(&png_bytes))
 }
 
 #[tokio::main]
