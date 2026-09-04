@@ -17,7 +17,12 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 futures-util = "0.3"
 bytes = { workspace = true }
-tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
+# webpki-roots (Mozilla-bundled CA set) instead of native-roots so
+# Android builds work — `rustls-native-certs` doesn't find the system
+# trust store on Android's non-standard cert paths and every WS
+# connect fails "no roots". Trade-off: user-added private CAs on the
+# desktop won't be honored; bitmule.qdat.net is public HTTPS so fine.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 tokio-util = { version = "0.7", features = ["io"] }
 str0m = "0.23"
