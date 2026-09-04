@@ -113,17 +113,22 @@ pub struct LiveSession {
     pub share_key: ShareKey,
 }
 
-/// Build a fresh Rtc + a SocketPool with one UdpSocket per host-candidate
-/// interface. All sockets share the same port so ICE candidates all look
-/// consistent to the remote peer. Per-socket recv-loop tasks fan into a
-/// shared mpsc so the caller can select! on a single stream.
+/// Build a SocketPool with one UdpSocket per host-candidate interface.
+/// All sockets share the same port so ICE candidates all look consistent
+/// to the remote peer. Per-socket recv-loop tasks fan into a shared mpsc
+/// so a single dispatch task can `select!` on one stream.
+///
+/// M2b-4 split (2026-09-04): pool creation is now separate from Rtc
+/// creation so multiple Rtcs can share one pool. See
+/// `build_rtc_with_pool_candidates` for the per-Rtc partner and
+/// `dispatch_pool_recv_to_rtcs` for the inbound-packet-to-Rtc routing.
 ///
 /// Fixes the "Discarding STUN request on unknown interface: 0.0.0.0:port"
 /// bug (Seb 2026-09-02): binding once on 0.0.0.0 made socket.local_addr()
 /// return the unspecified address, which str0m's ICE agent didn't
 /// recognize as any known local candidate → drops. Per-IP sockets give
 /// each recv a specific, matchable destination.
-async fn build_rtc() -> Result<(Rtc, SocketPool)> {
+async fn build_socket_pool() -> Result<SocketPool> {
     // Decide which IPs to bind on.
     let mut announced: Vec<IpAddr> = Vec::new();
     if let Ok(ip) = discover_outbound_ip().await {
@@ -193,8 +198,14 @@ async fn build_rtc() -> Result<(Rtc, SocketPool)> {
         recv_tasks.push(task);
     }
     drop(recv_tx);
-    let pool = SocketPool { sockets, recv_rx, _recv_tasks: recv_tasks };
+    Ok(SocketPool { sockets, recv_rx, _recv_tasks: recv_tasks })
+}
 
+/// Build a fresh Rtc seeded with host candidates from `pool.bound_addrs()`.
+/// Multiple Rtcs can share one SocketPool this way — each gets the same
+/// set of local candidates. `dispatch_pool_recv_to_rtcs` routes inbound
+/// packets to the owning Rtc via `Rtc::accepts()`.
+fn build_rtc_with_pool_candidates(pool: &SocketPool) -> Rtc {
     let mut rtc = Rtc::new(Instant::now());
     for addr in pool.bound_addrs() {
         match Candidate::host(addr, "udp") {
@@ -202,8 +213,49 @@ async fn build_rtc() -> Result<(Rtc, SocketPool)> {
             Err(e) => warn!("skipping host candidate {addr}: {e}"),
         }
     }
+    rtc
+}
 
+/// Legacy 1:1 helper — build a fresh SocketPool + one Rtc bound to it.
+/// Kept for callers that don't need the shared-pool M2b-4 dispatch shape
+/// (recv_connect, tests, exploratory code). New sender-side call sites
+/// should use `build_socket_pool` + `build_rtc_with_pool_candidates`
+/// directly and dispatch via `dispatch_pool_recv_to_rtcs`.
+async fn build_rtc() -> Result<(Rtc, SocketPool)> {
+    let pool = build_socket_pool().await?;
+    let rtc = build_rtc_with_pool_candidates(&pool);
     Ok((rtc, pool))
+}
+
+/// Route one pool-recv packet to the first Rtc that accepts it. Returns
+/// `Ok(Some(idx))` on match (caller must then drain that Rtc's
+/// `poll_output`), `Ok(None)` if no Rtc claimed it (stray packet or peer
+/// tore its Rtc down mid-flight — caller should log + drop, never
+/// force-feed an unowned packet into a wrong Rtc), or `Err` if the
+/// accepting Rtc's `handle_input` failed.
+///
+/// Correctness: `Rtc::accepts(&Input)` is str0m's authoritative
+/// ownership check — it inspects ICE ufrag on STUN messages and matches
+/// against the nominated send_addr on DTLS/RTP/RTCP traffic. Iterating
+/// in accept-check order and stopping on the first match preserves that
+/// authority; there is no fallback "guess the Rtc" path.
+pub(crate) fn dispatch_pool_recv_to_rtcs(
+    pr: &PoolRecv,
+    rtcs: &mut [&mut Rtc],
+) -> Result<Option<usize>> {
+    let input = Input::Receive(Instant::now(), Receive {
+        proto: Protocol::Udp,
+        source: pr.source,
+        destination: pr.destination,
+        contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
+    });
+    for (idx, rtc) in rtcs.iter_mut().enumerate() {
+        if rtc.accepts(&input) {
+            rtc.handle_input(input).map_err(|e| anyhow!("handle_input dispatch (rtc idx {idx}): {e}"))?;
+            return Ok(Some(idx));
+        }
+    }
+    Ok(None)
 }
 
 /// Enumerate local interface IPs by parsing `getifaddrs`-style output.
@@ -248,7 +300,11 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
     info!(session = %session_hex, "opening sender WS + Rtc");
 
     let ws = crate::open_ws(&websocket_url(server_url)?, &session_hex).await?;
-    let (mut rtc, mut pool) = build_rtc().await?;
+    // M2b-4: build the SocketPool once, then the sender-side Rtc against it.
+    // Structure holds today for N=1 (this Rtc) and extends to N=peers in
+    // M2b-5 with no dispatch-path changes — see dispatch_pool_recv_to_rtcs.
+    let mut pool = build_socket_pool().await?;
+    let mut rtc = build_rtc_with_pool_candidates(&pool);
 
     // M2b-3: hand the WS to a router+writer pair for the handshake. Router
     // dispatches inbound frames (unrouted here since no peer tasks yet);
@@ -391,14 +447,18 @@ pub async fn send_connect(server_url: &str, share_key: ShareKey, pre_generated_b
             maybe_pr = pool.recv() => {
                 let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
                 info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
-                let input = Input::Receive(Instant::now(), Receive {
-                    proto: Protocol::Udp,
-                    source: pr.source,
-                    destination: pr.destination,
-                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
-                });
-                rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
-                next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
+                // M2b-4: route through the N-Rtc dispatch helper (N=1 here).
+                // `None` = no Rtc claimed the packet; log at debug + drop,
+                // never force-feed an unowned packet into a wrong Rtc.
+                let mut rtcs: [&mut Rtc; 1] = [&mut rtc];
+                match dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)? {
+                    Some(_idx) => {
+                        next_timeout = drain_rtc_capture_open(&mut rtc, &pool, channel_id, &mut opened).await?;
+                    }
+                    None => {
+                        debug!("stray packet from {} on {} — no Rtc accepted, dropped", pr.source, pr.destination);
+                    }
+                }
             }
 
             _ = tokio::time::sleep(dur) => {

@@ -7,12 +7,17 @@
 //!   owns single WS split into stream+sink; router dispatches inbound
 //!   frames by `from_receiver_id` to per-peer mpsc inboxes; writer drains
 //!   an outbox mpsc onto the sink.
-//! - M2b-3 (this slice): send_connect swapped over to router+writer shape,
-//!   still single-peer. Router+writer support shutdown-and-return-halves so
+//! - M2b-3: send_connect swapped over to router+writer shape, still
+//!   single-peer. Router+writer support shutdown-and-return-halves so
 //!   the caller can reunite the WS before it lands in LiveSession —
 //!   downstream file-transfer code keeps its `session.ws.next()` shape
-//!   untouched until N-Rtc dispatch (M2b-4) needs the split-in-flight.
-//! - M2b-4: N-Rtc dispatch loop over shared SocketPool via Rtc::accepts().
+//!   untouched until N-Rtc dispatch requires the split-in-flight.
+//! - M2b-4 (this slice): shared SocketPool + N-Rtc dispatch scaffolding.
+//!   `build_rtc()` split into `build_socket_pool` + `build_rtc_with_pool_candidates`
+//!   so multiple Rtcs can share one pool. `dispatch_pool_recv_to_rtcs`
+//!   routes inbound packets via `Rtc::accepts()`. send_connect uses the
+//!   new shape with N=1 today; M2b-5 spawns per-peer Rtcs into the same
+//!   dispatch path with no changes to the routing itself.
 //! - M2b-5: PeerSession struct + per-peer task spawn on peer_hello.
 //! - M2b-6: block-serve loop with request_ranges wire.
 //! - M2b-7: receiver-side request_ranges + persistence for reconnect.
