@@ -1766,7 +1766,22 @@ async fn parse_ice_candidate(v: &serde_json::Value) -> Option<Candidate> {
         return None;
     }
     info!("remote ICE candidate: {line}");
-    let resolved: String = if line.split_whitespace().nth(4).map_or(false, |a| a.ends_with(".local")) {
+
+    // Skip TCP candidates before we bother anyone (mdns, str0m).
+    // str0m is UDP-only in our build; a TCP candidate would fail
+    // `Candidate::from_sdp_string` at best, or waste a 5s mdns lookup
+    // for the same hostname a UDP candidate already resolved (observed
+    // on Firefox: cf19...local `typ host tcptype active` blocked
+    // ICE-Connected for 5s before end-of-candidates arrived).
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let is_tcp = parts.get(2).map_or(false, |t| t.eq_ignore_ascii_case("tcp"))
+        || parts.iter().any(|p| p.eq_ignore_ascii_case("tcptype"));
+    if is_tcp {
+        info!("  → skipped: TCP candidate (UDP-only build)");
+        return None;
+    }
+
+    let resolved: String = if parts.get(4).map_or(false, |a| a.ends_with(".local")) {
         match crate::maybe_resolve_mdns_candidate(line).await {
             Some(r) => { info!("  → mdns resolved: {r}"); r }
             None => {

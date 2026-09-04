@@ -483,12 +483,48 @@ pub(crate) async fn open_ws(server_url: &str, session_hex: &str) -> Result<Ws> {
 /// a doomed system-resolver future in parallel just adds latency and
 /// log noise. If we ever see mdns lose (e.g. libnss-mdns configured
 /// on the host and firing sub-ms), reinstate the race.
+///
+/// Process-wide 60s TTL cache so repeat lookups of the same hostname
+/// (Firefox emits both `typ host udp` and `typ host tcp` for the
+/// same mDNS name; without the cache the TCP candidate re-hits the
+/// 5s discovery timeout after the responder has stopped announcing).
+/// Negative results are cached with a shorter TTL (5s) so a
+/// transiently-unresolvable hostname doesn't wedge for a full minute.
 async fn race_mdns_resolvers(hostname: &str, timeout: std::time::Duration) -> Option<std::net::IpAddr> {
     use tracing::info;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, (Instant, Option<std::net::IpAddr>)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    const POSITIVE_TTL: Duration = Duration::from_secs(60);
+    const NEGATIVE_TTL: Duration = Duration::from_secs(5);
+
+    let key = hostname.to_ascii_lowercase();
+    if let Ok(g) = cache.lock() {
+        if let Some((cached_at, cached_ip)) = g.get(&key) {
+            let ttl = if cached_ip.is_some() { POSITIVE_TTL } else { NEGATIVE_TTL };
+            if cached_at.elapsed() < ttl {
+                if let Some(ip) = cached_ip {
+                    info!("mdns cache hit {hostname} -> {ip}");
+                }
+                return *cached_ip;
+            }
+        }
+    }
+
     let start = tokio::time::Instant::now();
-    let ip = resolve_mdns_hostname(hostname, timeout).await?;
-    info!("mdns resolved {hostname} in {:?} -> {ip}", start.elapsed());
-    Some(ip)
+    let ip = resolve_mdns_hostname(hostname, timeout).await;
+    if let Some(v) = ip {
+        info!("mdns resolved {hostname} in {:?} -> {v}", start.elapsed());
+    }
+    if let Ok(mut g) = cache.lock() {
+        g.insert(key, (Instant::now(), ip));
+    }
+    ip
 }
 
 /// Ask the local multicast DNS responders for the A record behind
