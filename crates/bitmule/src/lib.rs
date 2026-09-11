@@ -75,10 +75,13 @@
 //!   `anyhow::Error` verbatim.
 
 use bitmule_client_native as native;
+use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
+use bitmule_client_native::{recv_file, send_file_multi, send_file_relay, ServeMode};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 
 pub use native::TransportMode;
 
@@ -276,17 +279,140 @@ impl SendBuilder {
         if self.entries.is_empty() {
             return Err(Error::EmptySend);
         }
-        // TODO(kenna 2026-09-11): plumb `prepare_and_spawn_send` (in
-        // `bitmule/src/main.rs`) up into this crate's lib module and
-        // delegate here. The zip bundle already handles multi-file /
-        // directory sends; `send_with_name`'s display_name lands in
-        // the meta frame's `name` field. The interim error keeps the
-        // API shape reviewable before we do the surgery.
-        let _ = (self.client, self.entries, self.mode, self.multi, self.progress);
-        Err(Error::Transport(anyhow::anyhow!(
-            "SendBuilder::start not yet wired to bitmule-client-native (draft)"
-        )))
+
+        // Bundle decision: single existing file → send as-is. Directory
+        // or multi-path → build a store-mode zip bundle on the fly,
+        // meta-flag it so the receiver unpacks. `send_with_name`
+        // overrides the top-level display name; only the FIRST entry's
+        // display_name is honored for bundles (later ones become
+        // entries inside the zip and use their own basenames).
+        let entry_paths: Vec<PathBuf> = self.entries.iter().map(|e| e.path.clone()).collect();
+        let first_display_override = self
+            .entries
+            .first()
+            .and_then(|e| e.display_name.clone());
+
+        let (send_path, zip_guard, container, display_name) = if entry_paths.len() == 1 {
+            let p = &entry_paths[0];
+            let meta = tokio::fs::metadata(p)
+                .await
+                .map_err(|e| Error::Transport(anyhow::anyhow!("stat {}: {e}", p.display())))?;
+            if meta.is_file() {
+                let basename = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file.bin".to_string());
+                let name = first_display_override.unwrap_or(basename);
+                (p.clone(), None, None, name)
+            } else if meta.is_dir() {
+                let (zip_file, disp) =
+                    bitmule_client_native::container::build_zip_bundle(&entry_paths)
+                        .await
+                        .map_err(Error::Transport)?;
+                let path = zip_file.path().to_path_buf();
+                let name = first_display_override.unwrap_or(disp);
+                (path, Some(zip_file), Some("zip-store".to_string()), name)
+            } else {
+                return Err(Error::NotAFileOrDir(p.clone()));
+            }
+        } else {
+            let (zip_file, disp) =
+                bitmule_client_native::container::build_zip_bundle(&entry_paths)
+                    .await
+                    .map_err(Error::Transport)?;
+            let path = zip_file.path().to_path_buf();
+            let name = first_display_override.unwrap_or(disp);
+            (path, Some(zip_file), Some("zip-store".to_string()), name)
+        };
+
+        let total_bytes = tokio::fs::metadata(&send_path)
+            .await
+            .map_err(|e| Error::Transport(anyhow::anyhow!("stat {}: {e}", send_path.display())))?
+            .len();
+
+        // Mint keys + compute URL commitment (SHA-256 folded with bulk key).
+        let share_key = ShareKey::random();
+        let bulk_key = BulkKey::random();
+        let session_hex = share_key.session_id_hex();
+        let signature = commit_file(&send_path, &bulk_key).await.map_err(Error::Transport)?;
+        let link = ShareLink::new(share_key.clone(), signature);
+        let server = (*self.client.server).clone();
+        let share_url = format!("{}/#{}", server.trim_end_matches('/'), link.to_b64_url());
+
+        let mode = self.mode;
+        let multi = self.multi;
+        let on_progress = self.progress.unwrap_or_else(|| Box::new(|_, _| {}));
+        // Progress boxes need FnMut+Send. tokio::spawn takes an owned future,
+        // capture the box directly.
+        let server_owned = server;
+        let container_owned = container.clone();
+        let handle = tokio::spawn(async move {
+            let _zip_guard = zip_guard; // hold NamedTempFile alive for the transfer
+            let container_ref = container_owned.as_deref();
+            match (multi, mode) {
+                (_, TransportMode::Relay) => {
+                    send_file_relay(
+                        &server_owned,
+                        share_key,
+                        bulk_key,
+                        &send_path,
+                        container_ref,
+                        on_progress,
+                    )
+                    .await
+                }
+                (false, TransportMode::Webrtc) => {
+                    send_file_multi(
+                        &server_owned,
+                        share_key,
+                        bulk_key,
+                        send_path,
+                        container_owned,
+                        ServeMode::Complete,
+                    )
+                    .await
+                }
+                (true, TransportMode::Webrtc) => {
+                    send_file_multi(
+                        &server_owned,
+                        share_key,
+                        bulk_key,
+                        send_path,
+                        container_owned,
+                        ServeMode::Multi,
+                    )
+                    .await
+                }
+            }
+        });
+
+        Ok(SendHandle {
+            share_url,
+            session_hex,
+            display_name,
+            total_bytes,
+            task: handle,
+        })
     }
+}
+
+/// Stream `path` through SHA-256 folding the bulk key in, produce the
+/// 32-byte URL commitment. Reads in 64 KiB chunks — the file is not
+/// held in memory. Mirrors the `commit_file` helper in `main.rs`.
+async fn commit_file(path: &Path, bulk_key: &BulkKey) -> anyhow::Result<[u8; 32]> {
+    let mut f = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let mut hasher = CommitmentHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize(bulk_key))
 }
 
 /// In-flight (or completed) send. Share URL is available immediately;
@@ -362,17 +488,165 @@ impl RecvBuilder {
     /// `dest`. Returns a [`RecvOutcome`] that enumerates each landed
     /// file.
     pub async fn start(self) -> Result<RecvOutcome> {
-        // TODO(kenna 2026-09-11): parse the share URL into a
-        // `ShareKey` + expected commitment (see `main.rs::cmd_recv`
-        // for the fragment shape), then delegate to
-        // `native::recv_file(server, share_key, Some(sig), &dest, mode, on_progress)`.
-        // For zip-store bundles unpack in place and enumerate the
-        // extracted entries; for single files emit one ReceivedFile.
-        let _ = (self.client, self.share_url, self.dest, self.mode, self.progress);
-        Err(Error::Transport(anyhow::anyhow!(
-            "RecvBuilder::start not yet wired to bitmule-client-native (draft)"
-        )))
+        // Parse the share URL. Two accepted forms:
+        //   1. Full ShareLink b64 (86 chars in the fragment) — real
+        //      URL commitment, signature will be verified post-transfer.
+        //   2. Legacy 64-char hex share_key — receiver-initiated flow,
+        //      no signature.
+        let frag = extract_link_fragment(&self.share_url)
+            .ok_or_else(|| Error::BadShareUrl(self.share_url.clone()))?;
+        let (share_key, expected_signature) = if let Ok(link) = ShareLink::from_b64_url(&frag) {
+            (link.share_key, Some(link.signature))
+        } else if frag.len() == 64 && frag.chars().all(|c| c.is_ascii_hexdigit()) {
+            let key = ShareKey::from_hex(&frag)
+                .map_err(|e| Error::Transport(anyhow::anyhow!("bad share_key hex: {e}")))?;
+            (key, None)
+        } else {
+            return Err(Error::BadShareUrl(format!(
+                "fragment {frag:?} is neither an 86-char ShareLink nor a 64-char share_key"
+            )));
+        };
+
+        // Prefer the server explicitly baked into the share URL (so
+        // the receiver doesn't need to match `.server()` at
+        // construction) — but fall back to the client's own if the
+        // URL is fragment-only.
+        let inferred_server = extract_server_from_url(&self.share_url);
+        let server = inferred_server.unwrap_or_else(|| (*self.client.server).clone());
+
+        let mode = self.mode;
+        let dest = self.dest.clone();
+        // recv_file expects `FnMut(u64, u64, &str)`. Default no-op if
+        // the caller didn't set one.
+        let on_progress = self.progress.unwrap_or_else(|| Box::new(|_, _, _| {}));
+        let outcome = recv_file(&server, share_key, expected_signature, &dest, mode, on_progress)
+            .await
+            .map_err(Error::Transport)?;
+
+        // Container-aware landing. `zip-store` → unpack into a
+        // sibling dir and enumerate; anything else (or none) → the
+        // single downloaded path is the ReceivedFile.
+        let mut files = Vec::new();
+        match outcome.container.as_deref() {
+            Some("zip-store") => {
+                let unpack_dir = bitmule_client_native::container::unpack_dir_for(&outcome.path);
+                match bitmule_client_native::container::unpack_zip_store(
+                    &outcome.path,
+                    &unpack_dir,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        // Zip served its purpose; delete best-effort.
+                        let _ = tokio::fs::remove_file(&outcome.path).await;
+                        collect_files_recursive(&unpack_dir, &mut files)
+                            .await
+                            .map_err(Error::Io)?;
+                    }
+                    Err(e) => {
+                        // Fall back to shipping the raw zip as one file.
+                        eprintln!(
+                            "warning: zip-store unpack failed: {e:#} — leaving as one file"
+                        );
+                        let size = tokio::fs::metadata(&outcome.path).await.map(|m| m.len()).unwrap_or(0);
+                        let name = outcome
+                            .path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "file.bin".to_string());
+                        files.push(ReceivedFile { name, path: outcome.path.clone(), size });
+                    }
+                }
+            }
+            Some(other) => {
+                // Unknown container; emit a warn but ship the raw file.
+                eprintln!(
+                    "warning: sender flagged container={other:?} — leaving file as-is"
+                );
+                let size = tokio::fs::metadata(&outcome.path).await.map(|m| m.len()).unwrap_or(0);
+                let name = outcome
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file.bin".to_string());
+                files.push(ReceivedFile { name, path: outcome.path.clone(), size });
+            }
+            None => {
+                let size = tokio::fs::metadata(&outcome.path).await.map(|m| m.len()).unwrap_or(0);
+                let name = outcome
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file.bin".to_string());
+                files.push(ReceivedFile { name, path: outcome.path.clone(), size });
+            }
+        }
+
+        Ok(RecvOutcome { files, dest })
     }
+}
+
+/// Extract the URL fragment from a share URL, or accept a bare
+/// fragment directly. Mirrors main.rs::extract_link_fragment.
+fn extract_link_fragment(input: &str) -> Option<String> {
+    let s = input.trim();
+    let candidate = if s.starts_with("http://") || s.starts_with("https://") {
+        s.rsplit('#').next().unwrap_or(s).to_string()
+    } else {
+        s.to_string()
+    };
+    let trimmed = candidate.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Extract `scheme://host[:port]` origin from a share URL, if the
+/// input is a full URL. Returns None on bare fragments.
+fn extract_server_from_url(input: &str) -> Option<String> {
+    let s = input.trim();
+    let (scheme, rest) = if let Some(r) = s.strip_prefix("http://") {
+        ("http", r)
+    } else if let Some(r) = s.strip_prefix("https://") {
+        ("https", r)
+    } else {
+        return None;
+    };
+    let end = rest.find(|c: char| c == '/' || c == '#').unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() {
+        None
+    } else {
+        Some(format!("{scheme}://{authority}"))
+    }
+}
+
+/// Walk `dir` recursively, appending every regular file as a
+/// [`ReceivedFile`] to `out`. Preserves the on-disk layout the
+/// unzip step produced.
+fn collect_files_recursive<'a>(
+    dir: &'a Path,
+    out: &'a mut Vec<ReceivedFile>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+            let meta = entry.metadata().await?;
+            if meta.is_dir() {
+                collect_files_recursive(&path, out).await?;
+            } else if meta.is_file() {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file.bin".to_string());
+                out.push(ReceivedFile { name, path, size: meta.len() });
+            }
+        }
+        Ok(())
+    })
 }
 
 /// One received file's on-disk landing. `.read()` / `.read_all().await`
