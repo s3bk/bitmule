@@ -1,78 +1,86 @@
 //! Bitmule — resumable, E2E-encrypted, WebRTC-first file transfer.
 //!
-//! Library surface of the `bitmule` crate (crate also ships a CLI in
-//! `src/main.rs`; both compile from this same `bitmule` package so
-//! `cargo add bitmule` gives embedders the types below and
-//! `cargo install bitmule` still gets the CLI).
+//! Library surface of the `bitmule` crate. The same crate also ships a
+//! CLI in `src/main.rs`; `cargo add bitmule` gets the types below,
+//! `cargo install bitmule` gets the binary.
 //!
 //! # Design
 //!
 //! One [`Client`] carries the signaling/relay server URL and any
-//! long-lived state (identity, HTTP client reuse). Per-transfer options
-//! come off fluent builders returned from [`Client::send`] and
-//! [`Client::recv`]. A send returns a [`SendHandle`] up front — the
-//! caller can hand out `handle.share_url()` before the receiver ever
-//! connects; `handle.wait().await` blocks until the transfer completes.
+//! long-lived state (identity, HTTP client reuse). A send is a fluent
+//! builder — chain `.send(path)` for each file, override the display
+//! name with `.send_with_name(path, name)`, tune `.mode()` /
+//! `.on_progress()`, then `.start().await` to mint the share URL and
+//! spawn the transport. Recv is symmetric: `client.recv(url)`,
+//! `.dest(dir)`, `.on_progress(...)`, `.start().await` — the returned
+//! [`RecvOutcome`] iterates each received file via `.files()` with
+//! per-file `read()` / `read_all().await`.
 //!
-//! Under the hood, the library wraps `bitmule-client-native`'s
-//! [`send_file_multi`] / [`send_file_relay`] / [`recv_file`] one-shots
-//! plus commitment hashing so the receiver can verify the URL
-//! signature. Nothing here touches CLI concerns (stdout, QR rendering,
-//! `--server` flag parsing) — that stays in `main.rs`.
-//!
-//! # Quick send
+//! # Send
 //!
 //! ```no_run
-//! # use std::path::Path;
-//! # async fn demo() -> bitmule::Result<()> {
-//! let client = bitmule::Client::new("https://bitmule.qdat.net");
+//! # #[tokio::main] async fn main() -> bitmule::Result<()> {
+//! use bitmule::{Client, TransportMode};
+//!
+//! let client = Client::new("https://bitmule.qdat.net");
 //! let handle = client
-//!     .send(Path::new("./photo.png"))
+//!     .send("./photo.png")
+//!     .send("./another_photo.png")
+//!     .send_with_name("/tmp/folder", "secret")
+//!     .mode(TransportMode::Auto)
+//!     .on_progress(|sent, total| eprintln!("{sent}/{total}"))
 //!     .start()
 //!     .await?;
-//! println!("share this URL: {}", handle.share_url());
+//! println!("share {}", handle.share_url());
 //! handle.wait().await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! # Quick recv
+//! # Recv
 //!
 //! ```no_run
-//! # async fn demo() -> bitmule::Result<()> {
-//! let client = bitmule::Client::new("https://bitmule.qdat.net");
+//! # #[tokio::main] async fn main() -> bitmule::Result<()> {
+//! use bitmule::Client;
+//!
+//! let client = Client::new("https://bitmule.qdat.net");
 //! let outcome = client
-//!     .recv("https://bitmule.qdat.net/#abcdef...", "./downloads/")
+//!     .recv("https://bitmule.qdat.net/#…")
+//!     .dest("./downloads")
+//!     .on_progress(|sent, total, name| eprintln!("{name}: {sent}/{total}"))
 //!     .start()
 //!     .await?;
-//! println!("wrote {} ({} bytes)", outcome.path.display(), outcome.size);
+//! for f in outcome.files() {
+//!     println!("{} {}b", f.name(), f.size());
+//!     let bytes = f.read_all().await?;
+//!     drop(bytes);
+//! }
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # Progress
 //!
-//! Both builders accept an `on_progress` callback. Called from the
-//! transport task on chunk-completion boundaries; must be cheap and
-//! non-blocking (spawn a task from inside if you need to do real work).
-//! Progress bytes are plaintext — same denominator on both sides.
+//! Callbacks fire from the transport task on chunk boundaries — cheap
+//! and non-blocking. Progress is in plaintext bytes; sender and
+//! receiver see the same denominator.
 //!
 //! # What isn't here yet
 //!
-//! - Identity/contacts API (currently `src/identity.rs`, CLI-only).
-//!   Migrate `Identity`, `Contact`, and the share-link/QR helpers up
-//!   to `pub use` here once the shape settles.
-//! - Streaming send from an `AsyncRead` (today the transport wants a
-//!   `Path`). Needed for the synthline-agent hand-off where the file
-//!   lives in a SQLite BLOB, not on disk.
-//! - Structured error variants — right now the transport crate returns
-//!   `anyhow::Error`; [`Error::Transport`] wraps it verbatim.
+//! - Identity / contacts API (currently `src/identity.rs`, CLI-only).
+//! - Streaming send from an `AsyncRead` — the transport wants a `Path`
+//!   today. Needed for the synthline-agent handoff where an
+//!   attachment lives in a SQLite BLOB.
+//! - Structured error variants — [`Error::Transport`] wraps
+//!   `anyhow::Error` verbatim.
 
 use bitmule_client_native as native;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::AsyncRead;
 
-pub use native::{RecvComplete, TransportMode};
+pub use native::TransportMode;
 
 // -----------------------------------------------------------------------
 // Errors
@@ -80,20 +88,12 @@ pub use native::{RecvComplete, TransportMode};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Client-facing error. Grows structured variants as internal errors
-/// stabilize; today most transport failures land in `Transport`.
 #[derive(Debug)]
 pub enum Error {
-    /// No paths given to `send`.
     EmptySend,
-    /// The URL passed to `recv` couldn't be parsed as a bitmule share
-    /// link (`https://host/#<hex>` or a bare fragment).
     BadShareUrl(String),
-    /// A source path is neither a regular file nor a directory.
     NotAFileOrDir(PathBuf),
-    /// Wrapping the underlying transport / crypto crate's errors.
     Transport(anyhow::Error),
-    /// Filesystem I/O.
     Io(std::io::Error),
 }
 
@@ -135,18 +135,15 @@ impl From<std::io::Error> for Error {
 // Client
 // -----------------------------------------------------------------------
 
-/// Long-lived handle to a bitmule server. Cheap to clone; internal
-/// state is `Arc`d as it grows (currently just the server URL string).
 #[derive(Clone)]
 pub struct Client {
-    server: String,
+    server: Arc<String>,
 }
 
 impl Client {
-    /// Shorthand for [`Client::builder`]`.server(url).build()`.
     pub fn new(server: impl Into<String>) -> Self {
         Self {
-            server: server.into(),
+            server: Arc::new(server.into()),
         }
     }
 
@@ -154,33 +151,23 @@ impl Client {
         ClientBuilder { server: None }
     }
 
-    /// Signaling+relay server URL this client was built with.
     pub fn server(&self) -> &str {
         &self.server
     }
 
-    /// Send a single file. Chain builder methods and call
-    /// [`SendBuilder::start`] to kick it off.
-    pub fn send(&self, path: impl Into<PathBuf>) -> SendBuilder<'_> {
-        SendBuilder::new(self, vec![path.into()])
+    /// Start a fluent send with one file. Chain `.send(...)` /
+    /// `.send_with_name(...)` for more.
+    pub fn send(&self, path: impl Into<PathBuf>) -> SendBuilder {
+        SendBuilder::new(self.clone()).send(path)
     }
 
-    /// Send multiple files or a directory — the sender bundles them
-    /// into a store-mode zip on the fly and flags the meta so the
-    /// receiver unpacks. A single-file `paths` behaves like
-    /// [`Client::send`].
-    pub fn send_paths(&self, paths: Vec<PathBuf>) -> SendBuilder<'_> {
-        SendBuilder::new(self, paths)
-    }
-
-    /// Receive a file/bundle from `share_url` into `out_dir`. Accepts
-    /// full `https://host/#<hex>` share URLs or a bare fragment
-    /// (`<hex>` — the caller has already stripped the origin).
-    pub fn recv(&self, share_url: impl Into<String>, out_dir: impl Into<PathBuf>) -> RecvBuilder<'_> {
+    /// Fluent recv from a share URL. Defaults `dest` to the current
+    /// working directory until [`RecvBuilder::dest`] overrides.
+    pub fn recv(&self, share_url: impl Into<String>) -> RecvBuilder {
         RecvBuilder {
-            client: self,
+            client: self.clone(),
             share_url: share_url.into(),
-            out_dir: out_dir.into(),
+            dest: PathBuf::from("."),
             mode: TransportMode::Webrtc,
             progress: None,
         }
@@ -198,11 +185,10 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Client {
-        Client {
-            server: self
-                .server
+        Client::new(
+            self.server
                 .unwrap_or_else(|| "https://bitmule.qdat.net".to_string()),
-        }
+        )
     }
 }
 
@@ -210,26 +196,55 @@ impl ClientBuilder {
 // Send
 // -----------------------------------------------------------------------
 
-/// Fluent send configuration. Consumed by [`SendBuilder::start`].
-pub struct SendBuilder<'a> {
-    client: &'a Client,
-    paths: Vec<PathBuf>,
+/// One entry queued for the next send. `display_name` is `None` when
+/// the sender wants the receiver to see the original basename, `Some`
+/// when `.send_with_name(...)` overrode it.
+struct SendEntry {
+    path: PathBuf,
+    display_name: Option<String>,
+}
+
+/// Fluent send configuration. Own the builder, chain `.send(...)` calls
+/// to append files, then `.start()`.
+pub struct SendBuilder {
+    client: Client,
+    entries: Vec<SendEntry>,
     mode: TransportMode,
     multi: bool,
-    container: Option<String>,
     progress: Option<Box<dyn FnMut(u64, u64) + Send>>,
 }
 
-impl<'a> SendBuilder<'a> {
-    fn new(client: &'a Client, paths: Vec<PathBuf>) -> Self {
+impl SendBuilder {
+    fn new(client: Client) -> Self {
         Self {
             client,
-            paths,
+            entries: Vec::new(),
             mode: TransportMode::Webrtc,
             multi: false,
-            container: None,
             progress: None,
         }
+    }
+
+    /// Append a file or directory to the send. Multiple `.send(...)`
+    /// calls accumulate. Directories are auto-bundled into a
+    /// store-mode zip on the fly (the receiver unpacks).
+    pub fn send(mut self, path: impl Into<PathBuf>) -> Self {
+        self.entries.push(SendEntry {
+            path: path.into(),
+            display_name: None,
+        });
+        self
+    }
+
+    /// Append a path with an explicit display name (what the receiver
+    /// sees in the meta frame / on disk). Same accumulator as
+    /// [`SendBuilder::send`].
+    pub fn send_with_name(mut self, path: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        self.entries.push(SendEntry {
+            path: path.into(),
+            display_name: Some(name.into()),
+        });
+        self
     }
 
     /// Force a specific transport. Defaults to WebRTC.
@@ -239,21 +254,13 @@ impl<'a> SendBuilder<'a> {
     }
 
     /// Keep the sender live and hand the same URL to any number of
-    /// receivers over time. Combines with [`SendBuilder::mode`].
+    /// receivers. Combines with [`SendBuilder::mode`].
     pub fn multi(mut self, on: bool) -> Self {
         self.multi = on;
         self
     }
 
-    /// Advisory MIME/container hint that flows through the meta frame
-    /// (e.g. `"zip-store"` for auto-bundled directories). Callers
-    /// almost never need to set this — the bundler picks it.
-    pub fn container(mut self, name: impl Into<String>) -> Self {
-        self.container = Some(name.into());
-        self
-    }
-
-    /// Progress callback: `(bytes_sent, total_bytes)`. Fired from the
+    /// Progress callback: `(bytes_sent, total_bytes)`. Fires from the
     /// transport task on chunk boundaries; keep it cheap.
     pub fn on_progress<F>(mut self, f: F) -> Self
     where
@@ -263,63 +270,53 @@ impl<'a> SendBuilder<'a> {
         self
     }
 
-    /// Prepare the session (mint keys, hash the file, spawn the
-    /// transport task) and return a [`SendHandle`]. `handle.share_url()`
-    /// is immediately valid; the transfer runs in the background until
-    /// `handle.wait().await`.
+    /// Mint the session, hash the file(s), spawn the transport task,
+    /// and return a [`SendHandle`] carrying the share URL.
     pub async fn start(self) -> Result<SendHandle> {
-        // TODO(kenna 2026-09-11): plumb `prepare_and_spawn_send` out of
-        // `main.rs` into this crate's lib.rs and delegate here. The
-        // existing function already returns everything a `SendHandle`
-        // needs (`session_hex`, `share_url`, `file_name`, `file_size`,
-        // `handle`); it just lives on the binary side today.
-        //
-        // Interim: this shape compiles and documents the intended API.
-        let _ = (self.client, self.paths, self.mode, self.multi, self.container, self.progress);
+        if self.entries.is_empty() {
+            return Err(Error::EmptySend);
+        }
+        // TODO(kenna 2026-09-11): plumb `prepare_and_spawn_send` (in
+        // `bitmule/src/main.rs`) up into this crate's lib module and
+        // delegate here. The zip bundle already handles multi-file /
+        // directory sends; `send_with_name`'s display_name lands in
+        // the meta frame's `name` field. The interim error keeps the
+        // API shape reviewable before we do the surgery.
+        let _ = (self.client, self.entries, self.mode, self.multi, self.progress);
         Err(Error::Transport(anyhow::anyhow!(
             "SendBuilder::start not yet wired to bitmule-client-native (draft)"
         )))
     }
 }
 
-/// In-flight (or completed) send. The share URL is available before
-/// the receiver connects; `wait` resolves when the transfer's over.
+/// In-flight (or completed) send. Share URL is available immediately;
+/// `wait` resolves when the receiver finishes (or, in multi mode, when
+/// the caller drops the future).
 pub struct SendHandle {
     share_url: String,
     session_hex: String,
-    file_name: String,
-    file_size: u64,
+    display_name: String,
+    total_bytes: u64,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl SendHandle {
-    /// Full share URL (`<server>/#<fragment>`). Safe to log or QR-encode.
     pub fn share_url(&self) -> &str {
         &self.share_url
     }
-
-    /// 64-char hex session id — useful for logs and matching against
-    /// the signaling server's session table.
     pub fn session_hex(&self) -> &str {
         &self.session_hex
     }
-
-    /// The name the receiver will see. For directories/multi-file
-    /// sends this is the zip bundle's display name.
-    pub fn file_name(&self) -> &str {
-        &self.file_name
+    /// What the receiver will see as the top-level filename (single
+    /// file's basename, `send_with_name` override, or bundle display
+    /// name for multi/directory sends).
+    pub fn display_name(&self) -> &str {
+        &self.display_name
     }
-
-    /// Plaintext size in bytes. Progress callbacks are in the same
-    /// unit — this is the denominator.
-    pub fn file_size(&self) -> u64 {
-        self.file_size
+    /// Plaintext byte count. Progress callbacks use the same unit.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
     }
-
-    /// Await transfer completion. Single-peer transports resolve after
-    /// the first receiver finishes; multi mode resolves when the
-    /// caller cancels the returned future (via drop or an outer
-    /// `select!`).
     pub async fn wait(self) -> Result<()> {
         self.task
             .await
@@ -332,23 +329,27 @@ impl SendHandle {
 // Recv
 // -----------------------------------------------------------------------
 
-pub struct RecvBuilder<'a> {
-    client: &'a Client,
+pub struct RecvBuilder {
+    client: Client,
     share_url: String,
-    out_dir: PathBuf,
+    dest: PathBuf,
     mode: TransportMode,
     progress: Option<Box<dyn FnMut(u64, u64, &str) + Send>>,
 }
 
-impl<'a> RecvBuilder<'a> {
+impl RecvBuilder {
+    /// Override the destination directory. Defaults to the current
+    /// working directory.
+    pub fn dest(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.dest = dir.into();
+        self
+    }
+
     pub fn mode(mut self, m: TransportMode) -> Self {
         self.mode = m;
         self
     }
 
-    /// Progress callback: `(bytes_received, total_bytes, filename)`.
-    /// `filename` is the sender-declared name; for zip-store bundles
-    /// it's the bundle display name, not the individual entry.
     pub fn on_progress<F>(mut self, f: F) -> Self
     where
         F: FnMut(u64, u64, &str) + Send + 'static,
@@ -357,74 +358,97 @@ impl<'a> RecvBuilder<'a> {
         self
     }
 
-    /// Connect, receive, and write into `out_dir`. Resolves when the
-    /// file (or bundle) is fully on disk and the URL signature has
-    /// been verified. Returns the concrete on-disk path + plaintext
-    /// size.
-    pub async fn start(self) -> Result<RecvComplete> {
-        // TODO(kenna 2026-09-11): parse `share_url` into a `ShareKey`
-        // + expected signature (see `bitmule/src/main.rs::cmd_recv`
-        // for the URL/fragment parsing shape), then delegate to
-        // `native::recv_file(server, share_key, Some(sig), &out_dir, mode, on_progress)`.
-        let _ = (self.client, self.share_url, self.out_dir, self.mode, self.progress);
+    /// Connect, receive, verify signature, and land the file(s) under
+    /// `dest`. Returns a [`RecvOutcome`] that enumerates each landed
+    /// file.
+    pub async fn start(self) -> Result<RecvOutcome> {
+        // TODO(kenna 2026-09-11): parse the share URL into a
+        // `ShareKey` + expected commitment (see `main.rs::cmd_recv`
+        // for the fragment shape), then delegate to
+        // `native::recv_file(server, share_key, Some(sig), &dest, mode, on_progress)`.
+        // For zip-store bundles unpack in place and enumerate the
+        // extracted entries; for single files emit one ReceivedFile.
+        let _ = (self.client, self.share_url, self.dest, self.mode, self.progress);
         Err(Error::Transport(anyhow::anyhow!(
             "RecvBuilder::start not yet wired to bitmule-client-native (draft)"
         )))
     }
 }
 
-// -----------------------------------------------------------------------
-// Convenience free functions
-// -----------------------------------------------------------------------
-
-/// One-liner send for callers who don't want to hold on to a
-/// [`Client`]. Equivalent to
-/// `Client::new(server).send(path).mode(mode).start().await`.
-pub async fn send(
-    server: impl Into<String>,
-    path: impl Into<PathBuf>,
-    mode: TransportMode,
-) -> Result<SendHandle> {
-    Client::new(server).send(path).mode(mode).start().await
+/// One received file's on-disk landing. `.read()` / `.read_all().await`
+/// stream the bytes from disk lazily — the transport has already
+/// written the file, this is just the reader convenience.
+pub struct ReceivedFile {
+    name: String,
+    path: PathBuf,
+    size: u64,
 }
 
-/// One-liner receive for callers who don't want to hold on to a
-/// [`Client`]. Equivalent to
-/// `Client::new(server).recv(url, out_dir).mode(mode).start().await`.
-pub async fn recv(
-    server: impl Into<String>,
-    share_url: impl Into<String>,
-    out_dir: impl Into<PathBuf>,
-    mode: TransportMode,
-) -> Result<RecvComplete> {
-    Client::new(server)
-        .recv(share_url, out_dir)
-        .mode(mode)
-        .start()
-        .await
+impl ReceivedFile {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    /// Absolute on-disk path — useful when the caller wants to hand
+    /// the file to another tool without re-reading through this
+    /// library.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Open the file for streaming. Returns a boxed async reader so
+    /// callers don't have to name the concrete `tokio::fs::File`.
+    pub async fn read(&self) -> Result<Box<dyn AsyncRead + Send + Unpin>> {
+        let f = tokio::fs::File::open(&self.path).await?;
+        Ok(Box::new(f))
+    }
+
+    /// Slurp the whole file. Convenience for callers that don't want
+    /// to write the streaming loop themselves.
+    pub async fn read_all(&self) -> Result<Vec<u8>> {
+        Ok(tokio::fs::read(&self.path).await?)
+    }
+}
+
+/// What a completed recv landed on disk. Iterate via [`RecvOutcome::files`].
+pub struct RecvOutcome {
+    files: Vec<ReceivedFile>,
+    dest: PathBuf,
+}
+
+impl RecvOutcome {
+    /// Iterate the received files in the order the sender bundled
+    /// them. Borrowed so callers can call `.read()` / `.read_all()`
+    /// per file without moving the outcome.
+    pub fn files(&self) -> impl Iterator<Item = &ReceivedFile> {
+        self.files.iter()
+    }
+
+    /// The directory the receiver wrote into.
+    pub fn dest(&self) -> &Path {
+        &self.dest
+    }
+
+    /// Total files landed. Handy when the caller just wants a count
+    /// without walking the iterator.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
 }
 
 // -----------------------------------------------------------------------
-// Re-exports for advanced users
+// Escape hatch
 // -----------------------------------------------------------------------
 
-/// Escape hatch: the underlying transport crate. Import from here if
-/// you need `LiveSession`, hand-rolled crypto keys, or the pre-flight
-/// commitment hasher. The `bitmule` crate's stable surface is the
-/// types above; anything under [`native`] may move.
+/// Advanced: direct access to the underlying transport crate. Import
+/// from here for `LiveSession`, hand-rolled crypto keys, or the
+/// commitment hasher. Anything under [`internals`] may move.
 pub mod internals {
     pub use bitmule_client_native as native;
-}
-
-// -----------------------------------------------------------------------
-// Path helpers — small enough to keep here rather than adding a util
-// module for two functions.
-// -----------------------------------------------------------------------
-
-/// Best-effort file-name display string from a path. Used by
-/// [`SendHandle::file_name`] when the send is a single file.
-fn _display_name(p: &Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file.bin".to_string())
 }
