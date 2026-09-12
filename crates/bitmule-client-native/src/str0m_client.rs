@@ -1330,6 +1330,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
     sender_bulk: Option<BulkKey>,
 ) -> Result<(BulkKey, MetaKey)> {
     use futures_util::{StreamExt};
+    eprintln!("[kex-{:?}] start", role);
     // Local ephemeral, MAC'd with share_key so the peer can authenticate us.
     let local_ephemeral = Ephemeral::generate();
     let local_pub = local_ephemeral.public_bytes();
@@ -1338,6 +1339,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
         pub_hex: hex_encode(&local_pub),
         mac_hex: hex_encode(&local_mac),
     }).await?;
+    eprintln!("[kex-{:?}] KexPub sent", role);
 
     let mut ephemeral_holder = Some(local_ephemeral);
     let mut wrap_key: Option<WrapKey> = None;
@@ -1375,8 +1377,9 @@ pub(crate) async fn handshake_bulk_key_over_ws(
         let msg = ws.next().await;
         let frame = match parse_ws_frame(msg)? {
             Some(f) => f,
-            None => continue,
+            None => { eprintln!("[kex-{:?}] parse=None, continue", role); continue },
         };
+        eprintln!("[kex-{:?}] got {:?}", role, std::mem::discriminant(&frame));
         match frame {
             SignalFrame::KexPub { pub_hex, mac_hex } => {
                 if wrap_key.is_some() {
