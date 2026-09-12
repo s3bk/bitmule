@@ -1367,7 +1367,22 @@ pub(crate) async fn handshake_bulk_key_over_ws(
                 return Ok((bk, mk));
             }
             Role::Receiver => {
-                if let (Some(b), Some(mk)) = (bulk_key.take(), meta_key_opt.take()) {
+                // Peek without consuming. The previous form
+                // `if let (Some(b), Some(mk)) = (bulk_key.take(), meta_key_opt.take())`
+                // was destructive: `.take()` on Option runs
+                // regardless of whether the pattern matches. On
+                // partial-progress iterations (KexPub gave meta_key
+                // but KeyWrap hadn't landed yet), the take() would
+                // consume meta_key_opt and leave it None, so when
+                // KeyWrap arrived and set bulk_key, the next check
+                // would be (Some, None) again and take() would eat
+                // bulk_key too. Receiver's KEX would then loop
+                // forever with both fields perpetually stolen.
+                // Kenna 2026-09-12, verified in sudfa container with
+                // KEX-trace instrumentation.
+                if bulk_key.is_some() && meta_key_opt.is_some() {
+                    let b = bulk_key.take().expect("just checked Some");
+                    let mk = meta_key_opt.take().expect("just checked Some");
                     return Ok((b, mk));
                 }
             }
