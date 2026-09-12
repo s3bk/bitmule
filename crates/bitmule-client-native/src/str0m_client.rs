@@ -1082,6 +1082,16 @@ pub async fn send_file_relay(
         receiver_id: None,
         wire_version: Some(crate::WIRE_VERSION),
     }).await?;
+    // Wait for the server to notify us a receiver has joined the room
+    // BEFORE we start emitting KEX frames. If we blast KexPub at t=0
+    // when the room is still empty, the server's `fan_to_receivers`
+    // has nobody to route to and the frame is lost. Server sends us a
+    // peer_hello("receiver") the moment a receiver's Hello lands; we
+    // block here until we see it. Kenna 2026-09-12, verified with the
+    // pump debug run in sudfa container: sender's KexPub was
+    // being emitted at t≈0.1s and lost, receiver's KEX-await never
+    // completed, receiver hung on "waiting for transfer".
+    wait_for_peer(&mut ws, "receiver").await?;
     // Sync bulk_key with receiver via KEX+KeyWrap over the same WS, BEFORE
     // dropping into the relay pump. The returned bulk_key is our own
     // pre-generated one — kept for future chunk encryption (Push B2).
@@ -1421,6 +1431,29 @@ pub(crate) async fn handshake_bulk_key_over_ws(
             }
             _ => { /* ignore other signaling frames during handshake */ }
         }
+    }
+}
+
+/// Block reading frames from `ws` until we see a `peer_hello` for the
+/// expected peer role, or bail on ws close. Silently drops any other
+/// signaling frames that arrive first. Used on the relay path to
+/// avoid emitting KEX frames into an empty room before the counter-
+/// party is registered on the server. Kenna 2026-09-12.
+pub(crate) async fn wait_for_peer(ws: &mut Ws, expected_role: &str) -> Result<()> {
+    use futures_util::StreamExt;
+    loop {
+        let msg = ws.next().await;
+        let frame = match parse_ws_frame(msg)? {
+            Some(f) => f,
+            None => continue,
+        };
+        if let SignalFrame::PeerHello { role: Some(role), .. } = &frame {
+            if role == expected_role {
+                return Ok(());
+            }
+        }
+        // Any other frame (Hello, KexPub arriving impossibly early,
+        // etc) is silently dropped during this bootstrap window.
     }
 }
 
