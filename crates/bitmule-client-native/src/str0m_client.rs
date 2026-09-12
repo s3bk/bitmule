@@ -1071,6 +1071,17 @@ pub async fn send_file_relay(
     let session_id = SessionId::from_hex(&session_hex)
         .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     let mut ws = crate::open_ws(server_url_http, &session_hex).await?;
+    // Server's `read_hello` requires a `HelloFrame` as the FIRST ws
+    // frame or it closes the socket. `send_file_multi` (WebRTC path)
+    // sends this already; the relay path was skipping it and the
+    // socket died as "ws closed pre-channel-open" the moment
+    // `handshake_bulk_key_over_ws` fired its first KexPub frame.
+    // Kenna 2026-09-12.
+    ws_send(&mut ws, &SignalFrame::Hello {
+        role: Role::Sender.as_str().to_owned(),
+        receiver_id: None,
+        wire_version: Some(crate::WIRE_VERSION),
+    }).await?;
     // Sync bulk_key with receiver via KEX+KeyWrap over the same WS, BEFORE
     // dropping into the relay pump. The returned bulk_key is our own
     // pre-generated one — kept for future chunk encryption (Push B2).
@@ -1100,6 +1111,20 @@ async fn recv_file_relay(
     let session_id = SessionId::from_hex(&session_hex)
         .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     let mut ws = crate::open_ws(server_url_http, &session_hex).await?;
+    // Same "server needs hello first" bug as send_file_relay above —
+    // the recv-relay path was missing the initial HelloFrame too.
+    // Kenna 2026-09-12.
+    let receiver_id = SessionId::random().as_hex();
+    ws_send(&mut ws, &SignalFrame::Hello {
+        role: Role::Receiver.as_str().to_owned(),
+        receiver_id: Some(receiver_id.clone()),
+        wire_version: Some(crate::WIRE_VERSION),
+    }).await?;
+    ws_send(&mut ws, &SignalFrame::PeerHello {
+        receiver_id: Some(receiver_id),
+        role: None,
+        wire_version: Some(crate::WIRE_VERSION),
+    }).await?;
     // Run KEX+KeyWrap over the WS to receive the bulk_key from the sender.
     // Do this BEFORE the pump takes over the ws so KEX frames don't race
     // chunk_relay frames.
