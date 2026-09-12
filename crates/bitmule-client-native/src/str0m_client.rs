@@ -1151,7 +1151,16 @@ async fn recv_file_relay(
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
-    let _ = out_tx; // relay recv only reads; sender kept alive so pumper's send half stays valid
+    // Bind out_tx to a NAMED variable so it lives until the end of this
+    // function scope. `let _ = out_tx;` (previous form) actually drops
+    // it immediately at end-of-statement — Rust's `_` pattern is an
+    // ignore-then-drop, not a hold. When out_tx dropped early, the
+    // pump's `out_rx.recv()` returned None immediately and the select!
+    // arm broke out of the loop, killing the ws-inbound half too. So
+    // the receiver never saw any of the sender's frames and hung on
+    // "waiting for transfer". Kenna 2026-09-12, verified live in the
+    // sudfa container.
+    let _out_tx = out_tx;
     let outcome = crate::recv_file_over_relay(
         server_url_http, &session_id, out_dir, in_rx,
         &bulk_key, &meta_key, &session_id_bytes,
