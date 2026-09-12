@@ -1092,12 +1092,28 @@ pub async fn send_file_relay(
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let progress = std::sync::Arc::new(tokio::sync::Mutex::new(crate::RelaySendProgress::default()));
-    let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
-    crate::send_file_over_relay(
+    let pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
+    // Move out_tx into a local so we can drop it deterministically
+    // BEFORE we await the pump. Otherwise it would stay alive for
+    // the whole function scope, out_rx would keep returning Pending,
+    // and the pump would never see EOF on its outbound channel.
+    let out_tx = out_tx;
+    let send_result = crate::send_file_over_relay(
         server_url_http, &session_id, file_path, container, out_tx, progress,
         &bulk, &meta, &session_id_bytes,
         on_progress,
-    ).await
+    ).await;
+    // send_file_over_relay owns out_tx (moved above) and drops it on
+    // return. That signals EOF to the pump's out_rx, which drains any
+    // remaining frames it was buffering then exits. Awaiting the pump
+    // here guarantees `meta_relay_enc`, all `chunk_relay` frames, and
+    // the final `relay_done` have actually hit the ws — without this
+    // await, `send_file_relay` returned before the pump had flushed,
+    // and when the tokio runtime shut down at cmd_send return, any
+    // still-queued frames were lost. Receiver then hung forever on
+    // "waiting for transfer". Kenna 2026-09-12.
+    let _ = pump.await;
+    send_result
 }
 
 async fn recv_file_relay(
