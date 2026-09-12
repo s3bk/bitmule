@@ -1180,27 +1180,41 @@ async fn pump_relay_ws(
     mut out_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     in_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) {
+    eprintln!("[pump] start");
     loop {
         tokio::select! {
             maybe_msg = ws.next() => {
                 match maybe_msg {
                     Some(Ok(Message::Text(t))) => {
-                        if in_tx.send(t.to_string()).is_err() { break; }
+                        let preview: String = t.chars().take(60).collect();
+                        eprintln!("[pump] ws->in ({}B): {}", t.len(), preview);
+                        if in_tx.send(t.to_string()).is_err() {
+                            eprintln!("[pump] in_tx.send failed, exit");
+                            break;
+                        }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(e)) => { warn!("relay ws recv: {e}"); break; }
+                    Some(Ok(Message::Close(_))) => { eprintln!("[pump] ws Close, exit"); break; }
+                    None => { eprintln!("[pump] ws None, exit"); break; }
+                    Some(Err(e)) => { warn!("relay ws recv: {e}"); eprintln!("[pump] ws recv err {e}, exit"); break; }
                     _ => {}
                 }
             }
             maybe_out = out_rx.recv() => {
-                let Some(text) = maybe_out else { break };
+                let Some(text) = maybe_out else {
+                    eprintln!("[pump] out_rx None, exit");
+                    break;
+                };
+                let preview: String = text.chars().take(60).collect();
+                eprintln!("[pump] out->ws ({}B): {}", text.len(), preview);
                 if let Err(e) = ws.send(Message::Text(text.into())).await {
                     warn!("relay ws send: {e}");
+                    eprintln!("[pump] ws send err {e}, exit");
                     break;
                 }
             }
         }
     }
+    eprintln!("[pump] exit");
 }
 
 // ---- run-loop core ------------------------------------------------------
