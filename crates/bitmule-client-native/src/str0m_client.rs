@@ -1295,6 +1295,15 @@ pub(crate) async fn handshake_bulk_key_over_ws(
     let mut meta_key_opt: Option<MetaKey> = None;
     let mut bulk_key: Option<BulkKey> = None;
     let mut key_wrap_sent = false;
+    // If the peer's KeyWrap arrives before we've processed the peer's
+    // KexPub (both sides send KexPub simultaneously, and the server
+    // may deliver [KexPub, KeyWrap] to the receiver before the
+    // receiver has picked its own KexPub out of the send order), we
+    // stash the payload here and drain it as soon as wrap_key
+    // materializes. Seb 2026-09-12: this used to bail with
+    // "KeyWrap arrived before KEX complete"; it's now a normal
+    // interleave case.
+    let mut pending_wrap: Option<(Vec<u8>, Vec<u8>)> = None;
 
     loop {
         // Sender is done as soon as KeyWrap is sent; receiver as soon as
@@ -1348,13 +1357,28 @@ pub(crate) async fn handshake_bulk_key_over_ws(
                 }
                 wrap_key = Some(wk);
                 meta_key_opt = Some(mk);
+                // Drain any KeyWrap that arrived before we had a
+                // wrap_key to unwrap with.
+                if let Some((nonce, ct)) = pending_wrap.take() {
+                    if let Some(w) = wrap_key.as_ref() {
+                        bulk_key = Some(w.unwrap_bulk_key(&nonce, &ct)?);
+                    }
+                }
             }
             SignalFrame::KeyWrap { enc_b_hex, nonce_hex } => {
-                let wk = wrap_key.as_ref()
-                    .ok_or_else(|| anyhow!("KeyWrap arrived before KEX complete"))?;
                 let nonce = hex_decode_var(&nonce_hex)?;
                 let ct = hex_decode_var(&enc_b_hex)?;
-                bulk_key = Some(wk.unwrap_bulk_key(&nonce, &ct)?);
+                match wrap_key.as_ref() {
+                    Some(wk) => {
+                        bulk_key = Some(wk.unwrap_bulk_key(&nonce, &ct)?);
+                    }
+                    None => {
+                        // KeyWrap raced ahead of the peer's KexPub —
+                        // stash and process once the KexPub arm
+                        // derives wrap_key.
+                        pending_wrap = Some((nonce, ct));
+                    }
+                }
             }
             _ => { /* ignore other signaling frames during handshake */ }
         }
