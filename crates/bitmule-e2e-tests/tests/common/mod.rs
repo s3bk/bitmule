@@ -182,6 +182,14 @@ pub fn cli_bin() -> String {
 /// (typically to capture the share URL that send/recv print on start-up
 /// before blocking on the transfer) and then awaits the child.
 pub fn spawn_cli(server_url: &str, args: &[&str]) -> Result<Child> {
+    spawn_cli_with_stderr(server_url, args, /*capture_stderr=*/false)
+}
+
+/// Same as `spawn_cli` but pipes stderr when `capture_stderr=true`
+/// so a failing test can display the child's error output. When
+/// `false`, stderr inherits into the test harness so cargo test's
+/// `--nocapture` can show it live.
+pub fn spawn_cli_with_stderr(server_url: &str, args: &[&str], capture_stderr: bool) -> Result<Child> {
     let bin = cli_bin();
     let (program, prefix): (&str, Vec<&str>) = if bin.ends_with("cargo") || bin == "cargo" {
         ("cargo", vec!["run", "--quiet", "-p", "bitmule", "--"])
@@ -193,10 +201,26 @@ pub fn spawn_cli(server_url: &str, args: &[&str]) -> Result<Child> {
         .arg("--server").arg(server_url)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
+        .stdout(Stdio::piped());
+    if capture_stderr {
+        cmd.stderr(Stdio::piped());
+    } else {
+        cmd.stderr(Stdio::inherit());
+    }
+    cmd.kill_on_drop(true);
     cmd.spawn().context("spawn bitmule cli")
+}
+
+/// Drain a child's already-piped stderr into a String. Caller must
+/// have spawned with `capture_stderr=true`. Non-blocking — reads what
+/// has accumulated and returns immediately when the pipe closes or
+/// there's nothing more to read.
+pub async fn drain_stderr(child: &mut Child) -> String {
+    use tokio::io::AsyncReadExt;
+    let Some(mut se) = child.stderr.take() else { return String::new() };
+    let mut buf = Vec::new();
+    let _ = se.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Read lines from a child's stdout until one contains a share URL

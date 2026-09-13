@@ -59,37 +59,65 @@ async fn transport_matrix() -> Result<()> {
         let rflag = rflag.to_string();
         handles.push(tokio::spawn(async move {
             let outcome = timeout(PER_CASE_TIMEOUT, run_one_case(&env, &sflag, &rflag)).await;
-            let msg = match outcome {
-                Err(_) => format!("TIMEOUT (>{}s)", PER_CASE_TIMEOUT.as_secs()),
-                Ok(Err(e)) => format!("FAIL: {e:#}"),
-                Ok(Ok(())) => "PASS".to_string(),
+            let report = match outcome {
+                Err(_) => CaseReport {
+                    status: format!("TIMEOUT (>{}s)", PER_CASE_TIMEOUT.as_secs()),
+                    stderr: String::new(),
+                    passed: false,
+                },
+                Ok(Ok(())) => CaseReport {
+                    status: "PASS".into(),
+                    stderr: String::new(),
+                    passed: true,
+                },
+                Ok(Err(e)) => {
+                    // Split top-line summary from any embedded stderr
+                    // dump the run_one_case error string contains.
+                    let s = format!("{e:#}");
+                    let (top, rest) = match s.find('\n') {
+                        Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
+                        None => (s, String::new()),
+                    };
+                    CaseReport {
+                        status: format!("FAIL: {top}"),
+                        stderr: rest,
+                        passed: false,
+                    }
+                }
             };
-            (label, msg)
+            (label, report)
         }));
     }
 
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut lines = Vec::new();
+    let mut results: Vec<(String, CaseReport)> = Vec::new();
     for h in handles {
-        let (label, msg) = h.await.expect("task panic");
-        if msg == "PASS" {
-            passed += 1;
-        } else {
-            failed += 1;
-        }
-        lines.push(format!("  {:32} {}", label, msg));
+        results.push(h.await.expect("task panic"));
     }
-    lines.sort();
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let passed = results.iter().filter(|(_, r)| r.passed).count();
+    let failed = results.len() - passed;
+
     eprintln!("\n=== transport matrix ({} passed, {} failed) ===", passed, failed);
-    for l in &lines {
-        eprintln!("{l}");
+    for (label, rep) in &results {
+        eprintln!("  {:32} {}", label, rep.status);
+        if !rep.stderr.is_empty() {
+            for line in rep.stderr.lines() {
+                eprintln!("      | {line}");
+            }
+        }
     }
     if failed > 0 {
-        Err(anyhow!("{failed}/{} cases failed — see per-case output above", cases.len()))
+        Err(anyhow!("{failed}/{} cases failed", results.len()))
     } else {
         Ok(())
     }
+}
+
+struct CaseReport {
+    status: String,
+    stderr: String,
+    passed: bool,
 }
 
 /// One (sender_mode, receiver_mode) pair. Spawn sender, capture its
@@ -105,7 +133,8 @@ async fn run_one_case(env: &Env, sender_flag: &str, recv_flag: &str) -> Result<(
     if !sender_flag.is_empty() { send_args.push(sender_flag); }
     send_args.push(file.to_str().unwrap());
 
-    let mut sender = spawn_cli(&env.server_url, &send_args).context("spawn sender")?;
+    let mut sender = spawn_cli_with_stderr(&env.server_url, &send_args, true)
+        .context("spawn sender")?;
     let share_url = read_stdout_for_share(&mut sender, Duration::from_secs(4))
         .await
         .context("read sender share URL")?;
@@ -117,16 +146,25 @@ async fn run_one_case(env: &Env, sender_flag: &str, recv_flag: &str) -> Result<(
     recv_args.push("--out");
     recv_args.push(dst.path().to_str().unwrap());
 
-    let mut receiver = spawn_cli(&env.server_url, &recv_args).context("spawn receiver")?;
+    let mut receiver = spawn_cli_with_stderr(&env.server_url, &recv_args, true)
+        .context("spawn receiver")?;
 
     let (send_res, recv_res) = tokio::join!(sender.wait(), receiver.wait());
     let send_status = send_res.context("sender wait")?;
     let recv_status = recv_res.context("receiver wait")?;
     if !send_status.success() {
-        return Err(anyhow!("sender exit {send_status}"));
+        let se = drain_stderr(&mut sender).await;
+        return Err(anyhow!(
+            "sender exit {send_status}\n--- sender stderr ---\n{}",
+            se.trim_end()
+        ));
     }
     if !recv_status.success() {
-        return Err(anyhow!("receiver exit {recv_status}"));
+        let se = drain_stderr(&mut receiver).await;
+        return Err(anyhow!(
+            "receiver exit {recv_status}\n--- receiver stderr ---\n{}",
+            se.trim_end()
+        ));
     }
 
     let received = std::fs::read_dir(dst.path())?

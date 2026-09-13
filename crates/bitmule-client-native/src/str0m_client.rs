@@ -418,6 +418,15 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let mut wrap_key: Option<WrapKey> = None;
     let mut meta_key: Option<MetaKey> = None;
     let mut bulk_key: Option<BulkKey> = None;
+    // Buffer for a KeyWrap that races ahead of peer KexPub. Same
+    // pattern as in handshake_bulk_key_over_ws (relay path). Both
+    // sides emit KexPub simultaneously and the server may deliver
+    // [KexPub, KeyWrap] before the receiver has processed the KexPub
+    // and derived wrap_key. Stashing here + draining as soon as
+    // wrap_key materializes eliminates the "KeyWrap arrived before
+    // KEX complete" bail on the recv_connect (webrtc) path.
+    // Kenna 2026-09-13 after Seb reproduced it live in matrix test.
+    let mut pending_wrap: Option<(Vec<u8>, Vec<u8>)> = None;
     let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
     let mut opened: Option<ChannelId> = None;
@@ -480,17 +489,36 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                         let eph = ephemeral_holder.take()
                             .ok_or_else(|| anyhow!("local ephemeral gone before peer KexPub arrived"))?;
                         let s = eph.derive_shared_secret(&peer_pub)?;
-                        wrap_key = Some(s.wrap_key(&session_id_bytes));
-                        meta_key = Some(s.meta_key(&session_id_bytes));
+                        let wk = s.wrap_key(&session_id_bytes);
+                        let mk = s.meta_key(&session_id_bytes);
+                        wrap_key = Some(wk);
+                        meta_key = Some(mk);
                         info!("KEX complete — wrap_key + meta_key derived");
+                        // Drain any KeyWrap that landed before we had
+                        // wrap_key to unwrap with.
+                        if let Some((nonce, ct)) = pending_wrap.take() {
+                            if let Some(w) = wrap_key.as_ref() {
+                                bulk_key = Some(w.unwrap_bulk_key(&nonce, &ct)?);
+                                info!("bulk key received + unwrapped (from pending_wrap)");
+                            }
+                        }
                     }
                     SignalFrame::KeyWrap { enc_b_hex, nonce_hex } => {
-                        let wk = wrap_key.as_ref()
-                            .ok_or_else(|| anyhow!("KeyWrap arrived before KEX complete"))?;
                         let nonce = hex_decode_var(&nonce_hex)?;
                         let ct = hex_decode_var(&enc_b_hex)?;
-                        bulk_key = Some(wk.unwrap_bulk_key(&nonce, &ct)?);
-                        info!("bulk key received + unwrapped");
+                        match wrap_key.as_ref() {
+                            Some(wk) => {
+                                bulk_key = Some(wk.unwrap_bulk_key(&nonce, &ct)?);
+                                info!("bulk key received + unwrapped");
+                            }
+                            None => {
+                                // KeyWrap raced ahead of peer's KexPub;
+                                // stash and drain once KEX derives
+                                // wrap_key.
+                                pending_wrap = Some((nonce, ct));
+                                info!("KeyWrap arrived pre-KEX — buffered");
+                            }
+                        }
                     }
                     _ => {}
                 }
