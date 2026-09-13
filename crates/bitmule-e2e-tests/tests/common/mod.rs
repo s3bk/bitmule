@@ -199,10 +199,44 @@ pub fn spawn_cli(server_url: &str, args: &[&str]) -> Result<Child> {
     cmd.spawn().context("spawn bitmule cli")
 }
 
+/// Read lines from a child's stdout until one contains a share URL
+/// (`^share:` prefix, then `<server>/#<key>` or similar). Returns
+/// the URL suitable for passing to `bitmule recv`. Replaces the
+/// earlier `hex`-only extraction which broke when share keys became
+/// base64url. Kenna 2026-09-13.
+pub async fn read_stdout_for_share(child: &mut Child, timeout: Duration) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no piped stdout"))?;
+    let mut reader = BufReader::new(stdout).lines();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, reader.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("share:") {
+                    let url = rest.trim().to_string();
+                    if !url.is_empty() && url.contains("://") {
+                        let mut lines = reader;
+                        tokio::spawn(async move {
+                            while let Ok(Some(_)) = lines.next_line().await {}
+                        });
+                        return Ok(url);
+                    }
+                }
+            }
+            Ok(Ok(None)) => bail!("CLI stdout closed before printing a share URL"),
+            Ok(Err(e)) => bail!("CLI stdout read: {e}"),
+            Err(_) => bail!("timed out waiting for share URL on CLI stdout"),
+        }
+    }
+}
+
 /// Read lines from a child's stdout until one contains a URL with a `#<hex>`
 /// fragment (matches both `<server>/#<hex>` and `<server>/send#<hex>` per
 /// Seb 2026-09-02: SPA modes 2 and 3). Returns the 64-char hex on the
 /// first match, or times out after `timeout`.
+#[allow(dead_code)]
 pub async fn read_stdout_for_hex(child: &mut Child, timeout: Duration) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no piped stdout"))?;

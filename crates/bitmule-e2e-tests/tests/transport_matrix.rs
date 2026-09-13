@@ -106,14 +106,14 @@ async fn run_one_case(env: &Env, sender_flag: &str, recv_flag: &str) -> Result<(
     send_args.push(file.to_str().unwrap());
 
     let mut sender = spawn_cli(&env.server_url, &send_args).context("spawn sender")?;
-    let hex = read_stdout_for_hex(&mut sender, Duration::from_secs(4))
+    let share_url = read_stdout_for_share(&mut sender, Duration::from_secs(4))
         .await
-        .context("read sender share hex")?;
+        .context("read sender share URL")?;
 
     let mut recv_args: Vec<&str> = Vec::new();
     recv_args.push("recv");
     if !recv_flag.is_empty() { recv_args.push(recv_flag); }
-    recv_args.push(&hex);
+    recv_args.push(&share_url);
     recv_args.push("--out");
     recv_args.push(dst.path().to_str().unwrap());
 
