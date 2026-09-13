@@ -399,9 +399,13 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
 
     let receiver_id = SessionId::random().as_hex();
+    // Webrtc-only recv_connect path: advertise only "webrtc" so the
+    // sender's negotiator refuses cleanly if the sender is pure-relay
+    // rather than hanging on an unbridgable cross-mode pair.
     ws_send(&mut ws, &SignalFrame::SessionJoin {
         receiver_id,
         wire_version: Some(crate::WIRE_VERSION),
+        transports: Some(vec!["webrtc".to_string()]),
     }).await?;
 
     // Crypto handshake — same symmetric KEX as send_connect.
@@ -1138,7 +1142,7 @@ pub async fn send_file_relay(
     // longer duplicated between the send and recv sides. Kenna
     // 2026-09-13.
     let mut session = crate::session::Session::open_sender(
-        server_url_http, &share_key, bulk_key,
+        server_url_http, &share_key, bulk_key, crate::TransportMode::Relay,
     ).await?;
     let session_id = session.session_id.clone();
     let session_id_bytes = session.session_id_bytes;
@@ -1183,7 +1187,7 @@ async fn recv_file_relay(
     // `session::Session::open_receiver`. See send_file_relay for the
     // sender-side symmetric change.
     let mut session = crate::session::Session::open_receiver(
-        server_url_http, &share_key,
+        server_url_http, &share_key, crate::TransportMode::Relay,
     ).await?;
     let session_id = session.session_id.clone();
     let session_id_bytes = session.session_id_bytes;
@@ -1472,7 +1476,14 @@ pub(crate) async fn handshake_bulk_key_over_ws(
 /// signaling frames that arrive first. Used on the relay path to
 /// avoid emitting KEX frames into an empty room before the counter-
 /// party is registered on the server. Kenna 2026-09-12.
-pub(crate) async fn wait_for_peer(ws: &mut Ws, expected_role: &str) -> Result<()> {
+/// Block reading frames from `ws` until a `PeerJoined` for the expected
+/// counterpart role arrives. Returns the peer's advertised
+/// `transports` field (preference order) so the caller can pick the
+/// negotiated chunk-transport via [`crate::negotiate_transport`].
+/// Returns `None` transports for pre-v3 peers that didn't advertise;
+/// callers treat that as legacy Auto `["webrtc","relay"]` for
+/// backward-compat.
+pub(crate) async fn wait_for_peer(ws: &mut Ws, expected_role: &str) -> Result<Option<Vec<String>>> {
     use futures_util::StreamExt;
     loop {
         let msg = ws.next().await;
@@ -1480,9 +1491,9 @@ pub(crate) async fn wait_for_peer(ws: &mut Ws, expected_role: &str) -> Result<()
             Some(f) => f,
             None => continue,
         };
-        if let SignalFrame::PeerJoined { role, .. } = &frame {
+        if let SignalFrame::PeerJoined { role, transports, .. } = frame {
             if role == expected_role {
-                return Ok(());
+                return Ok(transports);
             }
         }
         // Any other frame (KexPub arriving impossibly early, etc) is
@@ -2624,10 +2635,15 @@ pub async fn send_serve(
     });
 
     // Sender-side SessionCreate — no to_receiver_id (server broadcasts).
+    // send_file_multi is the webrtc-multipeer path; advertise "webrtc"
+    // only so an auto receiver sees the sender is webrtc-only. If the
+    // outer dispatcher (main.rs Auto arm) wants to keep relay as a
+    // fallback, it opens send_file_relay separately after this attempt.
     ws_enqueue_targeted(
         &writer.outbox_tx,
         &SignalFrame::SessionCreate {
             wire_version: Some(shared.wire_version),
+            transports: Some(vec!["webrtc".to_string()]),
         },
         None,
     )?;

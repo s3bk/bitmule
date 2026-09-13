@@ -30,6 +30,12 @@ pub enum Role {
 pub struct PeerEntry {
     pub sink: PeerSink,
     pub wire_version: Option<u32>,
+    /// Chunk-transports this peer advertised at SessionCreate/SessionJoin
+    /// time (preference order). Server copies into the counterpart's
+    /// PeerJoined so each side can pick the highest-preference mutual
+    /// entry from the intersection. `None` = pre-v3 peer that didn't
+    /// advertise.
+    pub transports: Option<Vec<String>>,
 }
 
 /// One session's live signaling state.

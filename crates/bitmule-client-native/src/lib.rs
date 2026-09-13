@@ -440,6 +440,14 @@ pub(crate) enum SignalFrame {
         /// the session with "please update your client".
         #[serde(skip_serializing_if = "Option::is_none", default)]
         wire_version: Option<u32>,
+        /// Chunk-transports this side is willing to speak. In
+        /// preference order (element 0 = preferred). Values from the
+        /// closed set `{"webrtc","relay"}`. Empty = old client, treat
+        /// as `["webrtc","relay"]` for backward-compat. Server includes
+        /// this in the counterpart's PeerJoined so the counterpart can
+        /// pick the highest-preference intersection at KEX-completion.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        transports: Option<Vec<String>>,
     },
     /// Receiver-only: join an existing session slot. Carries the
     /// receiver's `receiver_id` for multipeer routing. Replaces the
@@ -450,6 +458,9 @@ pub(crate) enum SignalFrame {
         receiver_id: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         wire_version: Option<u32>,
+        /// Same shape and semantics as SessionCreate.transports.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        transports: Option<Vec<String>>,
     },
     /// Server → client pairing notification. Emitted by the server to
     /// both sides once a Sender + Receiver are both registered on the
@@ -469,6 +480,11 @@ pub(crate) enum SignalFrame {
         /// notification the receiver gets.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         receiver_id: Option<String>,
+        /// Counterpart's advertised transports (in preference order).
+        /// `None` = pre-v3 peer that didn't advertise (backward-compat:
+        /// treat as `["webrtc","relay"]`, matches legacy Auto).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        transports: Option<Vec<String>>,
     },
     Sdp {
         kind: String, // "offer" | "answer"
@@ -691,8 +707,40 @@ pub enum TransportMode {
     Relay,
 }
 
+impl TransportMode {
+    /// Advertised chunk-transports for this mode, in preference order
+    /// (element 0 = preferred). Consumed at SessionCreate/SessionJoin
+    /// time and copied by the server into the counterpart's PeerJoined
+    /// notification. The peer's TransportNegotiator picks the highest-
+    /// preference mutual entry from the intersection.
+    pub fn advertised_transports(self) -> Vec<String> {
+        match self {
+            TransportMode::Webrtc => vec!["webrtc".to_string()],
+            TransportMode::Relay => vec!["relay".to_string()],
+            TransportMode::Auto => vec!["webrtc".to_string(), "relay".to_string()],
+        }
+    }
+}
+
+/// Pick the highest-preference mutual transport from local + peer
+/// advertisements. Returns `None` if the intersection is empty — the
+/// caller prints "no compatible transport, peer speaks {peer}, we
+/// speak {local}" and exits non-zero (Seb-set 2026-09-13: pure-webrtc
+/// paired with pure-relay is unrecoverable and should be a clean
+/// error not a hang).
+pub fn negotiate_transport(local: &[String], peer: &[String]) -> Option<String> {
+    for t in local {
+        if peer.iter().any(|p| p == t) {
+            return Some(t.clone());
+        }
+    }
+    None
+}
+
 /// Wall-clock budget the Auto sender/receiver gives WebRTC before
-/// tearing it down and reconnecting via the relay path.
+/// tearing it down and reconnecting via the relay path. Only used
+/// when transport-negotiation lands on webrtc but the DC never opens
+/// — the negotiated-relay path skips this entirely.
 pub const AUTO_WEBRTC_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 

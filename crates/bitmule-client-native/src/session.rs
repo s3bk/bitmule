@@ -20,7 +20,7 @@ use crate::{
     open_ws,
     crypto::{BulkKey, MetaKey, ShareKey},
     str0m_client::{handshake_bulk_key_over_ws, wait_for_peer, ws_send, hex_decode_fixed},
-    Role, SignalFrame, Ws,
+    Role, SignalFrame, TransportMode, Ws,
     WIRE_VERSION,
 };
 use bitmule_core::SessionId;
@@ -43,16 +43,24 @@ pub struct Session {
     /// its chunk-transport (e.g. `pump_relay_ws`), which typically
     /// takes the ws by value.
     pub ws: Option<Ws>,
+    /// Counterpart's advertised transports (preference order), as
+    /// received in PeerJoined. `None` = pre-v3 peer that didn't
+    /// advertise. Callers pick the negotiated chunk-transport via
+    /// [`crate::negotiate_transport`] on `mode.advertised_transports()`
+    /// intersect `peer_transports`.
+    pub peer_transports: Option<Vec<String>>,
 }
 
 impl Session {
-    /// Sender bootstrap: open ws, SessionCreate, wait for PeerJoined
-    /// (server-emitted pairing notification announcing the receiver),
-    /// then KEX(sender) with the pre-generated `bulk_key`.
+    /// Sender bootstrap: open ws, SessionCreate (advertising `mode`'s
+    /// transports), wait for PeerJoined (server-emitted pairing
+    /// notification announcing the receiver + its transports), then
+    /// KEX(sender) with the pre-generated `bulk_key`.
     pub async fn open_sender(
         server_url_http: &str,
         share_key: &ShareKey,
         bulk_key: BulkKey,
+        mode: TransportMode,
     ) -> Result<Self> {
         let session_hex = share_key.session_id_hex();
         let session_id = SessionId::from_hex(&session_hex)
@@ -62,10 +70,11 @@ impl Session {
         let mut ws = open_ws(server_url_http, &session_hex).await?;
         ws_send(&mut ws, &SignalFrame::SessionCreate {
             wire_version: Some(WIRE_VERSION),
+            transports: Some(mode.advertised_transports()),
         }).await?;
         // Don't blast KexPub into an empty room — wait for the server
         // to announce a receiver has joined.
-        wait_for_peer(&mut ws, "receiver").await?;
+        let peer_transports = wait_for_peer(&mut ws, "receiver").await?;
         let (bulk, meta) = handshake_bulk_key_over_ws(
             &mut ws, Role::Sender, share_key, &session_id_bytes, Some(bulk_key),
         ).await?;
@@ -78,6 +87,7 @@ impl Session {
             bulk_key: bulk,
             meta_key: meta,
             ws: Some(ws),
+            peer_transports,
         })
     }
 
@@ -89,6 +99,7 @@ impl Session {
     pub async fn open_receiver(
         server_url_http: &str,
         share_key: &ShareKey,
+        mode: TransportMode,
     ) -> Result<Self> {
         let session_hex = share_key.session_id_hex();
         let session_id = SessionId::from_hex(&session_hex)
@@ -100,7 +111,17 @@ impl Session {
         ws_send(&mut ws, &SignalFrame::SessionJoin {
             receiver_id,
             wire_version: Some(WIRE_VERSION),
+            transports: Some(mode.advertised_transports()),
         }).await?;
+        // Receiver's ws is now paired-registered. The PeerJoined
+        // notification (carrying sender's transports) arrives BEFORE
+        // the sender's KexPub — handshake_bulk_key_over_ws consumes
+        // both. To surface peer_transports on the receiver Session,
+        // the KEX helper reads and returns it (see
+        // `handshake_bulk_key_over_ws` — its return tuple grows a
+        // third element on the receiver path).
+        // For now, receiver reads it via a peek before KEX:
+        let peer_transports = wait_for_peer(&mut ws, "sender").await?;
         let (bulk, meta) = handshake_bulk_key_over_ws(
             &mut ws, Role::Receiver, share_key, &session_id_bytes, None,
         ).await?;
@@ -113,6 +134,7 @@ impl Session {
             bulk_key: bulk,
             meta_key: meta,
             ws: Some(ws),
+            peer_transports,
         })
     }
 

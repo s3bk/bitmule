@@ -42,12 +42,21 @@ enum JoinFrame {
         /// can detect version mismatch and prompt an update.
         #[serde(default)]
         wire_version: Option<u32>,
+        /// Chunk-transports this side is willing to speak (preference
+        /// order). Values from `{"webrtc","relay"}`. Server copies into
+        /// the counterpart's PeerJoined so each side picks the
+        /// intersection at KEX time. `None` = pre-v3 client, treated
+        /// as `["webrtc","relay"]` by the peer for backward-compat.
+        #[serde(default)]
+        transports: Option<Vec<String>>,
     },
     /// Receiver joins an existing session slot on this ws.
     SessionJoin {
         receiver_id: ReceiverId,
         #[serde(default)]
         wire_version: Option<u32>,
+        #[serde(default)]
+        transports: Option<Vec<String>>,
     },
 }
 
@@ -71,7 +80,7 @@ pub async fn ws_handler(
 
 async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionId) {
     // Wait for the initial SessionCreate or SessionJoin frame.
-    let (role, receiver_id, wire_version) = match read_join(&mut socket).await {
+    let (role, receiver_id, wire_version, transports) = match read_join(&mut socket).await {
         Some(v) => v,
         None => {
             let _ = socket.close().await;
@@ -83,12 +92,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     // Register into the room. After registering, notify each side of the
-    // OTHER'S wire_version via `peer_joined` frames so a client can bail
-    // cleanly on version mismatch. `to_incumbent` tells the already-present
-    // peer about the newcomer; `to_newcomer` tells the newcomer about the
-    // incumbent (needed on our side because the newcomer's own registration
-    // ran after the incumbent's already-sent frames drained).
-    let self_entry = PeerEntry { sink: tx.clone(), wire_version };
+    // OTHER'S wire_version + transports via `peer_joined` frames so a
+    // client can bail cleanly on version mismatch OR pick the negotiated
+    // chunk transport from the intersection. `to_incumbent` tells the
+    // already-present peer about the newcomer; `to_newcomer` tells the
+    // newcomer about the incumbent (needed on our side because the
+    // newcomer's own registration ran after the incumbent's already-sent
+    // frames drained).
+    let self_entry = PeerEntry { sink: tx.clone(), wire_version, transports: transports.clone() };
     let (to_incumbent, to_newcomer_frames): (Option<(Role, String)>, Vec<String>);
     {
         let mut r = room.lock().await;
@@ -102,7 +113,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                 // Each notification carries the incumbent receiver's id
                 // so the sender's per-peer router can pre-register.
                 let incumbent_frames: Vec<String> = r.receivers.iter()
-                    .map(|(rid, entry)| build_peer_joined("receiver", entry.wire_version, Some(rid)))
+                    .map(|(rid, entry)| build_peer_joined("receiver", entry.wire_version, Some(rid), entry.transports.as_deref()))
                     .collect();
                 r.sender = Some(self_entry.clone());
                 to_incumbent = if r.receivers.is_empty() {
@@ -112,7 +123,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                         Role::Receiver,
                         // Sender→receiver notification: sender has no
                         // receiver_id (unique-per-receiver-only concept).
-                        build_peer_joined("sender", wire_version, None),
+                        build_peer_joined("sender", wire_version, None, transports.as_deref()),
                     ))
                 };
                 to_newcomer_frames = incumbent_frames;
@@ -127,7 +138,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                 };
                 // Newcomer is receiver; incumbent is at most one sender.
                 let incumbent_frames: Vec<String> = r.sender.as_ref()
-                    .map(|entry| vec![build_peer_joined("sender", entry.wire_version, None)])
+                    .map(|entry| vec![build_peer_joined("sender", entry.wire_version, None, entry.transports.as_deref())])
                     .unwrap_or_default();
                 r.receivers.insert(rid, self_entry.clone());
                 to_incumbent = if r.sender.is_some() {
@@ -137,7 +148,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                         // receiver — INCLUDE the newcomer's id so the
                         // sender-side router can register the per-peer
                         // dispatch route.
-                        build_peer_joined("receiver", wire_version, Some(&rid)),
+                        build_peer_joined("receiver", wire_version, Some(&rid), transports.as_deref()),
                     ))
                 } else {
                     None
@@ -301,7 +312,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
     out.abort();
 }
 
-async fn read_join(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, Option<u32>)> {
+async fn read_join(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, Option<u32>, Option<Vec<String>>)> {
     while let Some(msg) = socket.next().await {
         let raw = match msg {
             Ok(m) => m,
@@ -316,11 +327,11 @@ async fn read_join(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, 
                 match serde_json::from_str::<JoinFrame>(&text) {
                     Ok(parsed) => {
                         return Some(match parsed {
-                            JoinFrame::SessionCreate { wire_version } => {
-                                (Role::Sender, None, wire_version)
+                            JoinFrame::SessionCreate { wire_version, transports } => {
+                                (Role::Sender, None, wire_version, transports)
                             }
-                            JoinFrame::SessionJoin { receiver_id, wire_version } => {
-                                (Role::Receiver, Some(receiver_id), wire_version)
+                            JoinFrame::SessionJoin { receiver_id, wire_version, transports } => {
+                                (Role::Receiver, Some(receiver_id), wire_version, transports)
                             }
                         });
                     }
@@ -350,6 +361,7 @@ fn build_peer_joined(
     peer_role: &str,
     wire_version: Option<u32>,
     peer_receiver_id: Option<&ReceiverId>,
+    peer_transports: Option<&[String]>,
 ) -> String {
     let mut v = serde_json::json!({
         "type": "peer_joined",
@@ -357,6 +369,11 @@ fn build_peer_joined(
     });
     if let Some(ver) = wire_version {
         v["wire_version"] = serde_json::Value::from(ver);
+    }
+    if let Some(ts) = peer_transports {
+        v["transports"] = serde_json::Value::from(
+            ts.iter().map(|s| serde_json::Value::from(s.clone())).collect::<Vec<_>>()
+        );
     }
     if let Some(rid) = peer_receiver_id {
         let hex = rid.as_hex();
