@@ -438,6 +438,10 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, multi:
         (false, TransportMode::Webrtc) => {
             println!("mode:    complete (WebRTC, exits after first receiver has the file)");
         }
+        (_, TransportMode::Auto) => {
+            println!("mode:    auto (WebRTC first, relay fallback after {}s)",
+                bitmule_client_native::AUTO_WEBRTC_BUDGET.as_secs());
+        }
     }
     println!("sending {} ({} bytes)…", file_name, file_size);
     use std::io::Write;
