@@ -1801,7 +1801,7 @@ pub(crate) async fn spawn_peer_task(
     let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<SignalFrame>();
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
     router_register
-        .send(PeerRegistration { receiver_id: rid_hex.clone(), inbox_tx, ack: ack_tx })
+        .send(PeerRegistration { receiver_id, inbox_tx, ack: ack_tx })
         .map_err(|e| anyhow!("router register (peer {rid_hex}): {e}"))?;
     ack_rx.await.map_err(|_| anyhow!("router dropped ack for peer {rid_hex} — router task exited?"))?;
 

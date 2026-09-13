@@ -38,7 +38,7 @@ pub struct RecvComplete {
 }
 
 use anyhow::{anyhow, bail, Context, Result};
-use bitmule_core::SessionId;
+use bitmule_core::{ReceiverId, SessionId};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
@@ -455,7 +455,7 @@ pub(crate) enum SignalFrame {
     /// redundant — server only ever routed off Hello, receiver-sent
     /// PeerHello was silently dropped by wait_for_peer).
     SessionJoin {
-        receiver_id: String,
+        receiver_id: ReceiverId,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         wire_version: Option<u32>,
         /// Same shape and semantics as SessionCreate.transports.
@@ -479,7 +479,7 @@ pub(crate) enum SignalFrame {
         /// on the sender side (multipeer routing key). Absent on the
         /// notification the receiver gets.
         #[serde(skip_serializing_if = "Option::is_none", default)]
-        receiver_id: Option<String>,
+        receiver_id: Option<ReceiverId>,
         /// Counterpart's advertised transports (in preference order).
         /// `None` = pre-v3 peer that didn't advertise (backward-compat:
         /// treat as `["webrtc","relay"]`, matches legacy Auto).

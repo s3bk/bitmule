@@ -139,7 +139,7 @@ pub enum CoveredNote {
 /// for handshake correctness under a hot signaling server.
 #[allow(dead_code)]
 pub(crate) struct PeerRegistration {
-    pub receiver_id: String,
+    pub receiver_id: ReceiverId,
     pub inbox_tx: mpsc::UnboundedSender<SignalFrame>,
     pub ack: oneshot::Sender<()>,
 }
@@ -188,7 +188,7 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel::<bool>(false);
 
     let task = tokio::spawn(async move {
-        let mut peers: HashMap<String, mpsc::UnboundedSender<SignalFrame>> = HashMap::new();
+        let mut peers: HashMap<ReceiverId, mpsc::UnboundedSender<SignalFrame>> = HashMap::new();
         // Pending: WS frames whose envelope `from_receiver_id` names a
         // peer that hasn't registered yet. Common when the receiver
         // ships peer_hello + KexPub + SDP answer back-to-back and the
@@ -196,7 +196,7 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
         // finished spawn_peer_task's registration handshake. Small cap
         // to bound worst-case memory if a bogus from_receiver_id keeps
         // arriving for a peer that never registers.
-        let mut pending: HashMap<String, Vec<SignalFrame>> = HashMap::new();
+        let mut pending: HashMap<ReceiverId, Vec<SignalFrame>> = HashMap::new();
         const PENDING_CAP_PER_PEER: usize = 32;
         loop {
             tokio::select! {
@@ -226,7 +226,9 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
                         Err(e) => return Err(e),
                     };
                     let (frame, from) = parsed;
-                    match from.as_deref().and_then(|rid| peers.get(rid)) {
+                    let from_rid: Option<ReceiverId> = from.as_deref()
+                        .and_then(|s| ReceiverId::from_hex(s).ok());
+                    match from_rid.as_ref().and_then(|rid| peers.get(rid)) {
                         Some(inbox) => {
                             // Silent-drop if peer inbox already dropped.
                             let _ = inbox.send(frame);
@@ -254,8 +256,8 @@ pub(crate) fn spawn_ws_router(mut stream: SplitStream<Ws>) -> WsRouterHandle {
                             // unrouted copy at debug level (non-PeerHello
                             // unrouted frames are expected chatter under
                             // this dual-delivery scheme).
-                            if let Some(rid) = from.as_deref() {
-                                let entry = pending.entry(rid.to_string()).or_default();
+                            if let Some(rid) = from_rid {
+                                let entry = pending.entry(rid).or_default();
                                 if entry.len() < PENDING_CAP_PER_PEER {
                                     entry.push(frame.clone());
                                 }
