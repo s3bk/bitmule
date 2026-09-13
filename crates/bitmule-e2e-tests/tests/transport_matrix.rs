@@ -31,7 +31,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-const PER_CASE_TIMEOUT: Duration = Duration::from_secs(10);
+const PER_CASE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires built bitmule binaries; --webrtc cases need reachable STUN"]
