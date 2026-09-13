@@ -431,30 +431,44 @@ pub const WIRE_VERSION: u32 = 2;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum SignalFrame {
-    Hello {
-        role: String,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        receiver_id: Option<String>,
+    /// Sender-only: create a new session slot on the server. Only frame
+    /// permitted on a fresh ws before the peer has joined. Replaces the
+    /// old `Hello { role: "sender" }` shape.
+    SessionCreate {
         /// Wire-protocol version. See [`WIRE_VERSION`]. Absent when
-        /// deserializing a Hello from a pre-v2 client — the receiver
-        /// rejects the session with "please update your client".
+        /// deserializing from a pre-v3 client — the receiver rejects
+        /// the session with "please update your client".
         #[serde(skip_serializing_if = "Option::is_none", default)]
         wire_version: Option<u32>,
     },
-    PeerHello {
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        receiver_id: Option<String>,
-        /// Server-injected role of the peer being announced ("sender" or
-        /// "receiver"). Present when server relays a peer_hello notification,
-        /// absent on the receiver-sent PeerHello that kicks the SDP handshake.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        role: Option<String>,
-        /// Wire-protocol version of the OTHER side, as observed by the
-        /// signaling server when it paired us. Server copies from the
-        /// peer's `Hello.wire_version` into this field. Client bails when
-        /// version mismatches ours.
+    /// Receiver-only: join an existing session slot. Carries the
+    /// receiver's `receiver_id` for multipeer routing. Replaces the
+    /// old `Hello { role: "receiver" } + PeerHello` pair (they were
+    /// redundant — server only ever routed off Hello, receiver-sent
+    /// PeerHello was silently dropped by wait_for_peer).
+    SessionJoin {
+        receiver_id: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         wire_version: Option<u32>,
+    },
+    /// Server → client pairing notification. Emitted by the server to
+    /// both sides once a Sender + Receiver are both registered on the
+    /// same session_hex. Carries the OTHER side's role + wire_version
+    /// so each side can fail-fast on version mismatch. Distinct from
+    /// SessionCreate/SessionJoin (which are client → server) — this is
+    /// the only frame the server originates in this family.
+    PeerJoined {
+        /// Counterpart's role: "sender" or "receiver".
+        role: String,
+        /// Counterpart's wire_version, copied from their SessionCreate
+        /// or SessionJoin. `None` = pre-v3 peer, this side bails.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        wire_version: Option<u32>,
+        /// Receiver's `receiver_id` when the pairing notification lands
+        /// on the sender side (multipeer routing key). Absent on the
+        /// notification the receiver gets.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        receiver_id: Option<String>,
     },
     Sdp {
         kind: String, // "offer" | "answer"

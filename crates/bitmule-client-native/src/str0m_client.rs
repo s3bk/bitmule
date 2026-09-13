@@ -399,12 +399,10 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
 
     let receiver_id = SessionId::random().as_hex();
-    ws_send(&mut ws, &SignalFrame::Hello {
-        role: Role::Receiver.as_str().to_owned(),
-        receiver_id: Some(receiver_id.clone()),
+    ws_send(&mut ws, &SignalFrame::SessionJoin {
+        receiver_id,
         wire_version: Some(crate::WIRE_VERSION),
     }).await?;
-    ws_send(&mut ws, &SignalFrame::PeerHello { receiver_id: Some(receiver_id), role: None, wire_version: Some(crate::WIRE_VERSION) }).await?;
 
     // Crypto handshake — same symmetric KEX as send_connect.
     let local_ephemeral = Ephemeral::generate();
@@ -447,10 +445,10 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                             next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
                         }
                     }
-                    SignalFrame::PeerHello { wire_version, .. } => {
-                        // Server-injected peer_hello carrying the sender's
-                        // wire_version. Bail on mismatch — the alternative
-                        // is a silent decode failure mid-transfer.
+                    SignalFrame::PeerJoined { wire_version, .. } => {
+                        // Server-injected pairing notification carrying the
+                        // sender's wire_version. Bail on mismatch — the
+                        // alternative is a silent decode failure mid-transfer.
                         match wire_version {
                             Some(v) if v == crate::WIRE_VERSION => { /* ok */ }
                             Some(v) => bail!(
@@ -1482,13 +1480,13 @@ pub(crate) async fn wait_for_peer(ws: &mut Ws, expected_role: &str) -> Result<()
             Some(f) => f,
             None => continue,
         };
-        if let SignalFrame::PeerHello { role: Some(role), .. } = &frame {
+        if let SignalFrame::PeerJoined { role, .. } = &frame {
             if role == expected_role {
                 return Ok(());
             }
         }
-        // Any other frame (Hello, KexPub arriving impossibly early,
-        // etc) is silently dropped during this bootstrap window.
+        // Any other frame (KexPub arriving impossibly early, etc) is
+        // silently dropped during this bootstrap window.
     }
 }
 
@@ -2625,12 +2623,10 @@ pub async fn send_serve(
         container,
     });
 
-    // Sender-side Hello — no to_receiver_id (server broadcasts).
+    // Sender-side SessionCreate — no to_receiver_id (server broadcasts).
     ws_enqueue_targeted(
         &writer.outbox_tx,
-        &SignalFrame::Hello {
-            role: Role::Sender.as_str().to_owned(),
-            receiver_id: None,
+        &SignalFrame::SessionCreate {
             wire_version: Some(shared.wire_version),
         },
         None,
@@ -2644,7 +2640,7 @@ pub async fn send_serve(
     // the mode-aware exit predicate.
     let (note_tx, note_rx) = mpsc::unbounded_channel::<CoveredNote>();
 
-    // Orchestrator loop: consume unrouted frames (PeerHello notifications
+    // Orchestrator loop: consume unrouted frames (PeerJoined notifications
     // from the signaling server). Spawn per-peer task on each new one;
     // ignore duplicates; bail on version mismatch as send_connect does.
     let peers_loop = peers.clone();
@@ -2669,7 +2665,7 @@ pub async fn send_serve(
     let loop_task = tokio::spawn(async move {
         while let Some((frame, from)) = unrouted_rx.recv().await {
             let (rid_body_opt, wire_v) = match &frame {
-                SignalFrame::PeerHello { receiver_id, wire_version, .. } => {
+                SignalFrame::PeerJoined { receiver_id, wire_version, .. } => {
                     (receiver_id.clone(), *wire_version)
                 }
                 _ => {
@@ -2678,13 +2674,13 @@ pub async fn send_serve(
                 }
             };
             // Prefer envelope-level from_receiver_id (server always sets
-            // this on relayed peer_hello notifications). Fall back to the
+            // this on relayed PeerJoined notifications). Fall back to the
             // frame body's own `receiver_id` field — some server versions
             // put it there — before giving up and dropping.
             let rid_hex = match from.or(rid_body_opt) {
                 Some(r) => r,
                 None => {
-                    warn!("orchestrator: peer_hello without receiver_id (neither envelope nor body) — dropping");
+                    warn!("orchestrator: PeerJoined without receiver_id (neither envelope nor body) — dropping");
                     continue;
                 }
             };

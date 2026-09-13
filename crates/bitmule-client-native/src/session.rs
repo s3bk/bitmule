@@ -46,9 +46,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// Sender bootstrap: open ws, Hello{sender}, wait for
-    /// peer_hello(receiver), then KEX(sender) with the pre-generated
-    /// `bulk_key`.
+    /// Sender bootstrap: open ws, SessionCreate, wait for PeerJoined
+    /// (server-emitted pairing notification announcing the receiver),
+    /// then KEX(sender) with the pre-generated `bulk_key`.
     pub async fn open_sender(
         server_url_http: &str,
         share_key: &ShareKey,
@@ -60,9 +60,7 @@ impl Session {
         let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
         let mut ws = open_ws(server_url_http, &session_hex).await?;
-        ws_send(&mut ws, &SignalFrame::Hello {
-            role: Role::Sender.as_str().to_owned(),
-            receiver_id: None,
+        ws_send(&mut ws, &SignalFrame::SessionCreate {
             wire_version: Some(WIRE_VERSION),
         }).await?;
         // Don't blast KexPub into an empty room — wait for the server
@@ -83,9 +81,11 @@ impl Session {
         })
     }
 
-    /// Receiver bootstrap: open ws, Hello{receiver, rid} + PeerHello,
-    /// then KEX(receiver). Sender-side of the KEX unwraps its bulk_key
-    /// into ours via KeyWrap.
+    /// Receiver bootstrap: open ws, single SessionJoin{rid}, then
+    /// KEX(receiver). Sender-side of the KEX unwraps its bulk_key
+    /// into ours via KeyWrap. (Was previously Hello+PeerHello — the
+    /// server only ever routed off the first frame and the second was
+    /// silently dropped by wait_for_peer.)
     pub async fn open_receiver(
         server_url_http: &str,
         share_key: &ShareKey,
@@ -97,14 +97,8 @@ impl Session {
 
         let mut ws = open_ws(server_url_http, &session_hex).await?;
         let receiver_id = SessionId::random().as_hex();
-        ws_send(&mut ws, &SignalFrame::Hello {
-            role: Role::Receiver.as_str().to_owned(),
-            receiver_id: Some(receiver_id.clone()),
-            wire_version: Some(WIRE_VERSION),
-        }).await?;
-        ws_send(&mut ws, &SignalFrame::PeerHello {
-            receiver_id: Some(receiver_id),
-            role: None,
+        ws_send(&mut ws, &SignalFrame::SessionJoin {
+            receiver_id,
             wire_version: Some(WIRE_VERSION),
         }).await?;
         let (bulk, meta) = handshake_bulk_key_over_ws(

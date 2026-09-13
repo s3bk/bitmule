@@ -39,3 +39,11 @@ base64 = "0.22"
 zip = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
+
+# version pins
+dimpl = "0.7.3"
+rcgen = "=0.14.7"
+time = "=0.3.45"
+icu_normalizer = "=2.0.1"
+icu_provider = "=2.1.1"
+icu_locale_core = "=2.1.1"

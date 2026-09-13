@@ -2,10 +2,14 @@
 //!
 //! Protocol (all JSON-over-text):
 //!
-//! Client → server, first frame after upgrade:
-//!   `{"type":"hello","role":"sender"|"receiver","receiver_id":"<hex>"?}`
+//! Client → server, first frame after upgrade — one of:
+//!   `{"type":"session_create","wire_version":<u32>?}`         (sender)
+//!   `{"type":"session_join","receiver_id":"<hex>","wire_version":<u32>?}` (receiver)
 //!
-//! After a valid hello, the socket becomes a bidirectional relay:
+//! Server → client pairing notification:
+//!   `{"type":"peer_joined","role":"sender"|"receiver","wire_version":<u32>?,"receiver_id":"<hex>"?}`
+//!
+//! After the pairing notification the socket is a bidirectional relay:
 //!   - Sender frames fan out to all receivers currently in the room.
 //!   - Receiver frames route only to the sender.
 //!
@@ -30,14 +34,18 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum HelloFrame {
-    Hello {
-        role: String,
+enum JoinFrame {
+    /// Sender opens a new session slot on this ws.
+    SessionCreate {
+        /// Client wire-protocol version. Server stores per peer and
+        /// includes in `peer_joined` notifications so the counterpart
+        /// can detect version mismatch and prompt an update.
         #[serde(default)]
-        receiver_id: Option<ReceiverId>,
-        /// Client wire-protocol version. Server stores per peer and includes
-        /// in `peer_hello` notifications so the counterpart can detect
-        /// version mismatch and prompt an update.
+        wire_version: Option<u32>,
+    },
+    /// Receiver joins an existing session slot on this ws.
+    SessionJoin {
+        receiver_id: ReceiverId,
         #[serde(default)]
         wire_version: Option<u32>,
     },
@@ -62,8 +70,8 @@ pub async fn ws_handler(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionId) {
-    // Wait for the initial hello frame.
-    let (role, receiver_id, wire_version) = match read_hello(&mut socket).await {
+    // Wait for the initial SessionCreate or SessionJoin frame.
+    let (role, receiver_id, wire_version) = match read_join(&mut socket).await {
         Some(v) => v,
         None => {
             let _ = socket.close().await;
@@ -75,7 +83,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     // Register into the room. After registering, notify each side of the
-    // OTHER'S wire_version via `peer_hello` frames so a client can bail
+    // OTHER'S wire_version via `peer_joined` frames so a client can bail
     // cleanly on version mismatch. `to_incumbent` tells the already-present
     // peer about the newcomer; `to_newcomer` tells the newcomer about the
     // incumbent (needed on our side because the newcomer's own registration
@@ -94,7 +102,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                 // Each notification carries the incumbent receiver's id
                 // so the sender's per-peer router can pre-register.
                 let incumbent_frames: Vec<String> = r.receivers.iter()
-                    .map(|(rid, entry)| build_peer_hello("receiver", entry.wire_version, Some(rid)))
+                    .map(|(rid, entry)| build_peer_joined("receiver", entry.wire_version, Some(rid)))
                     .collect();
                 r.sender = Some(self_entry.clone());
                 to_incumbent = if r.receivers.is_empty() {
@@ -104,7 +112,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                         Role::Receiver,
                         // Sender→receiver notification: sender has no
                         // receiver_id (unique-per-receiver-only concept).
-                        build_peer_hello("sender", wire_version, None),
+                        build_peer_joined("sender", wire_version, None),
                     ))
                 };
                 to_newcomer_frames = incumbent_frames;
@@ -119,7 +127,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                 };
                 // Newcomer is receiver; incumbent is at most one sender.
                 let incumbent_frames: Vec<String> = r.sender.as_ref()
-                    .map(|entry| vec![build_peer_hello("sender", entry.wire_version, None)])
+                    .map(|entry| vec![build_peer_joined("sender", entry.wire_version, None)])
                     .unwrap_or_default();
                 r.receivers.insert(rid, self_entry.clone());
                 to_incumbent = if r.sender.is_some() {
@@ -129,7 +137,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
                         // receiver — INCLUDE the newcomer's id so the
                         // sender-side router can register the per-peer
                         // dispatch route.
-                        build_peer_hello("receiver", wire_version, Some(&rid)),
+                        build_peer_joined("receiver", wire_version, Some(&rid)),
                     ))
                 } else {
                     None
@@ -293,18 +301,19 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
     out.abort();
 }
 
-async fn read_hello(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, Option<u32>)> {
+async fn read_join(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, Option<u32>)> {
     while let Some(msg) = socket.next().await {
         match msg.ok()? {
             Message::Text(t) => {
-                let parsed: HelloFrame = serde_json::from_str(&t).ok()?;
-                let HelloFrame::Hello { role, receiver_id, wire_version } = parsed;
-                let role = match role.as_str() {
-                    "sender" => Role::Sender,
-                    "receiver" => Role::Receiver,
-                    _ => return None,
-                };
-                return Some((role, receiver_id, wire_version));
+                let parsed: JoinFrame = serde_json::from_str(&t).ok()?;
+                return Some(match parsed {
+                    JoinFrame::SessionCreate { wire_version } => {
+                        (Role::Sender, None, wire_version)
+                    }
+                    JoinFrame::SessionJoin { receiver_id, wire_version } => {
+                        (Role::Receiver, Some(receiver_id), wire_version)
+                    }
+                });
             }
             Message::Close(_) => return None,
             _ => continue,
@@ -313,7 +322,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>,
     None
 }
 
-/// Build a peer_hello notification frame. Wraps counterpart's role +
+/// Build a `peer_joined` notification frame. Wraps counterpart's role +
 /// wire_version so the recipient can bail on version mismatch. When
 /// `peer_receiver_id` is `Some` (server notifying the sender about a
 /// receiver), also injects `from_receiver_id` at the envelope level so
@@ -322,13 +331,13 @@ async fn read_hello(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>,
 ///
 /// Kept as a helper so the two call sites (incumbent-notified,
 /// newcomer-notified) stay in sync.
-fn build_peer_hello(
+fn build_peer_joined(
     peer_role: &str,
     wire_version: Option<u32>,
     peer_receiver_id: Option<&ReceiverId>,
 ) -> String {
     let mut v = serde_json::json!({
-        "type": "peer_hello",
+        "type": "peer_joined",
         "role": peer_role,
     });
     if let Some(ver) = wire_version {
@@ -337,8 +346,9 @@ fn build_peer_hello(
     if let Some(rid) = peer_receiver_id {
         let hex = rid.as_hex();
         // Include BOTH:
-        //   - `receiver_id` in the body (matches the receiver-emitted
-        //     PeerHello shape; some clients may still look here).
+        //   - `receiver_id` in the body (matches the SignalFrame::PeerJoined
+        //     variant on the client side; the receiver_id field is where
+        //     the sender reads the paired receiver's id from).
         //   - `from_receiver_id` at the envelope level (the sender-side
         //     WS router keys per-peer inbox dispatch off this field).
         v["receiver_id"] = serde_json::Value::from(hex.clone());
