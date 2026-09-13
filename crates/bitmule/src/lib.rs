@@ -383,6 +383,30 @@ impl SendBuilder {
                     )
                     .await
                 }
+                (_, TransportMode::Auto) => {
+                    // Try WebRTC with a bounded budget; on timeout or
+                    // error, reconnect via relay. Same shape as the
+                    // main.rs Auto arm — the lib API is used by the
+                    // Qt6 / GTK4 UIs which need identical semantics.
+                    // Kenna 2026-09-13.
+                    let serve = if multi { ServeMode::Multi } else { ServeMode::Complete };
+                    let sk_relay = share_key.clone();
+                    let webrtc_attempt = tokio::time::timeout(
+                        bitmule_client_native::AUTO_WEBRTC_BUDGET,
+                        send_file_multi(&server_owned, share_key, bulk_key, send_path.clone(), container_owned.clone(), serve),
+                    ).await;
+                    match webrtc_attempt {
+                        Ok(Ok(())) => Ok(()),
+                        _ => {
+                            eprintln!(
+                                "auto send: WebRTC leg didn't complete within {}s, falling back to relay",
+                                bitmule_client_native::AUTO_WEBRTC_BUDGET.as_secs()
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            send_file_relay(&server_owned, sk_relay, bulk_key, &send_path, container_ref, on_progress).await
+                        }
+                    }
+                }
             }
         });
 
