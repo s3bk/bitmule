@@ -1066,6 +1066,10 @@ pub async fn recv_file(
                         "auto recv: WebRTC leg didn't complete within {}s, falling back to relay",
                         crate::AUTO_WEBRTC_BUDGET.as_secs()
                     );
+                    // See send-side comment: give server-side room
+                    // cleanup a moment before we re-register as this
+                    // session's receiver.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     recv_file_relay(server_url_http, sk_relay, expected_signature, out_dir, on_progress).await
                 }
             }

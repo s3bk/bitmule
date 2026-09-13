@@ -352,6 +352,16 @@ where
                             "auto send: WebRTC leg didn't complete within {}s, falling back to relay",
                             bitmule_client_native::AUTO_WEBRTC_BUDGET.as_secs()
                         );
+                        // Server's ws_handler slams the door on a
+                        // second sender-Hello for a session that
+                        // already has one registered. When we time out
+                        // above the ws-drop → TCP-FIN → server-side
+                        // remove-from-room happens asynchronously; if
+                        // we re-connect too fast the server still sees
+                        // the old sender and closes our new ws
+                        // immediately. Short sleep here lets the
+                        // cleanup land before we retry. Kenna 2026-09-13.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         send_file_relay(&server, sk_relay, bulk_key, &send_path, container_ref, on_progress).await
                     }
                 }
