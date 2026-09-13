@@ -108,17 +108,27 @@ enum IdentityAction {
     },
 }
 
-fn resolve_mode(_webrtc: bool, relay: bool) -> TransportMode {
-    // TransportMode::Auto was deleted with the pre-multipeer send/recv
-    // path (Sep 4, per Seb "nobody is on the old api, delete it").
-    // Default = Webrtc; --relay flag forces relay.
-    if relay { TransportMode::Relay } else { TransportMode::Webrtc }
+fn resolve_mode(webrtc: bool, relay: bool) -> TransportMode {
+    // Default (no flag) = Auto: try WebRTC first with a bounded budget
+    // (bitmule_client_native::AUTO_WEBRTC_BUDGET), fall back to relay
+    // if the DC doesn't open in time. --webrtc forces WebRTC only,
+    // --relay forces relay only. clap's `conflicts_with` prevents both
+    // being passed together. Kenna 2026-09-13 — reinstated after the
+    // CLI transport matrix showed the earlier "auto = Webrtc" left
+    // mixed-mode pairs broken.
+    match (webrtc, relay) {
+        (false, false) => TransportMode::Auto,
+        (true,  false) => TransportMode::Webrtc,
+        (false, true)  => TransportMode::Relay,
+        (true,  true)  => unreachable!("clap conflicts_with prevents this"),
+    }
 }
 
 fn mode_label(m: TransportMode) -> &'static str {
     match m {
         TransportMode::Webrtc => "WebRTC only",
         TransportMode::Relay => "relay only",
+        TransportMode::Auto => "auto (WebRTC first, relay fallback)",
     }
 }
 
@@ -322,6 +332,29 @@ where
             }
             (true, TransportMode::Webrtc) => {
                 send_file_multi(&server, share_key, bulk_key, send_path, container.clone(), ServeMode::Multi).await
+            }
+            (_, TransportMode::Auto) => {
+                // Try WebRTC with a bounded budget; on timeout or error,
+                // reconnect via relay. Kenna 2026-09-13. Multi + Auto
+                // behaves like Multi + Webrtc first, then Relay single-
+                // peer as fallback — the multipeer-over-relay path isn't
+                // exercised here.
+                let serve = if multi { ServeMode::Multi } else { ServeMode::Complete };
+                let sk_relay = share_key.clone();
+                let webrtc_attempt = tokio::time::timeout(
+                    bitmule_client_native::AUTO_WEBRTC_BUDGET,
+                    send_file_multi(&server, share_key, bulk_key, send_path.clone(), container.clone(), serve),
+                ).await;
+                match webrtc_attempt {
+                    Ok(Ok(())) => Ok(()),
+                    _ => {
+                        eprintln!(
+                            "auto send: WebRTC leg didn't complete within {}s, falling back to relay",
+                            bitmule_client_native::AUTO_WEBRTC_BUDGET.as_secs()
+                        );
+                        send_file_relay(&server, sk_relay, bulk_key, &send_path, container_ref, on_progress).await
+                    }
+                }
             }
         }
     });

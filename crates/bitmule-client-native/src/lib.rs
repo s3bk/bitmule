@@ -662,11 +662,23 @@ pub(crate) async fn maybe_resolve_mdns_candidate(candidate_line: &str) -> Option
 /// How the caller wants file transfer to happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
+    /// Try WebRTC first with a bounded budget (see `AUTO_WEBRTC_BUDGET`);
+    /// if the DC hasn't opened by then, tear it down and reconnect via
+    /// the server-relay path. Both `send_file_*` and `recv_file` handle
+    /// this internally so callers only pick a mode.
+    /// Kenna 2026-09-13: reinstated after the CLI matrix showed that a
+    /// hardcoded auto = Webrtc leaves any receiver that can't reach
+    /// STUN completely dead.
+    Auto,
     /// Only WebRTC. Errors if the DC never opens.
     Webrtc,
     /// Skip WebRTC entirely; use server relay from the start.
     Relay,
 }
+
+/// Wall-clock budget the Auto sender/receiver gives WebRTC before
+/// tearing it down and reconnecting via the relay path.
+pub const AUTO_WEBRTC_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 
 fn derive_ws_url(server_url_http: &str) -> String {

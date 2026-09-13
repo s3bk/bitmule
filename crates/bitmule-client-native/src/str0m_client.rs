@@ -1044,17 +1044,52 @@ pub async fn recv_file(
     // so signature verification on the relay path is a follow-up — for now
     // only the WebRTC path verifies.
     match mode {
-        TransportMode::Webrtc => {
-            let mut sess = recv_connect(server_url_http, share_key).await?;
-            let outcome = recv_file_over_dc(&mut sess, out_dir, on_progress).await?;
-            if let Some(sig) = expected_signature {
-                verify_transferred_signature(&outcome.path, &sig, sess.bulk_key.as_ref()
-                    .ok_or_else(|| anyhow!("session has no bulk key at verify time"))?).await?;
+        TransportMode::Webrtc => recv_file_webrtc(
+            server_url_http, share_key, expected_signature, out_dir, on_progress
+        ).await,
+        TransportMode::Relay => recv_file_relay(
+            server_url_http, share_key, expected_signature, out_dir, on_progress
+        ).await,
+        TransportMode::Auto => {
+            // Try WebRTC with a bounded budget; on timeout or error,
+            // tear it down (share_key.clone → detached KEX+ICE) and
+            // reconnect via the relay path. Kenna 2026-09-13.
+            let sk_relay = share_key.clone();
+            let webrtc_attempt = tokio::time::timeout(
+                crate::AUTO_WEBRTC_BUDGET,
+                recv_file_webrtc(server_url_http, share_key, expected_signature, out_dir, /*on_progress passed by move*/ |_,_,_| {})
+            ).await;
+            match webrtc_attempt {
+                Ok(Ok(outcome)) => Ok(outcome),
+                _ => {
+                    info!(
+                        "auto recv: WebRTC leg didn't complete within {}s, falling back to relay",
+                        crate::AUTO_WEBRTC_BUDGET.as_secs()
+                    );
+                    recv_file_relay(server_url_http, sk_relay, expected_signature, out_dir, on_progress).await
+                }
             }
-            Ok(outcome)
         }
-        TransportMode::Relay => recv_file_relay(server_url_http, share_key, expected_signature, out_dir, on_progress).await,
     }
+}
+
+/// WebRTC-only receive path, extracted so `Auto` can invoke it with a
+/// timeout wrapper without duplicating the KEX + verify-signature
+/// dance. Kenna 2026-09-13.
+async fn recv_file_webrtc(
+    server_url_http: &str,
+    share_key: ShareKey,
+    expected_signature: Option<[u8; 32]>,
+    out_dir: &Path,
+    on_progress: impl FnMut(u64, u64, &str) + Send,
+) -> Result<crate::RecvComplete> {
+    let mut sess = recv_connect(server_url_http, share_key).await?;
+    let outcome = recv_file_over_dc(&mut sess, out_dir, on_progress).await?;
+    if let Some(sig) = expected_signature {
+        verify_transferred_signature(&outcome.path, &sig, sess.bulk_key.as_ref()
+            .ok_or_else(|| anyhow!("session has no bulk key at verify time"))?).await?;
+    }
+    Ok(outcome)
 }
 
 /// Stream `path` through SHA256 and fold in `bulk_key`, compare against
