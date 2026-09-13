@@ -398,7 +398,7 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
 
     let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
 
-    let receiver_id = SessionId::random().as_hex();
+    let receiver_id = bitmule_core::ReceiverId::random();
     // Webrtc-only recv_connect path: advertise only "webrtc" so the
     // sender's negotiator refuses cleanly if the sender is pure-relay
     // rather than hanging on an unbridgable cross-mode pair.
@@ -2693,13 +2693,18 @@ pub async fn send_serve(
             // this on relayed PeerJoined notifications). Fall back to the
             // frame body's own `receiver_id` field — some server versions
             // put it there — before giving up and dropping.
-            let rid_hex = match from.or(rid_body_opt) {
+            let receiver_id: ReceiverId = match from
+                .as_deref()
+                .and_then(|s| ReceiverId::from_hex(s).ok())
+                .or(rid_body_opt)
+            {
                 Some(r) => r,
                 None => {
                     warn!("orchestrator: PeerJoined without receiver_id (neither envelope nor body) — dropping");
                     continue;
                 }
             };
+            let rid_hex = receiver_id.as_hex();
             match wire_v {
                 Some(v) if v == shared_loop.wire_version => { /* ok */ }
                 Some(v) => {
@@ -2721,13 +2726,6 @@ pub async fn send_serve(
                     continue;
                 }
             }
-            let receiver_id = match ReceiverId::from_hex(&rid_hex) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("peer_hello receiver_id parse ({rid_hex}): {e} — dropping");
-                    continue;
-                }
-            };
             match spawn_peer_task(
                 receiver_id,
                 shared_loop.clone(),

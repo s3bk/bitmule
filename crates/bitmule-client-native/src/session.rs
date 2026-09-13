@@ -107,7 +107,7 @@ impl Session {
         let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
 
         let mut ws = open_ws(server_url_http, &session_hex).await?;
-        let receiver_id = SessionId::random().as_hex();
+        let receiver_id = bitmule_core::ReceiverId::random();
         ws_send(&mut ws, &SignalFrame::SessionJoin {
             receiver_id,
             wire_version: Some(WIRE_VERSION),
