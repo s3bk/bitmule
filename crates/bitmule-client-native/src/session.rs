@@ -19,11 +19,11 @@
 use crate::{
     open_ws,
     crypto::{BulkKey, MetaKey, ShareKey},
-    str0m_client::{handshake_bulk_key_over_ws, wait_for_peer, ws_send, SignalFrame, Role, Ws},
+    str0m_client::{handshake_bulk_key_over_ws, wait_for_peer, ws_send, hex_decode_fixed},
+    Role, SignalFrame, Ws,
     WIRE_VERSION,
 };
-use crate::str0m_client::hex_decode_fixed;
-use crate::multipeer::SessionId;
+use bitmule_core::SessionId;
 use anyhow::{anyhow, Result};
 
 /// A live, KEX-completed session over a single ws.

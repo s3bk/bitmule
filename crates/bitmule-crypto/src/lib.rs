@@ -302,6 +302,7 @@ impl SessionKey {
 /// Derived from S with the "transfer-v1 meta-key" info string, so it's
 /// distinct from both wrap_key (which encrypts B) and B (which encrypts
 /// chunks). A break of any one key doesn't leak the others.
+#[derive(Clone)]
 pub struct MetaKey(pub [u8; 32]);
 impl Drop for MetaKey { fn drop(&mut self) { self.0.zeroize(); } }
 
