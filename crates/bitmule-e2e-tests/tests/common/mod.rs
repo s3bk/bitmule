@@ -65,6 +65,31 @@ impl Env {
             _data_dir: data_dir
         })
     }
+
+    /// Server-only variant for tests that don't need a browser
+    /// (transport_matrix, CLI-only smoke tests). Skips chromedriver
+    /// spawn so a box without chromedriver installed can still run
+    /// the CLI-only matrix. `webdriver_url` is populated with the
+    /// default sentinel string but MUST NOT be used.
+    /// Kenna 2026-09-13.
+    pub async fn bring_up_server_only() -> Result<Self> {
+        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../web");
+        let data_dir = TempDir::new()?;
+        let (server_url, server_child) = match std::env::var("BITMULE_SERVER").ok() {
+            Some(url) => (url, None),
+            None => {
+                let child = spawn_server(DEFAULT_SERVER_ADDR, data_dir.path(), &web_dir).await.context("spawn_server")?;
+                (format!("http://{}", DEFAULT_SERVER_ADDR), Some(child))
+            }
+        };
+        Ok(Env {
+            server_url,
+            webdriver_url: DEFAULT_WEBDRIVER_URL.to_string(),
+            _webdriver: None,
+            _server: server_child,
+            _data_dir: data_dir,
+        })
+    }
 }
 
 async fn spawn_server(bind: &str, data_dir: &Path, web_dir: &Path) -> Result<Child> {
