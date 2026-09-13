@@ -23,6 +23,7 @@ pub mod room;
 pub mod state;
 pub mod ws;
 pub mod relay;
+pub mod relay2;
 
 pub use room::{Role, Room};
 pub use state::AppState;

@@ -27,3 +27,8 @@ hex = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 tower-http = { version = "0.5", features = ["fs", "trace"] }
+tokio-util = { version = "*", features = ["codec", "io"] }
+biter = "*"
+itertools = "*"
+futures = "*"
+tokio-stream = "*"
