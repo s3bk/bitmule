@@ -65,7 +65,6 @@ impl From<AcquireError> for Error {
 }
 
 struct Dest {
-    is_closed: bool,
     tx: mpsc::Sender<Bytes>,
 }
 
@@ -79,7 +78,7 @@ pub async fn run_session(session: Arc<MulticastSession>, stream: BodyDataStream)
     let stream = FramedRead::new(reader, FrameDecoder);
     pin!(stream);
 
-    let mut routing_table: Vec<Dest> = vec![];
+    let mut routing_table: Vec<Option<Dest>> = vec![];
     let mut selection_bits = vec![];
 
     while let Some(next) = stream.next().await {
@@ -89,20 +88,21 @@ pub async fn run_session(session: Arc<MulticastSession>, stream: BodyDataStream)
             F_CHUNK => {
                 let bitset = || Biter::from(&*selection_bits);
 
-                let n_required = izip!(bitset(), routing_table.iter_mut()).filter(|&(include, ref dest)| include && !dest.is_closed).count();
+                let n_required = izip!(bitset(), routing_table.iter_mut()).filter(|&(include, ref dest)| include && dest.is_some()).count();
                 let mut permits = session.semaphore.acquire_many(n_required as u32).await?;
 
-                for (include, dest) in izip!(bitset(), routing_table.iter_mut()) {
-                    if !include || dest.is_closed {
+                for (include, dest_opt) in izip!(bitset(), routing_table.iter_mut()) {
+                    if !include {
                         continue;
                     }
+                    let Some(ref dest) = dest_opt else { continue };
 
                     match dest.tx.try_send(data.clone()) {
                         Ok(()) => {
                             permits.split(1).unwrap().forget();
                         },
                         Err(TrySendError::Closed(_)) => {
-                            dest.is_closed = true;
+                            *dest_opt = None;
                         }
                         Err(TrySendError::Full(_)) => {}
                     }
@@ -118,12 +118,10 @@ pub async fn run_session(session: Arc<MulticastSession>, stream: BodyDataStream)
                 let n_old = routing_table.len();
                 routing_table.clear();
                 let receivers = session.receivers.lock().await;
-                routing_table.extend(data.chunks_exact(size_of::<ReceiverId>()).flat_map(|chunk| {
+                routing_table.extend(data.chunks_exact(size_of::<ReceiverId>()).map(|chunk| {
                     let id = ReceiverId(u128::from_le_bytes(chunk.try_into().unwrap()));
                     let tx = receivers.get(&id)?.clone();
-                    Some(Dest {
-                        is_closed: false, tx
-                    })
+                    Some(Dest { tx })
                 }));
 
                 let n_new = routing_table.len();
