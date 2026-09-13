@@ -1134,38 +1134,19 @@ pub async fn send_file_relay(
     container: Option<&str>,
     on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<()> {
-    let session_hex = share_key.session_id_hex();
-    let session_id = SessionId::from_hex(&session_hex)
-        .map_err(|e| anyhow!("session_id from hex: {e}"))?;
-    let mut ws = crate::open_ws(server_url_http, &session_hex).await?;
-    // Server's `read_hello` requires a `HelloFrame` as the FIRST ws
-    // frame or it closes the socket. `send_file_multi` (WebRTC path)
-    // sends this already; the relay path was skipping it and the
-    // socket died as "ws closed pre-channel-open" the moment
-    // `handshake_bulk_key_over_ws` fired its first KexPub frame.
-    // Kenna 2026-09-12.
-    ws_send(&mut ws, &SignalFrame::Hello {
-        role: Role::Sender.as_str().to_owned(),
-        receiver_id: None,
-        wire_version: Some(crate::WIRE_VERSION),
-    }).await?;
-    // Wait for the server to notify us a receiver has joined the room
-    // BEFORE we start emitting KEX frames. If we blast KexPub at t=0
-    // when the room is still empty, the server's `fan_to_receivers`
-    // has nobody to route to and the frame is lost. Server sends us a
-    // peer_hello("receiver") the moment a receiver's Hello lands; we
-    // block here until we see it. Kenna 2026-09-12, verified with the
-    // pump debug run in sudfa container: sender's KexPub was
-    // being emitted at t≈0.1s and lost, receiver's KEX-await never
-    // completed, receiver hung on "waiting for transfer".
-    wait_for_peer(&mut ws, "receiver").await?;
-    // Sync bulk_key with receiver via KEX+KeyWrap over the same WS, BEFORE
-    // dropping into the relay pump. The returned bulk_key is our own
-    // pre-generated one — kept for future chunk encryption (Push B2).
-    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
-    let (bulk, meta) = handshake_bulk_key_over_ws(
-        &mut ws, Role::Sender, &share_key, &session_id_bytes, Some(bulk_key),
+    // Session-single-ws: the entire "open ws + Hello + wait_for_peer +
+    // KEX" preamble moved into `session::Session::open_sender`. Same
+    // frames on the wire, same bulk_key/meta_key derived — just no
+    // longer duplicated between the send and recv sides. Kenna
+    // 2026-09-13.
+    let mut session = crate::session::Session::open_sender(
+        server_url_http, &share_key, bulk_key,
     ).await?;
+    let session_id = session.session_id.clone();
+    let session_id_bytes = session.session_id_bytes;
+    let bulk = session.bulk_key.clone();
+    let meta = session.meta_key.clone();
+    let ws = session.take_ws();
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let progress = std::sync::Arc::new(tokio::sync::Mutex::new(crate::RelaySendProgress::default()));
@@ -1200,31 +1181,17 @@ async fn recv_file_relay(
     out_dir: &Path,
     on_progress: impl FnMut(u64, u64, &str) + Send,
 ) -> Result<crate::RecvComplete> {
-    let session_hex = share_key.session_id_hex();
-    let session_id = SessionId::from_hex(&session_hex)
-        .map_err(|e| anyhow!("session_id from hex: {e}"))?;
-    let mut ws = crate::open_ws(server_url_http, &session_hex).await?;
-    // Same "server needs hello first" bug as send_file_relay above —
-    // the recv-relay path was missing the initial HelloFrame too.
-    // Kenna 2026-09-12.
-    let receiver_id = SessionId::random().as_hex();
-    ws_send(&mut ws, &SignalFrame::Hello {
-        role: Role::Receiver.as_str().to_owned(),
-        receiver_id: Some(receiver_id.clone()),
-        wire_version: Some(crate::WIRE_VERSION),
-    }).await?;
-    ws_send(&mut ws, &SignalFrame::PeerHello {
-        receiver_id: Some(receiver_id),
-        role: None,
-        wire_version: Some(crate::WIRE_VERSION),
-    }).await?;
-    // Run KEX+KeyWrap over the WS to receive the bulk_key from the sender.
-    // Do this BEFORE the pump takes over the ws so KEX frames don't race
-    // chunk_relay frames.
-    let session_id_bytes: [u8; 32] = hex_decode_fixed(&session_hex)?;
-    let (bulk_key, meta_key) = handshake_bulk_key_over_ws(
-        &mut ws, Role::Receiver, &share_key, &session_id_bytes, None,
+    // Session-single-ws: open ws + Hello + PeerHello + KEX moved to
+    // `session::Session::open_receiver`. See send_file_relay for the
+    // sender-side symmetric change.
+    let mut session = crate::session::Session::open_receiver(
+        server_url_http, &share_key,
     ).await?;
+    let session_id = session.session_id.clone();
+    let session_id_bytes = session.session_id_bytes;
+    let bulk_key = session.bulk_key.clone();
+    let meta_key = session.meta_key.clone();
+    let ws = session.take_ws();
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _pump = tokio::spawn(pump_relay_ws(ws, out_rx, in_tx));
@@ -1525,7 +1492,7 @@ pub(crate) async fn wait_for_peer(ws: &mut Ws, expected_role: &str) -> Result<()
     }
 }
 
-async fn ws_send(ws: &mut Ws, frame: &SignalFrame) -> Result<()> {
+pub(crate) async fn ws_send(ws: &mut Ws, frame: &SignalFrame) -> Result<()> {
     let text = serde_json::to_string(frame).context("frame encode")?;
     ws.send(Message::Text(text.into())).await.context("ws send")?;
     Ok(())
@@ -1718,7 +1685,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hex_decode_fixed<const N: usize>(s: &str) -> Result<[u8; N]> {
+pub(crate) fn hex_decode_fixed<const N: usize>(s: &str) -> Result<[u8; N]> {
     if s.len() != N * 2 {
         bail!("hex string length {} != expected {}", s.len(), N * 2);
     }

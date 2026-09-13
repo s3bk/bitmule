@@ -24,6 +24,7 @@ pub mod crypto;
 pub mod pipeline;
 pub mod multipeer;
 pub mod container;
+pub mod session;
 pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
 pub use multipeer::ServeMode;
 
