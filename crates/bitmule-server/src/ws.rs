@@ -303,17 +303,32 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
 
 async fn read_join(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, Option<u32>)> {
     while let Some(msg) = socket.next().await {
-        match msg.ok()? {
+        let raw = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("read_join: ws error before join frame: {e}");
+                return None;
+            }
+        };
+        match raw {
             Message::Text(t) => {
-                let parsed: JoinFrame = serde_json::from_str(&t).ok()?;
-                return Some(match parsed {
-                    JoinFrame::SessionCreate { wire_version } => {
-                        (Role::Sender, None, wire_version)
+                let text = t.to_string();
+                match serde_json::from_str::<JoinFrame>(&text) {
+                    Ok(parsed) => {
+                        return Some(match parsed {
+                            JoinFrame::SessionCreate { wire_version } => {
+                                (Role::Sender, None, wire_version)
+                            }
+                            JoinFrame::SessionJoin { receiver_id, wire_version } => {
+                                (Role::Receiver, Some(receiver_id), wire_version)
+                            }
+                        });
                     }
-                    JoinFrame::SessionJoin { receiver_id, wire_version } => {
-                        (Role::Receiver, Some(receiver_id), wire_version)
+                    Err(e) => {
+                        tracing::warn!("read_join: reject frame ({e}) body={text}");
+                        return None;
                     }
-                });
+                }
             }
             Message::Close(_) => return None,
             _ => continue,
