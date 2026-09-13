@@ -1,0 +1,271 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1600" font-family="Menlo,Monaco,monospace" font-size="12">
+  <style>
+    .lane { stroke: #999; stroke-width: 1; stroke-dasharray: 3 3; }
+    .lane-head { fill: #222; }
+    .lane-head-text { fill: #fff; font-size: 14px; font-weight: bold; }
+    .stage { fill: #f0f0f0; stroke: #666; }
+    .stage-text { font-size: 13px; font-weight: bold; fill: #222; }
+    .msg { stroke: #1a5fb4; stroke-width: 1.5; fill: none; marker-end: url(#arr); }
+    .msg-back { stroke: #2ec27e; stroke-width: 1.5; fill: none; marker-end: url(#arrg); }
+    .msg-internal { stroke: #999; stroke-width: 1; fill: none; stroke-dasharray: 2 2; marker-end: url(#arrgray); }
+    .msg-text { font-size: 11px; fill: #1a5fb4; }
+    .msg-text-back { font-size: 11px; fill: #2ec27e; }
+    .msg-text-internal { font-size: 10px; fill: #666; font-style: italic; }
+    .state-box { fill: #fffbe6; stroke: #d4b106; stroke-width: 1; }
+    .state-text { font-size: 10px; fill: #614700; }
+    .stage-sep { stroke: #333; stroke-width: 2; }
+    .note { fill: #eef; stroke: #446; stroke-width: 1; }
+    .note-text { font-size: 10px; fill: #223; }
+    .tick { stroke: #888; stroke-width: 0.5; }
+    .tick-text { font-size: 9px; fill: #888; }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a5fb4"/>
+    </marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2ec27e"/>
+    </marker>
+    <marker id="arrgray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#999"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="26" text-anchor="middle" font-size="16" font-weight="bold">bitmule handshake &amp; data flow — session-single-ws</text>
+  <text x="500" y="44" text-anchor="middle" font-size="11" fill="#666">time flows down · sender left · server middle · receiver right</text>
+
+  <!-- Lane headers -->
+  <rect class="lane-head" x="120" y="60" width="160" height="26" rx="4"/>
+  <text class="lane-head-text" x="200" y="78" text-anchor="middle">SENDER</text>
+  <rect class="lane-head" x="420" y="60" width="160" height="26" rx="4"/>
+  <text class="lane-head-text" x="500" y="78" text-anchor="middle">SERVER</text>
+  <rect class="lane-head" x="720" y="60" width="160" height="26" rx="4"/>
+  <text class="lane-head-text" x="800" y="78" text-anchor="middle">RECEIVER</text>
+
+  <!-- Lifelines -->
+  <line class="lane" x1="200" y1="90" x2="200" y2="1560"/>
+  <line class="lane" x1="500" y1="90" x2="500" y2="1560"/>
+  <line class="lane" x1="800" y1="90" x2="800" y2="1560"/>
+
+  <!-- Time axis ticks (left margin) -->
+  <text class="tick-text" x="60" y="105" text-anchor="end">t=0</text>
+  <text class="tick-text" x="60" y="315" text-anchor="end">~50ms</text>
+  <text class="tick-text" x="60" y="555" text-anchor="end">~150ms</text>
+  <text class="tick-text" x="60" y="825" text-anchor="end">~300ms</text>
+  <text class="tick-text" x="60" y="1145" text-anchor="end">variable</text>
+  <text class="tick-text" x="60" y="1465" text-anchor="end">end</text>
+
+  <!-- ============================= -->
+  <!-- STAGE 1: WS OPEN + HELLO      -->
+  <!-- ============================= -->
+  <rect class="stage" x="10" y="95" width="80" height="200" rx="4"/>
+  <text class="stage-text" x="50" y="115" text-anchor="middle">1</text>
+  <text class="stage-text" x="50" y="130" text-anchor="middle">WS</text>
+  <text class="stage-text" x="50" y="145" text-anchor="middle">OPEN</text>
+  <text class="stage-text" x="50" y="160" text-anchor="middle">+</text>
+  <text class="stage-text" x="50" y="175" text-anchor="middle">HELLO</text>
+
+  <line x1="200" y1="115" x2="500" y2="115" class="msg"/>
+  <text class="msg-text" x="340" y="110" text-anchor="middle">WS upgrade /ws?session=&lt;sid&gt;</text>
+
+  <line x1="200" y1="140" x2="500" y2="140" class="msg"/>
+  <text class="msg-text" x="340" y="135" text-anchor="middle">SignalFrame::Hello{role:sender, wire_version}</text>
+
+  <line x1="800" y1="170" x2="500" y2="170" class="msg-back"/>
+  <text class="msg-text-back" x="640" y="165" text-anchor="middle">WS upgrade /ws?session=&lt;sid&gt;</text>
+
+  <line x1="800" y1="195" x2="500" y2="195" class="msg-back"/>
+  <text class="msg-text-back" x="640" y="190" text-anchor="middle">SignalFrame::Hello{role:receiver, receiver_id}</text>
+
+  <line x1="800" y1="220" x2="500" y2="220" class="msg-back"/>
+  <text class="msg-text-back" x="640" y="215" text-anchor="middle">SignalFrame::PeerHello{receiver_id}</text>
+
+  <line x1="500" y1="255" x2="200" y2="255" class="msg"/>
+  <text class="msg-text" x="340" y="250" text-anchor="middle">peer_hello event → wait_for_peer("receiver") unblocks</text>
+
+  <rect class="state-box" x="130" y="265" width="140" height="24" rx="3"/>
+  <text class="state-text" x="200" y="280" text-anchor="middle">sender has peer_rid</text>
+  <rect class="state-box" x="430" y="265" width="140" height="24" rx="3"/>
+  <text class="state-text" x="500" y="280" text-anchor="middle">session registered, 2 sides</text>
+  <rect class="state-box" x="730" y="265" width="140" height="24" rx="3"/>
+  <text class="state-text" x="800" y="280" text-anchor="middle">receiver joined</text>
+
+  <line class="stage-sep" x1="10" y1="300" x2="990" y2="300"/>
+
+  <!-- ============================= -->
+  <!-- STAGE 2: KEX OVER WS          -->
+  <!-- ============================= -->
+  <rect class="stage" x="10" y="310" width="80" height="240" rx="4"/>
+  <text class="stage-text" x="50" y="330" text-anchor="middle">2</text>
+  <text class="stage-text" x="50" y="348" text-anchor="middle">KEX</text>
+  <text class="stage-text" x="50" y="364" text-anchor="middle">(over</text>
+  <text class="stage-text" x="50" y="380" text-anchor="middle">ws)</text>
+
+  <line class="msg-internal" x1="180" y1="325" x2="180" y2="345"/>
+  <rect class="state-box" x="120" y="320" width="160" height="30" rx="3"/>
+  <text class="state-text" x="200" y="333" text-anchor="middle">gen ECDH P-256 ephemeral</text>
+  <text class="state-text" x="200" y="345" text-anchor="middle">wrap_key = HKDF(share_key)</text>
+
+  <line x1="200" y1="370" x2="500" y2="370" class="msg"/>
+  <text class="msg-text" x="340" y="365" text-anchor="middle">SignalFrame::KexPub{pub_bytes, mac}</text>
+
+  <line x1="500" y1="395" x2="800" y2="395" class="msg"/>
+  <text class="msg-text" x="640" y="390" text-anchor="middle">fan_to_receivers(KexPub)</text>
+
+  <rect class="state-box" x="720" y="405" width="160" height="30" rx="3"/>
+  <text class="state-text" x="800" y="418" text-anchor="middle">verify MAC (share_key)</text>
+  <text class="state-text" x="800" y="430" text-anchor="middle">wrap_key = HKDF(share_key)</text>
+
+  <line x1="800" y1="450" x2="500" y2="450" class="msg-back"/>
+  <text class="msg-text-back" x="640" y="445" text-anchor="middle">SignalFrame::KexPub{pub_bytes, mac}</text>
+
+  <line x1="500" y1="475" x2="200" y2="475" class="msg-back"/>
+  <text class="msg-text-back" x="340" y="470" text-anchor="middle">fan_to_sender(KexPub)</text>
+
+  <rect class="state-box" x="120" y="480" width="160" height="30" rx="3"/>
+  <text class="state-text" x="200" y="493" text-anchor="middle">derive bulk_key, meta_key</text>
+  <text class="state-text" x="200" y="505" text-anchor="middle">seal via wrap_key → KeyWrap</text>
+
+  <line x1="200" y1="525" x2="500" y2="525" class="msg"/>
+  <text class="msg-text" x="340" y="520" text-anchor="middle">SignalFrame::KeyWrap{ct}</text>
+
+  <line x1="500" y1="545" x2="800" y2="545" class="msg"/>
+  <text class="msg-text" x="640" y="540" text-anchor="middle">fan_to_receivers(KeyWrap)</text>
+
+  <line class="stage-sep" x1="10" y1="565" x2="990" y2="565"/>
+
+  <!-- ============================= -->
+  <!-- STAGE 3: TRANSPORT DISPATCH   -->
+  <!-- ============================= -->
+  <rect class="stage" x="10" y="575" width="80" height="260" rx="4"/>
+  <text class="stage-text" x="50" y="595" text-anchor="middle">3</text>
+  <text class="stage-text" x="50" y="613" text-anchor="middle">TX</text>
+  <text class="stage-text" x="50" y="629" text-anchor="middle">DISPATCH</text>
+
+  <rect class="state-box" x="130" y="580" width="140" height="42" rx="3"/>
+  <text class="state-text" x="200" y="595" text-anchor="middle">TransportMode chosen</text>
+  <text class="state-text" x="200" y="607" text-anchor="middle">from --relay / --webrtc</text>
+  <text class="state-text" x="200" y="619" text-anchor="middle">/ Auto / AutoParallel</text>
+  <rect class="state-box" x="730" y="580" width="140" height="42" rx="3"/>
+  <text class="state-text" x="800" y="595" text-anchor="middle">TransportMode chosen</text>
+  <text class="state-text" x="800" y="607" text-anchor="middle">from --relay / --webrtc</text>
+  <text class="state-text" x="800" y="619" text-anchor="middle">/ Auto / AutoParallel</text>
+
+  <rect class="note" x="120" y="640" width="760" height="180" rx="4"/>
+  <text class="note-text" x="130" y="658" font-weight="bold">Mode branch (same ws used for signaling in every mode):</text>
+  <text class="note-text" x="140" y="675">• Relay      → skip stage 3.a, jump straight to stage 4 chunk POST/stream</text>
+  <text class="note-text" x="140" y="691">• WebRTC     → stage 3.a below: SignalFrame::Sdp/Ice exchanged over SAME ws, then DC becomes carrier</text>
+  <text class="note-text" x="140" y="707">• Auto       → stage 3.a with AUTO_WEBRTC_BUDGET (3s). On budget miss OR DC error, fall back to stage 4 RELAY</text>
+  <text class="note-text" x="140" y="723">  on the SAME ws. This is the piece the current 4 timeouts are missing — a second ws-open reject-registers with the server.</text>
+  <text class="note-text" x="140" y="742" font-style="italic">• AutoParallel (queued feature): stage 3.a AND stage 4 concurrent from t=0. Chunks race; receiver dedups by chunk_idx.</text>
+  <text class="note-text" x="140" y="758" font-style="italic">  Bandwidth ~2x during transfer; wall-clock = min(webrtc_ttfb, relay_ttfb). Guardrail: --parallel-max-mb=N to cap 2x cost.</text>
+
+  <text class="note-text" x="140" y="783" font-weight="bold">Stage 3.a (WebRTC signaling — Auto and Webrtc modes only):</text>
+  <text class="note-text" x="140" y="799">  sender.CreateOffer → SignalFrame::Sdp{offer} → server relay → receiver.SetRemoteOffer + CreateAnswer</text>
+  <text class="note-text" x="140" y="815">  → SignalFrame::Sdp{answer} → server relay → sender.SetRemoteAnswer.  ICE candidates trickle both ways via SignalFrame::Ice.</text>
+
+  <line class="stage-sep" x1="10" y1="840" x2="990" y2="840"/>
+
+  <!-- ============================= -->
+  <!-- STAGE 4: DATA TRANSFER        -->
+  <!-- ============================= -->
+  <rect class="stage" x="10" y="850" width="80" height="280" rx="4"/>
+  <text class="stage-text" x="50" y="870" text-anchor="middle">4</text>
+  <text class="stage-text" x="50" y="888" text-anchor="middle">DATA</text>
+  <text class="stage-text" x="50" y="906" text-anchor="middle">TRANSFER</text>
+
+  <text class="note-text" x="100" y="868" font-weight="bold" fill="#1a5fb4">Relay path (HTTP chunk POST + SSE stream fan-out):</text>
+
+  <line x1="200" y1="885" x2="500" y2="885" class="msg"/>
+  <text class="msg-text" x="340" y="880" text-anchor="middle">POST /session/&lt;sid&gt;/chunk[0]  (nonce | AEAD ct | tag)</text>
+
+  <line x1="500" y1="910" x2="800" y2="910" class="msg"/>
+  <text class="msg-text" x="640" y="905" text-anchor="middle">SSE frame → chunk[0]</text>
+
+  <line x1="200" y1="935" x2="500" y2="935" class="msg"/>
+  <text class="msg-text" x="340" y="930" text-anchor="middle">POST .../chunk[1]</text>
+
+  <line x1="500" y1="960" x2="800" y2="960" class="msg"/>
+  <text class="msg-text" x="640" y="955" text-anchor="middle">SSE → chunk[1]</text>
+
+  <line x1="200" y1="985" x2="500" y2="985" class="msg" stroke-dasharray="4 2"/>
+  <text class="msg-text" x="340" y="980" text-anchor="middle">... N chunks ...</text>
+
+  <line x1="500" y1="1010" x2="800" y2="1010" class="msg" stroke-dasharray="4 2"/>
+  <text class="msg-text" x="640" y="1005" text-anchor="middle">... SSE fan-out ...</text>
+
+  <line x1="200" y1="1035" x2="500" y2="1035" class="msg"/>
+  <text class="msg-text" x="340" y="1030" text-anchor="middle">POST .../chunk[N-1] (FIN bit set)</text>
+
+  <line x1="500" y1="1060" x2="800" y2="1060" class="msg"/>
+  <text class="msg-text" x="640" y="1055" text-anchor="middle">SSE → chunk[N-1] (FIN)</text>
+
+  <rect class="note" x="100" y="1075" width="780" height="50" rx="4"/>
+  <text class="note-text" x="110" y="1093" font-weight="bold" fill="#2ec27e">WebRTC path (same stage, different carrier):</text>
+  <text class="note-text" x="110" y="1109">  Chunks flow SENDER ↔ RECEIVER directly via DataChannel. Server sees no data traffic — only the SDP/ICE from stage 3.a</text>
+  <text class="note-text" x="110" y="1122">  and any ws frames left over (e.g. shutdown ping). Same nonce | AEAD ct | tag envelope.</text>
+
+  <line class="stage-sep" x1="10" y1="1135" x2="990" y2="1135"/>
+
+  <!-- ============================= -->
+  <!-- STAGE 5: CLEANUP              -->
+  <!-- ============================= -->
+  <rect class="stage" x="10" y="1145" width="80" height="140" rx="4"/>
+  <text class="stage-text" x="50" y="1165" text-anchor="middle">5</text>
+  <text class="stage-text" x="50" y="1183" text-anchor="middle">CLEANUP</text>
+
+  <line class="msg-internal" x1="180" y1="1160" x2="180" y2="1180"/>
+  <rect class="state-box" x="120" y="1155" width="160" height="30" rx="3"/>
+  <text class="state-text" x="200" y="1168" text-anchor="middle">await pump.join() — flush</text>
+  <text class="state-text" x="200" y="1180" text-anchor="middle">outbound ws frames first</text>
+
+  <line x1="200" y1="1200" x2="500" y2="1200" class="msg"/>
+  <text class="msg-text" x="340" y="1195" text-anchor="middle">WS close (sender)</text>
+
+  <line x1="500" y1="1225" x2="800" y2="1225" class="msg"/>
+  <text class="msg-text" x="640" y="1220" text-anchor="middle">SSE stream close</text>
+
+  <line x1="800" y1="1250" x2="500" y2="1250" class="msg-back"/>
+  <text class="msg-text-back" x="640" y="1245" text-anchor="middle">WS close (receiver)</text>
+
+  <rect class="state-box" x="430" y="1260" width="140" height="20" rx="3"/>
+  <text class="state-text" x="500" y="1273" text-anchor="middle">session slot freed</text>
+
+  <line class="stage-sep" x1="10" y1="1290" x2="990" y2="1290"/>
+
+  <!-- ============================= -->
+  <!-- Legend                        -->
+  <!-- ============================= -->
+  <text x="30" y="1315" font-size="12" font-weight="bold">Legend:</text>
+  <line x1="30" y1="1332" x2="80" y2="1332" class="msg"/>
+  <text x="90" y="1336" font-size="11">sender → server → receiver flow</text>
+  <line x1="30" y1="1352" x2="80" y2="1352" class="msg-back"/>
+  <text x="90" y="1356" font-size="11">receiver → server → sender flow</text>
+  <line x1="30" y1="1372" x2="80" y2="1372" class="msg-internal"/>
+  <text x="90" y="1376" font-size="11">internal state transition</text>
+  <rect class="state-box" x="30" y="1385" width="50" height="14"/>
+  <text x="90" y="1396" font-size="11">state snapshot on a lane</text>
+  <rect class="note" x="30" y="1408" width="50" height="14"/>
+  <text x="90" y="1419" font-size="11">design note / mode branch</text>
+
+  <!-- Timing budget note -->
+  <rect class="note" x="450" y="1310" width="530" height="120" rx="4"/>
+  <text class="note-text" x="460" y="1328" font-weight="bold">Timing budget (order of magnitude, local network):</text>
+  <text class="note-text" x="460" y="1345">  stage 1 (ws + hello):     ~30-80ms</text>
+  <text class="note-text" x="460" y="1360">  stage 2 (KEX round-trip): ~40-120ms  (2 KexPub + 1 KeyWrap through server)</text>
+  <text class="note-text" x="460" y="1375">  stage 3 (webrtc setup):   ~200-800ms (SDP + ICE trickle, DC open)  · relay/AutoParallel: ~0ms</text>
+  <text class="note-text" x="460" y="1390">  stage 4:                   payload-bound</text>
+  <text class="note-text" x="460" y="1405">  stage 5:                   ~10-50ms</text>
+  <text class="note-text" x="460" y="1424" font-weight="bold">AUTO_WEBRTC_BUDGET = 3s in current Auto arm. Session-single-ws removes the ws reconnect on fallback.</text>
+
+  <!-- Frame index -->
+  <rect class="note" x="30" y="1440" width="410" height="150" rx="4"/>
+  <text class="note-text" x="40" y="1458" font-weight="bold">SignalFrame variants seen in this diagram:</text>
+  <text class="note-text" x="40" y="1475">  Hello{role, receiver_id?, wire_version?}</text>
+  <text class="note-text" x="40" y="1490">  PeerHello{receiver_id?, role?, wire_version?}</text>
+  <text class="note-text" x="40" y="1505">  KexPub{pub_bytes, mac}</text>
+  <text class="note-text" x="40" y="1520">  KeyWrap{ct}</text>
+  <text class="note-text" x="40" y="1535">  Sdp{sdp} · Ice{cand}   (stage 3.a only)</text>
+  <text class="note-text" x="40" y="1555" font-style="italic">All frames use JSON envelope; ws is text-mode. Chunk transport (stage 4) uses HTTP or DC binary,</text>
+  <text class="note-text" x="40" y="1570" font-style="italic">NOT the ws — so ws stays quiet during bulk transfer regardless of mode.</text>
+</svg>
