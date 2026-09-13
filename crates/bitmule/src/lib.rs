@@ -391,6 +391,7 @@ impl SendBuilder {
                     // Kenna 2026-09-13.
                     let serve = if multi { ServeMode::Multi } else { ServeMode::Complete };
                     let sk_relay = share_key.clone();
+                    let bulk_relay = bulk_key.clone();
                     let webrtc_attempt = tokio::time::timeout(
                         bitmule_client_native::AUTO_WEBRTC_BUDGET,
                         send_file_multi(&server_owned, share_key, bulk_key, send_path.clone(), container_owned.clone(), serve),
@@ -403,7 +404,7 @@ impl SendBuilder {
                                 bitmule_client_native::AUTO_WEBRTC_BUDGET.as_secs()
                             );
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            send_file_relay(&server_owned, sk_relay, bulk_key, &send_path, container_ref, on_progress).await
+                            send_file_relay(&server_owned, sk_relay, bulk_relay, &send_path, container_ref, on_progress).await
                         }
                     }
                 }

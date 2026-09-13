@@ -341,6 +341,7 @@ where
                 // exercised here.
                 let serve = if multi { ServeMode::Multi } else { ServeMode::Complete };
                 let sk_relay = share_key.clone();
+                let bulk_relay = bulk_key.clone();
                 let webrtc_attempt = tokio::time::timeout(
                     bitmule_client_native::AUTO_WEBRTC_BUDGET,
                     send_file_multi(&server, share_key, bulk_key, send_path.clone(), container.clone(), serve),
@@ -362,7 +363,7 @@ where
                         // immediately. Short sleep here lets the
                         // cleanup land before we retry. Kenna 2026-09-13.
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        send_file_relay(&server, sk_relay, bulk_key, &send_path, container_ref, on_progress).await
+                        send_file_relay(&server, sk_relay, bulk_relay, &send_path, container_ref, on_progress).await
                     }
                 }
             }
