@@ -1,0 +1,15 @@
+[package]
+name = "fountain-demo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }
+raptorq = "1.8"
+rand = { version = "0.8", features = ["small_rng"] }
+anyhow = "1"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = { workspace = true }
