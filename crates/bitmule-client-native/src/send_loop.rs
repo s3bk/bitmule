@@ -47,7 +47,7 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
     let (bodx_tx, body_rx) = mpsc::channel(10);
 
     let file_len = file.metadata().await?.len();
-    let frame_size = (chunk_size.size() as usize).min(1 << 15);
+    let frame_size = (chunk_size.size() as usize).min(0xfc00);
     let num_chunks = chunk_size.num_chunks(file_len);
 
     spawn(async move {
@@ -55,7 +55,7 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
 
         let mut missing = ChunkBitmap::new();
         let mut bitmaps: IndexMap<ReceiverId, ChunkBitmap> = IndexMap::new();
-        let mut is_empty = true;
+        let mut nothing_to_send = true;
         let mut bitmaps_added = false;
         let mut bitmaps_modified = false;
         let mut receivers_removed = HashSet::new();
@@ -64,19 +64,18 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
         let mut prev_selection_mask: Vec<u8> = vec![];
 
         'main: loop {
-            let cmd;
-            if is_empty {
+            let cmd = if nothing_to_send && !bitmaps_modified {
                 match cmd_rx.recv().await {
-                    Some(c) => cmd = Some(c),
+                    Some(c) => Some(c),
                     None => break,
                 }
             } else {
                 match cmd_rx.try_recv() {
-                    Ok(c) => cmd = Some(c),
+                    Ok(c) => Some(c),
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
-                    Err(mpsc::error::TryRecvError::Empty) => cmd = None,
+                    Err(mpsc::error::TryRecvError::Empty) => None,
                 }
-            }
+            };
 
             match cmd {
                 Some(SendRelayCmd::AddReceiver { id, wants }) => {
@@ -86,9 +85,11 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
                     continue;
                 }
                 Some(SendRelayCmd::RemoveReceiver { id }) => {
-                    bitmaps[&id].bits.clear();
-                    bitmaps_modified = true;
-                    receivers_removed.insert(id);
+                    if let Some(wants) = bitmaps.get_mut(&id) {
+                        wants.bits.clear();
+                        bitmaps_modified = true;
+                        receivers_removed.insert(id);
+                    }
                     continue;
                 }
                 None => {}
@@ -97,12 +98,13 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
             // if this point has been reached, there are no pending commands
             // update bitmaps if needed
             if bitmaps_modified {
+                bitmaps_modified = false;
                 missing.bits.clear();
                 for needed in bitmaps.values() {
                     missing.bits |= &needed.bits;
                 }
-                is_empty = missing.bits.is_empty();
-                if is_empty {
+                nothing_to_send = missing.bits.is_empty();
+                if nothing_to_send {
                     // nothing to do, reset current chunk_idx and await instructions
                     chunk_idx = 0;
                     continue;
@@ -122,6 +124,7 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
             }
 
             if bitmaps_added || receivers_removed.len() > 8 || selection_mask.len() == 0 {
+                bitmaps_added = false;
                 // update reciever table
                 // first apply any pending removes
                 for id in receivers_removed.drain() {
@@ -170,7 +173,7 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
             while bytes_sent < this_chunk_size {
                 let payload_len = (file_len - start_pos - bytes_sent as u64).min(frame_size as u64) as usize;
                 let mut frame = BytesMut::zeroed(1 + FRAME_SIZE_BYTES + payload_len);
-                frame[..FRAME_SIZE_BYTES].copy_from_slice(&(payload_len as u16).to_be_bytes());
+                frame[..FRAME_SIZE_BYTES].copy_from_slice(&(payload_len as u16).to_le_bytes());
                 frame[FRAME_SIZE_BYTES] = F_CHUNK;
                 if let Err(e) = file.read_exact(&mut frame[FRAME_SIZE_BYTES+1..]).await {
                     tracing::error!({e=%e}, "reading file");
