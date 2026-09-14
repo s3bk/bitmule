@@ -1,7 +1,7 @@
 use std::{collections::HashSet, io::SeekFrom};
 
 use biter::MutBiter;
-use bitmule_core::{ChunkBitmap, ChunkSize, ReceiverId};
+use bitmule_core::{ChunkBitmap, ChunkHasher, ChunkSize, ReceiverId};
 use bitmule_crypto::{BulkKey, ShareKey, ShareLink};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::Stream;
@@ -168,16 +168,32 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
             if let Err(_) = file.seek(SeekFrom::Start(start_pos)).await {
                 break 'main;
             }
-
+            let mut hasher = ChunkHasher::new(chunk_idx);
             let mut bytes_sent = 0;
             while bytes_sent < this_chunk_size {
                 let payload_len = (file_len - start_pos - bytes_sent as u64).min(frame_size as u64) as usize;
-                let mut frame = BytesMut::zeroed(1 + FRAME_SIZE_BYTES + payload_len);
+                let is_first = bytes_sent == 0;
+                let is_last = bytes_sent + payload_len == this_chunk_size;
+                let extra = is_first as usize * 8 + is_last as usize * 8;
+                let mut frame = BytesMut::zeroed(1 + FRAME_SIZE_BYTES + payload_len + extra);
                 frame[..FRAME_SIZE_BYTES].copy_from_slice(&(payload_len as u16).to_le_bytes());
-                frame[FRAME_SIZE_BYTES] = F_CHUNK;
-                if let Err(e) = file.read_exact(&mut frame[FRAME_SIZE_BYTES+1..]).await {
+                frame[FRAME_SIZE_BYTES] = F_DATA;
+                let payload_start = FRAME_SIZE_BYTES+1 + is_first as usize * 8;
+                if is_first {
+                    frame[FRAME_SIZE_BYTES+1..FRAME_SIZE_BYTES+5].copy_from_slice(&chunk_idx.to_le_bytes());
+                    frame[FRAME_SIZE_BYTES+5..FRAME_SIZE_BYTES+9].copy_from_slice(&this_chunk_size.to_le_bytes());
+                }
+
+                let payload = &mut frame[payload_start..payload_start+payload_len];
+                if let Err(e) = file.read_exact(payload).await {
                     tracing::error!({e=%e}, "reading file");
                     break 'main;
+                }
+                hasher.add_frame(&*payload);
+
+                if is_last {
+                    let digest = hasher.digest();
+                    frame[payload_start+payload_len..].copy_from_slice(&digest.to_le_bytes());
                 }
 
                 if let Err(_) = bodx_tx.send(frame.freeze()).await {
@@ -192,3 +208,16 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
 
     Ok(ReceiverStream::new(body_rx))
 }
+
+/*
+ * a sequence of chunks is sent.
+ * each chunk is transfered via multiple data frames
+
+  each chunk begins with
+  4 LE bytes chunk index
+  4 LE bytes chunk size
+
+  followed by the contents of the chunk
+
+  8 LE bytes chunk hash
+ */

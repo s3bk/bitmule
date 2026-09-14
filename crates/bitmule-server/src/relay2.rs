@@ -92,7 +92,7 @@ pub async fn run_session(session: Arc<MulticastSession>, stream: BodyDataStream)
         let (frame_type, data) = next?;
 
         match frame_type {
-            F_CHUNK => {
+            F_DATA => {
                 let bitset = || Biter::from(&*selection_bits);
 
                 let n_required = izip!(bitset(), routing_table.iter_mut()).filter(|&(include, ref dest)| include && dest.is_some()).count();

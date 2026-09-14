@@ -139,11 +139,11 @@ mod roaring_serde {
 pub mod relay_frame {
     #[repr(u8)]
     pub enum FrameType {
-        Chunk = 1,
+        Data = 1,
         SelectionUpdate = 2,
         RoutingUpdate = 3,
     }
-    pub const F_CHUNK: u8 = FrameType::Chunk as u8;
+    pub const F_DATA: u8 = FrameType::Data as u8;
     pub const F_SELECTION_UPDATE: u8 = FrameType::SelectionUpdate as u8;
     pub const F_ROUTING_UPDATE: u8 = FrameType::RoutingUpdate as u8;
 
