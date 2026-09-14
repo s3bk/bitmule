@@ -9,6 +9,8 @@ pub mod crypto;
 pub mod protocol;
 pub mod traits;
 
+use std::ops;
+
 pub use manifest::{Manifest, FileEntry, ChunkSize};
 pub use chunk::{ChunkId, ChunkHeader, ChunkPayload};
 pub use crypto::{SessionKey, ContentKey, WrappedContentKey, KeyExchange};
@@ -51,5 +53,24 @@ impl ChunkHasher {
     }
     pub fn digest(&self) -> u64 {
         self.inner.digest()
+    }
+}
+
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChunkIdx(u64);
+impl ChunkIdx {
+    pub fn from_le_bytes(bytes: [u8; 6]) -> Self {
+        let [b0,b1,b2,b3,b4,b5] = bytes;
+        ChunkIdx(u64::from_le_bytes([b0,b1,b2,b3,b4,b5,0,0]))
+    }
+    pub fn to_le_bytes(self) -> [u8; 6] {
+        let [b0,b1,b2,b3,b4,b5,_,_] = self.0.to_le_bytes();
+        [b0,b1,b2,b3,b4,b5]
+    }
+}
+impl ops::Deref for ChunkIdx {
+    type Target = u64;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
