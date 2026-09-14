@@ -47,7 +47,7 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
     let (bodx_tx, body_rx) = mpsc::channel(10);
 
     let file_len = file.metadata().await?.len();
-    let frame_size = (chunk_size.size() as usize).min(0xfc00);
+    let frame_size = (chunk_size.size() as usize).min(0xf000);
     let num_chunks = chunk_size.num_chunks(file_len);
 
     spawn(async move {
