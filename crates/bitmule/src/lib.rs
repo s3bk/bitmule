@@ -74,7 +74,7 @@
 //! - Structured error variants — [`Error::Transport`] wraps
 //!   `anyhow::Error` verbatim.
 
-use bitmule_client_native as native;
+use bitmule_client_native::{self as native, commit_reader};
 use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
 use bitmule_client_native::{recv_file, send_file_multi, send_file_relay, ServeMode};
 use std::fmt;
