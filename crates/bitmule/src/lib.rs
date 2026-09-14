@@ -421,6 +421,7 @@ impl SendBuilder {
     }
 }
 
+
 /// Stream `path` through SHA-256 folding the bulk key in, produce the
 /// 32-byte URL commitment. Reads in 64 KiB chunks — the file is not
 /// held in memory. Mirrors the `commit_file` helper in `main.rs`.
@@ -428,16 +429,8 @@ async fn commit_file(path: &Path, bulk_key: &BulkKey) -> anyhow::Result<[u8; 32]
     let mut f = tokio::fs::File::open(path)
         .await
         .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-    let mut hasher = CommitmentHasher::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize(bulk_key))
+
+    commit_reader(&mut f, bulk_key).await
 }
 
 /// In-flight (or completed) send. Share URL is available immediately;

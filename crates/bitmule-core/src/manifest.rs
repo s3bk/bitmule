@@ -10,22 +10,25 @@ use serde::{Deserialize, Serialize};
 /// be bumped further (see protocol renegotiation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ChunkSize(pub u32);
+pub struct ChunkSize {
+    // chunk size = 1 << power
+    power: u8,
+}
 
 impl ChunkSize {
     pub fn from_total(total_bytes: u64) -> Self {
-        if total_bytes < 100 * 1024 * 1024 {
-            ChunkSize(256 * 1024)
-        } else if total_bytes < 10 * 1024 * 1024 * 1024 {
-            ChunkSize(1024 * 1024)
-        } else {
-            ChunkSize(4 * 1024 * 1024)
-        }
-    }
+        const MIN: u32 = 10; // 1kB chunks
+        const MAX: u32 = 20; // 1MB chunks
 
-    pub fn lan_boost() -> Self {
-        // LAN-direct: fatter chunks, less per-chunk overhead
-        ChunkSize(8 * 1024 * 1024)
+        let size_power = 63 - total_bytes.leading_zeros().min(63);
+        let chunk_power = size_power.saturating_sub(5);
+        ChunkSize { power: chunk_power.clamp(MIN, MAX) as u8 }
+    }
+    pub fn size(&self) -> u64 {
+        1u64 << self.power
+    }
+    pub fn num_chunks(&self, bytes: u64) -> u32 {
+        ((bytes + self.size() - 1) >> self.power) as u32
     }
 }
 

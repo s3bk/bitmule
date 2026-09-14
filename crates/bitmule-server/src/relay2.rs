@@ -1,3 +1,22 @@
+//!
+//! Frame formats
+//!
+//! ROUTING
+//! - 2 bytes data length n (LE)
+//! - 1 byte with value 3
+//! - n = 16 * num_ids bytes containing LE encoded ReceiverId
+//!
+//! Selection update
+//! - 2 bytes data length n (LE)
+//! - 1 byte with value 2
+//! - n = ceil(n_indices / 8) bytes with the bits for the corresponding reciever indices set to 1
+//!
+//! Data
+//! - 2 bytes payload length n (LE)
+//! - 1 byte with value 1
+//! - n bytes payload
+
+
 use std::{collections::{HashMap}, convert::Infallible, io, pin::Pin, sync::Arc, task::{Context, Poll}};
 
 use axum::body::{Body, BodyDataStream};
@@ -9,19 +28,7 @@ use tokio::{pin, sync::{AcquireError, Mutex, Semaphore, mpsc::{self, error::TryS
 use tokio_util::{codec::{Decoder, FramedRead}, io::StreamReader};
 use itertools::izip;
 
-#[derive(PartialEq, Eq, Hash)]
-pub struct ReceiverId(pub u128);
-
-
-#[repr(u8)]
-enum FrameType {
-    Chunk = 1,
-    SelectionUpdate = 2,
-    RoutingUpdate = 3,
-}
-const F_CHUNK: u8 = FrameType::Chunk as u8;
-const F_SELECTION_UPDATE: u8 = FrameType::SelectionUpdate as u8;
-const F_ROUTING_UPDATE: u8 = FrameType::RoutingUpdate as u8;
+use bitmule_core::{ReceiverId, protocol::relay_frame::*};
 
 
 struct FrameDecoder;
@@ -31,15 +38,15 @@ impl Decoder for FrameDecoder {
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.remaining() < 3 { return Ok(None); }  // type(1) + len(2)
+        if src.remaining() < 1 + FRAME_SIZE_BYTES { return Ok(None); }  // type(1) + len(FRAME_SIZE_BYTES)
 
-        let frame_length = u16::from_le_bytes(src[0..2].try_into().unwrap()) as usize;
-        let frame_type = src[2];
+        let frame_length = FrameSize::from_le_bytes(src[0..FRAME_SIZE_BYTES].try_into().unwrap()) as usize;
+        let frame_type = src[FRAME_SIZE_BYTES];
 
-        if src.remaining() < 3 + frame_length as usize {
+        if src.remaining() < 1 + FRAME_SIZE_BYTES + frame_length as usize {
             return Ok(None);
         }
-        src.advance(3);
+        src.advance(1 + FRAME_SIZE_BYTES);
 
         let payload = src.split_to(frame_length).freeze();
         Ok(Some((frame_type, payload)))
@@ -119,7 +126,7 @@ pub async fn run_session(session: Arc<MulticastSession>, stream: BodyDataStream)
                 routing_table.clear();
                 let receivers = session.receivers.lock().await;
                 routing_table.extend(data.chunks_exact(size_of::<ReceiverId>()).map(|chunk| {
-                    let id = ReceiverId(u128::from_le_bytes(chunk.try_into().unwrap()));
+                    let id = ReceiverId(chunk.try_into().unwrap());
                     let tx = receivers.get(&id)?.clone();
                     Some(Dest { tx })
                 }));

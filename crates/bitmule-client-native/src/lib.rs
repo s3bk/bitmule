@@ -25,8 +25,10 @@ pub mod pipeline;
 pub mod multipeer;
 pub mod container;
 pub mod session;
+use bitmule_crypto::{BulkKey, CommitmentHasher};
 pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
 pub use multipeer::ServeMode;
+pub mod send_loop;
 
 /// Return value from [`recv_file`] — the on-disk path plus the wire's
 /// `container` flag so the caller can post-process (e.g. unzip a
@@ -42,7 +44,7 @@ use bitmule_core::{ReceiverId, SessionId};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
-use tokio::{io::AsyncReadExt, sync::{mpsc, Mutex}};
+use tokio::{io::{AsyncRead, AsyncReadExt}, pin, sync::{Mutex, mpsc}};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 
@@ -251,6 +253,24 @@ pub async fn resend_relay_progress(
     if p.done {
         let _ = out_json_tx.send(r#"{"type":"relay_done"}"#.to_string());
     }
+}
+
+/// Stream `path` through SHA-256 folding the bulk key in, produce the
+/// 32-byte URL commitment. Reads in 64 KiB chunks — the file is not
+/// held in memory. Mirrors the `commit_file` helper in `main.rs`.
+pub async fn commit_reader<R>(reader: &mut R, bulk_key: &BulkKey) -> anyhow::Result<[u8; 32]>
+where R: AsyncRead + Unpin
+{
+    let mut hasher = CommitmentHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize(bulk_key))
 }
 
 /// Receive a file via the server relay. Consumes JSON frames from

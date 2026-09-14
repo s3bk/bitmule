@@ -135,3 +135,18 @@ mod roaring_serde {
         RoaringBitmap::deserialize_from(&buf[..]).map_err(serde::de::Error::custom)
     }
 }
+
+pub mod relay_frame {
+    #[repr(u8)]
+    pub enum FrameType {
+        Chunk = 1,
+        SelectionUpdate = 2,
+        RoutingUpdate = 3,
+    }
+    pub const F_CHUNK: u8 = FrameType::Chunk as u8;
+    pub const F_SELECTION_UPDATE: u8 = FrameType::SelectionUpdate as u8;
+    pub const F_ROUTING_UPDATE: u8 = FrameType::RoutingUpdate as u8;
+
+    pub type FrameSize = u16;
+    pub const FRAME_SIZE_BYTES: usize = size_of::<FrameSize>();
+}
