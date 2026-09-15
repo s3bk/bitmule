@@ -16,18 +16,17 @@
 //! The server does not inspect frame payloads. SDP, ICE, and key-exchange
 //! all ride the same relay.
 
+use std::sync::Arc;
+
 use crate::{
-    room::{PeerEntry, PeerSink, Role},
-    state::AppState,
+    room::{PeerEntry, PeerSink, Role}, state::{AppState, SessionState},
 };
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
-    },
-    response::IntoResponse,
+        Path, State, ws::{Message, WebSocket, WebSocketUpgrade},
+    }, http::StatusCode, response::IntoResponse,
 };
-use bitmule_core::{ReceiverId, SessionId};
+use bitmule_core::{ReceiverId, SessionId, pow};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -60,12 +59,12 @@ enum JoinFrame {
     },
 }
 
-pub async fn ws_handler(
+pub async fn ws_join_session(
     ws: WebSocketUpgrade,
     Path(session_hex): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let session = match SessionId::from_hex(&session_hex) {
+    let session_id = match SessionId::from_hex(&session_hex) {
         Ok(id) => id,
         Err(_) => {
             return axum::http::Response::builder()
@@ -74,11 +73,37 @@ pub async fn ws_handler(
                 .unwrap();
         }
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session))
+    let Some(session_state) = state.get_session(session_id).await else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_state))
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionId) {
+pub async fn ws_create_session(
+    ws: WebSocketUpgrade,
+    Path((session_hex, nounce)): Path<(String, u64)>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let session_id = match SessionId::from_hex(&session_hex) {
+        Ok(id) => id,
+        Err(_) => {
+            return axum::http::Response::builder()
+                .status(axum::http::StatusCode::BAD_REQUEST)
+                .body(axum::body::Body::from("invalid session id"))
+                .unwrap();
+        }
+    };
+    if !pow::verify(&session_id, nounce, 20) {
+        return (StatusCode::BAD_REQUEST, "bad nounce").into_response();
+    }
+    let session = state.create_session(session_id).await;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session))
+        .into_response()
+}
+
+async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: SessionId, session: Arc<SessionState>) {
     // Wait for the initial SessionCreate or SessionJoin frame.
     let (role, receiver_id, wire_version, transports) = match read_join(&mut socket).await {
         Some(v) => v,
@@ -88,7 +113,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
         }
     };
 
-    let room = state.room(session).await;
+    let room = session.room();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     // Register into the room. After registering, notify each side of the
@@ -308,7 +333,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: SessionI
             }
         }
     }
-    state.maybe_drop_room(&session).await;
+    state.maybe_drop_room(session_id).await;
     out.abort();
 }
 

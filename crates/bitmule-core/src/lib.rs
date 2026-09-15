@@ -8,6 +8,7 @@ pub mod chunk;
 pub mod crypto;
 pub mod protocol;
 pub mod traits;
+pub mod pow;
 
 use std::ops;
 

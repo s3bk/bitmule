@@ -205,7 +205,7 @@ async fn sha256_of(path: &PathBuf) -> Result<[u8; 32]> {
     Ok(h.finalize().into())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -223,7 +223,9 @@ async fn main() -> Result<()> {
     let num_blocks =
         ((file_len + cli.block_size as u64 - 1) / cli.block_size as u64) as u32;
 
-    let (tx, rx) = mpsc::channel::<WirePacket>(4096);
+    let (tx, rx) = mpsc::channel::<WirePacket>(4);
+
+    let t0 = std::time::Instant::now();
 
     let enc = tokio::spawn(encoder_task(
         cli.input.clone(),
@@ -244,6 +246,10 @@ async fn main() -> Result<()> {
 
     let enc_blocks = enc.await??;
     dec.await??;
+
+    let dt = t0.elapsed().as_secs_f64();
+    println!("{dt:.1}s, {:.2}MB/s", file_len as f64 / (dt * 1024. * 1024.));
+
 
     let a = sha256_of(&cli.input).await?;
     let b = sha256_of(&cli.output).await?;

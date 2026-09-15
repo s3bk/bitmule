@@ -17,9 +17,9 @@
 //! - n bytes payload
 
 
-use std::{collections::{HashMap}, convert::Infallible, io, pin::Pin, sync::Arc, task::{Context, Poll}};
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, io, pin::Pin, sync::Arc, task::{Context, Poll}};
 
-use axum::body::{Body, BodyDataStream};
+use axum::{body::{Body, BodyDataStream}, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::IntoResponse};
 use biter::{Biter};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{TryStreamExt};
@@ -28,7 +28,9 @@ use tokio::{pin, sync::{AcquireError, Mutex, Semaphore, mpsc::{self, error::TryS
 use tokio_util::{codec::{Decoder, FramedRead}, io::StreamReader};
 use itertools::izip;
 
-use bitmule_core::{ReceiverId, protocol::relay_frame::*};
+use bitmule_core::{ReceiverId, SessionId, pow, protocol::relay_frame::*};
+
+use crate::{AppState, state::SessionState};
 
 
 struct FrameDecoder;
@@ -55,6 +57,9 @@ impl Decoder for FrameDecoder {
 
 #[derive(Debug)]
 pub enum Error {
+    BadSessionId,
+    BadReceiverId,
+    SessionNotFound,
     Io(io::Error),
     InvalidFrameType(u8),
     SelectionLength { expected: usize, found: usize },
@@ -70,6 +75,24 @@ impl From<AcquireError> for Error {
         Error::Closed
     }
 }
+impl IntoResponse for Error {
+    fn into_response(self) -> axum::response::Response {
+        use axum::http::StatusCode;
+        let (status, body): (StatusCode, Cow<str>) = match self {
+            Error::Io(e) => (StatusCode::BAD_REQUEST, "Io Error".into()),
+            Error::InvalidFrameType(t) => (StatusCode::BAD_REQUEST, format!("invalid frame type: {t}").into()),
+            Error::SelectionLength { expected, found } => (
+                StatusCode::BAD_REQUEST,
+                format!("selection length mismatch: expected {expected}, found {found}").into(),
+            ),
+            Error::Closed => (StatusCode::SERVICE_UNAVAILABLE, "session closed".into()),
+            Error::BadSessionId => (StatusCode::BAD_REQUEST, "Invalid Session ID".into()),
+            Error::BadReceiverId => (StatusCode::BAD_REQUEST, "Invalid Receiver ID".into()),
+            Error::SessionNotFound => (StatusCode::NOT_FOUND, "Session ID not found".into()),
+        };
+        (status, body).into_response()
+    }
+}
 
 struct Dest {
     tx: mpsc::Sender<Bytes>,
@@ -79,8 +102,14 @@ pub struct MulticastSession {
     receivers: Mutex<HashMap<ReceiverId, mpsc::Sender<Bytes>>>,
     semaphore: Semaphore,
 }
+impl Default for MulticastSession {
+    fn default() -> Self {
+        MulticastSession { receivers: Default::default(), semaphore: Semaphore::new(0) }
+    }
+}
 
-pub async fn run_session(session: Arc<MulticastSession>, stream: BodyDataStream) -> Result<(), Error> {
+pub async fn run_session(state: Arc<SessionState>, stream: BodyDataStream) -> Result<(), Error> {
+    let session = state.multicast();
     let reader = StreamReader::new(stream.map_err(io::Error::other));
     let stream = FramedRead::new(reader, FrameDecoder);
     pin!(stream);
@@ -146,25 +175,24 @@ pub async fn run_session(session: Arc<MulticastSession>, stream: BodyDataStream)
     Ok(())
 }
 
-pub async fn add_receiver(session: &Arc<MulticastSession>, reciever_id: ReceiverId) -> Body {
+pub async fn add_receiver(state: Arc<SessionState>, reciever_id: ReceiverId) -> Body {
     let (tx, rx) = mpsc::channel(1);
-    session.receivers.lock().await.insert(reciever_id, tx);
+    state.multicast().receivers.lock().await.insert(reciever_id, tx);
 
-    let session = session.clone();
-    let stream = DeliveringBody { inner: rx, session: session.clone() };
+    let stream = DeliveringBody { inner: rx, state };
     Body::from_stream(stream)
 }
 
 struct DeliveringBody {
     inner: mpsc::Receiver<Bytes>,
-    session: Arc<MulticastSession>,
+    state: Arc<SessionState>,
 }
 impl Drop for DeliveringBody {
     fn drop(&mut self) {
         // Buffered items that will never fire their delivery-side add_permits.
         // Return them all now.
         let leftover = self.inner.len();
-        self.session.semaphore.add_permits(leftover);
+        self.state.multicast().semaphore.add_permits(leftover);
     }
 }
 
@@ -175,7 +203,7 @@ impl Stream for DeliveringBody {
         match self.inner.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(data)) => {
-                self.session.semaphore.add_permits(1);
+                self.state.multicast().semaphore.add_permits(1);
                 Poll::Ready(Some(Result::<_, Infallible>::Ok(data)))
             }
             Poll::Ready(None) => Poll::Ready(None)
@@ -190,4 +218,32 @@ impl Stream for DeliveringBody {
             (self.inner.len(), None)
         }
     }
+}
+
+pub fn parse_session(hex: &str) -> Result<SessionId, Error> {
+    SessionId::from_hex(hex).map_err(|_| Error::BadSessionId)
+}
+
+pub async fn post(
+    Path((session_hex, receiver_hex)): Path<(String, String)>,
+    State(state): State<AppState>,
+    body: Body,
+) -> Result<(), Error> {
+    let session_id = parse_session(&session_hex)?;
+    let receiver_id = ReceiverId::from_hex(&receiver_hex).map_err(|e| Error::BadReceiverId)?;
+
+    let session = state.get_session(session_id).await.ok_or(Error::SessionNotFound)?;
+
+    run_session(session, body.into_data_stream()).await
+}
+pub async fn get(
+    Path((session_hex, receiver_hex)): Path<(String, String)>,
+    State(state): State<AppState>
+) -> Result<Body, Error> {
+    let session_id = parse_session(&session_hex)?;
+    let receiver_id = ReceiverId::from_hex(&receiver_hex).map_err(|e| Error::BadReceiverId)?;
+    let session = state.get_session(session_id).await.ok_or(Error::SessionNotFound)?;
+
+    let body = add_receiver(session, receiver_id).await;
+    Ok(body)
 }
