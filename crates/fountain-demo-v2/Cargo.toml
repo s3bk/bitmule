@@ -1,0 +1,33 @@
+[package]
+name = "fountain-demo-v2"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "fountain_demo_v2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fountain-send"
+path = "src/bin/send.rs"
+
+[[bin]]
+name = "fountain-recv"
+path = "src/bin/recv.rs"
+
+[dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = "1"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Fountain code stack — engine + RaptorQ scheme + utility wrappers.
+# Docs: https://docs.rs/fountain_engine/  https://docs.rs/fountain_raptor_q/  https://docs.rs/fountain_utility/
+fountain_engine = "2"
+fountain_raptor_q = "2"
+fountain_utility = "2"

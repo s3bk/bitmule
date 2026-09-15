@@ -14,6 +14,7 @@ members = [
     "crates/bitmule-gtk4",
     "crates/bitmule-mobile-ffi",
     "crates/fountain-demo",
+    "crates/fountain-demo-v2",
 ]
 
 [workspace.package]
