@@ -72,5 +72,6 @@ futures = "*"
 # builds; comment out and add back only if release size becomes
 # critical again.
 [profile.release]
-strip = "symbols"
+#strip = "symbols"
+debug = "full"
 lto = "thin"
