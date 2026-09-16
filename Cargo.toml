@@ -14,7 +14,7 @@ members = [
     "crates/bitmule-gtk4",
     "crates/bitmule-mobile-ffi",
     "crates/fountain-demo",
-    "crates/fountain-demo-v2",
+    "crates/fountain-demo-v2", "crates/raptor-demo",
 ]
 
 [workspace.package]
@@ -74,5 +74,5 @@ futures = "*"
 # critical again.
 [profile.release]
 #strip = "symbols"
-debug = "full"
+debug = 1
 lto = "thin"

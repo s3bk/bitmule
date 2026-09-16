@@ -621,7 +621,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use bitmule_core::traits::ChunkStore;
-    use bitmule_server::{relay, state::AppState, ws::ws_handler};
+    use bitmule_server::{relay, state::AppState, ws::ws_join_session};
     use bitmule_server_store_fs::FsChunkStore;
 
     /// End-to-end round-trip: spawn an in-process bitmule-server on a
@@ -639,7 +639,7 @@ mod tests {
             Arc::new(FsChunkStore::new(server_data_dir.path()));
         let state = AppState::new(store);
         let app = axum::Router::new()
-            .route("/ws/:session", axum::routing::get(ws_handler))
+            .route("/ws/:session", axum::routing::get(ws_join_session))
             .route(
                 "/session/:sess/chunk/:idx",
                 axum::routing::put(relay::put_chunk).get(relay::get_chunk),
