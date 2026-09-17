@@ -15,3 +15,7 @@ clap = { version = "*", features = ["derive"] }
 postcard = { version = "*", features = ["use-std"] }
 futures = "*"
 xxhash-rust = { version = "*", features = ["xxh3"] }
+tokio-stream = "*"
+serde = { version = "*", featues = ["derive"] }
+serde_with = "*"
+console-subscriber = "*"
