@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-raptorq = { path = "../../../raptorq", features = ["serde_support"] }
+raptorq = { git = "https://github.com/s3bk/raptorq", features = ["serde_support"] }
 tokio-uring = { version = "0.5.0" }
 tokio = { version = "*", features = ["macros", "rt-multi-thread", "time"] }
 anyhow = "*"
