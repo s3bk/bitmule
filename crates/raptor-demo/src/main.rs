@@ -10,6 +10,7 @@ use std::{collections::HashSet, io, iter::once, mem::replace, ops::Deref, path::
 
 use crossbeam::queue::ArrayQueue;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use raptor_demo::tracked_await;
 use raptorq::{Decoder, EncodingPacket, ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder, SourceBlockEncodingPlan, SourceBlockStorage, Symbol, ZeroInit};
 use serde::{Deserialize, Serialize};
 use tokio::{select, spawn, sync::{Semaphore, mpsc}, time::Instant};
@@ -164,7 +165,7 @@ async fn read_loop(input: PathBuf, input_size: u64, tx: mpsc::Sender<InputBlock>
         let offset = BLOCK_SIZE as u64 * n;
         let size = (input_size - offset).min(BLOCK_SIZE as u64) as usize;
         let slice = buffer.slice(size);
-        let (res, slice) = file.read_at(slice, offset).await;
+        let (res, slice) = tracked_await!(file.read_at(slice, offset), "read block from disk");
         match res {
             Ok(n) if n == size => {}
             _ => bail!("failed to read buffer {n}")
@@ -172,7 +173,7 @@ async fn read_loop(input: PathBuf, input_size: u64, tx: mpsc::Sender<InputBlock>
         let data = slice.padded();
 
         let hash = block_hash(&*data);
-        tx.send(InputBlock { block_nr: n, data, hash }).await?;
+        tracked_await!(tx.send(InputBlock { block_nr: n, data, hash }), "send block")?;
     }
     Ok(())
 }
@@ -181,7 +182,7 @@ async fn encode_loop(mut rx: mpsc::Receiver<InputBlock>, tx: mpsc::Sender<Packet
     let plan = SourceBlockEncodingPlan::generate(N_SYMBOLS as u16);
     let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE as u16, 0, 1, 1);
 
-    while let Some(InputBlock { block_nr, data, hash }) = rx.recv().await {
+    while let Some(InputBlock { block_nr, data, hash }) = tracked_await!(rx.recv(), "receive block") {
         let encoder = SourceBlockEncoder::with_encoding_plan(1, &config, &*data, &plan);
         block_pool.push(data).map_err(|_| anyhow!("BlockPool full"))?;
 
@@ -223,7 +224,7 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
     };
     let alloc_block = |_| block_pool.pop().unwrap();
 
-    while let Some(Packet { block_nr, data, hash }) = rx.recv().await {
+    while let Some(Packet { block_nr, data, hash }) = tracked_await!(rx.recv(), "recv packet") {
         //println!("{block_nr}:{}", data.payload_id().encoding_symbol_id());
         if complete.contains(&block_nr) {
             continue;
@@ -240,7 +241,7 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
         }
         last_block = block_nr;
         if let Some(data) = decoder.decode_with(&mut storage, once(data), dispose_symbol, alloc_block) {
-            complete_tx.send(CompleteBlock { block_nr, data, hash }).await.context("complete_tx.send")?;
+            tracked_await!(complete_tx.send(CompleteBlock { block_nr, data, hash }), "send output block").context("complete_tx.send")?;
             block_complete = true;
             complete.insert(block_nr);
             if complete.len() == num_blocks {
@@ -420,6 +421,7 @@ async fn main() -> Result<(), Error> {
 
     std::mem::forget(symbol_pool5);
 
+    raptor_demo::await_tracker::print_report();
     Ok(())
 }
 fn print_err(r: Result<(), Error>, label: &str) -> bool {
