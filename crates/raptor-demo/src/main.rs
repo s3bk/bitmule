@@ -183,16 +183,19 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
     let mut complete = HashSet::with_capacity(num_blocks);
 
     while let Some(Packet { block_nr, data, hash }) = rx.recv().await {
-        //println!("{block_nr}:{}", data.payload_id().encoding_symbol_id());
+        println!("{block_nr}:{}", data.payload_id().encoding_symbol_id());
         if complete.contains(&block_nr) {
             continue;
         }
         if block_nr != last_block {
-            if !block_complete {
+            if block_complete {
+                decoder = SourceBlockDecoder::new(1, &config, ELEMENTS);
+                storage = SourceBlockStorage::<SymbolBuffer>::new(&config, ELEMENTS);
+                block_complete = false;
+            } else {
                 let partial = replace(&mut storage,  SourceBlockStorage::<SymbolBuffer>::new(&config, ELEMENTS));
                 partial_tx.send(PartialBlock { block_nr, storage: partial }).await?;
             }
-            decoder = SourceBlockDecoder::new(1, &config, ELEMENTS);
         }
         last_block = block_nr;
         if let Some(data) = decoder.decode(&mut storage, once(data)) {
