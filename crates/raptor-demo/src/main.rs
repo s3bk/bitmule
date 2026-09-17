@@ -81,6 +81,11 @@ impl ZeroInit for SymbolBuffer {
 struct BlockBuffer {
     inner: Box<[u8; BLOCK_SIZE]>,
 }
+impl AsMut<[u8]> for BlockBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut *self.inner
+    }
+}
 struct BufferSlice {
     buffer: Box<[u8; BLOCK_SIZE]>,
     len: usize
@@ -204,7 +209,7 @@ fn reset_storage(storage: &mut SourceBlockStorage<SymbolBuffer>, symbol_pool: &S
     }
 }
 
-async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<PartialBlock>, complete_tx: mpsc::Sender<CompleteBlock>, num_blocks: usize, symbol_pool: SymbolPool) -> Result<(), Error> {
+async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<PartialBlock>, complete_tx: mpsc::Sender<CompleteBlock>, num_blocks: usize, symbol_pool: SymbolPool, block_pool: BlockPool) -> Result<(), Error> {
     let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE as u16, 0, 1, 1);
 
     const ELEMENTS: u64 = N_SYMBOLS as u64 * SYMBOL_SIZE as u64;
@@ -213,9 +218,10 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
     let mut last_block = 0;
     let mut block_complete = false;
     let mut complete = HashSet::with_capacity(num_blocks);
-    let dispose = |buf| {
+    let dispose_symbol = |buf| {
         let _ = symbol_pool.push(buf);
     };
+    let alloc_block = |_| block_pool.pop().unwrap();
 
     while let Some(Packet { block_nr, data, hash }) = rx.recv().await {
         //println!("{block_nr}:{}", data.payload_id().encoding_symbol_id());
@@ -233,7 +239,7 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
             }
         }
         last_block = block_nr;
-        if let Some(data) = decoder.decode_with(&mut storage, once(data), dispose) {
+        if let Some(data) = decoder.decode_with(&mut storage, once(data), dispose_symbol, alloc_block) {
             complete_tx.send(CompleteBlock { block_nr, data, hash }).await.context("complete_tx.send")?;
             block_complete = true;
             complete.insert(block_nr);
@@ -257,38 +263,46 @@ struct PartialBlock {
 }
 struct CompleteBlock {
     block_nr: u64,
-    data: Vec<u8>,
+    data: BlockBuffer,
     hash: u64,
 }
-fn block_hash(data: &[u8]) -> u64 {
-    assert_eq!(data.len(), BLOCK_SIZE);
+fn block_hash(data: &[u8; BLOCK_SIZE]) -> u64 {
     xxh3_64(data)
 }
 
-async fn save_output(mut rx: mpsc::Receiver<CompleteBlock>, output_file: PathBuf, file_size: u64) -> Result<(), Error> {
+async fn save_output(mut rx: mpsc::Receiver<CompleteBlock>, output_file: PathBuf, file_size: u64, block_pool: BlockPool) -> Result<(), Error> {
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&output_file)?;
     file.set_len(file_size)?;
     let file = File::from_std(file);
 
+    let process_result = |(block_nr, r, buf): (u64, Result<(), io::Error>, BufferSlice)| {
+        match r {
+            Err(e) => println!("save output {block_nr}: {e:?}"),
+            Ok(()) => {}
+        }
+        let (buf, len) = buf.into_inner();
+        let _ = block_pool.push(buf);
+    };
+
     let mut pending = FuturesUnordered::new();
     loop {
         select!{
-            Some(CompleteBlock { block_nr, mut data, hash }) = rx.recv(), if !rx.is_closed() => {
+            Some(CompleteBlock { block_nr, data, hash }) = rx.recv(), if !rx.is_closed() => {
                 if block_hash(&data) != hash {
                     bail!("incorrect block {block_nr}");
                 }
                 let pos = block_nr * BLOCK_SIZE as u64;
                 let remaining = file_size - pos;
-                if remaining < BLOCK_SIZE as u64 {
-                    data.truncate(remaining as usize);
+                let slice = data.slice(remaining.min(BLOCK_SIZE as u64) as usize);
+
+                pending.push(file.write_all_at(slice, pos).map(move |(r, buf)| (block_nr, r, buf)));
+
+                if pending.len() > 16 {
+                    process_result(pending.next().await.unwrap());
                 }
-                pending.push(file.write_all_at(data, pos).map(move |r| (block_nr, r)));
             }
-            Some((block_nr, (r, buf))) = pending.next(), if !pending.is_empty() => {
-                match r {
-                    Err(e) => println!("save output {block_nr}: {e:?}"),
-                    Ok(()) => {}
-                }
+            Some(r) = pending.next(), if !pending.is_empty() => {
+                process_result(r);
             }
             else => {
                 break
@@ -355,21 +369,28 @@ fn make_pool<T>(n: usize, init: impl Fn() -> T) -> Arc<ArrayQueue<T>> {
 async fn main() -> Result<(), Error> {
     let args = Cli::parse();
     std::fs::create_dir_all(&args.partial)?;
-    let block_pool = make_pool(10, BlockBuffer::new);
-    let symbol_pool = make_pool(1024 + 2 * N_SYMBOLS + 2 * args.overhead_factor as usize, SymbolBuffer::new);
+    let block_pool = make_pool(10 + 16, BlockBuffer::new);
+
+    let packet_ch_cap = 4 * 1024;
+    let partial_ch_cap = 16;
+    let n_symbol_allocs = packet_ch_cap + (N_SYMBOLS + args.overhead_factor as usize) * (partial_ch_cap + 4);
+    let symbol_pool = make_pool(n_symbol_allocs, SymbolBuffer::new);
 
     let input_size = std::fs::metadata(&args.input)?.len();
     let num_blocks = div_ceil(input_size, BLOCK_SIZE as u64);
 
     let (input_tx, input_rx) = mpsc::channel(4);
-    let (packet_tx, packet_rx) = mpsc::channel(1024);
+    let (packet_tx, packet_rx) = mpsc::channel(packet_ch_cap);
     let (partial_tx, partial_rx) = mpsc::channel(16);
     let (complete_tx, complete_rx) = mpsc::channel(16);
 
     let block_pool2 = block_pool.clone();
+    let block_pool3 = block_pool.clone();
+    let block_pool4 = block_pool.clone();
     let symbol_pool2 = symbol_pool.clone();
     let symbol_pool3 = symbol_pool.clone();
     let symbol_pool4 = symbol_pool.clone();
+    let symbol_pool5 = symbol_pool.clone();
 
     let start = Instant::now();
     let t_read = std::thread::spawn(move || {
@@ -377,12 +398,12 @@ async fn main() -> Result<(), Error> {
     });
 
     let t_encode = spawn(encode_loop(input_rx, packet_tx, block_pool2, args.overhead_factor, symbol_pool2));
-    let t_decode = spawn(decode_loop(packet_rx, partial_tx, complete_tx, num_blocks as usize, symbol_pool));
+    let t_decode = spawn(decode_loop(packet_rx, partial_tx, complete_tx, num_blocks as usize, symbol_pool3, block_pool4));
     let t_partial = std::thread::spawn(move || {
-        tokio_uring::start(save_decoder(partial_rx, &args.partial, symbol_pool3))
+        tokio_uring::start(save_decoder(partial_rx, &args.partial, symbol_pool4))
     });
     let t_complete = std::thread::spawn(move || {
-        tokio_uring::start(save_output(complete_rx, args.output, input_size))
+        tokio_uring::start(save_output(complete_rx, args.output, input_size, block_pool3))
     });
 
     let mut ok = true;
@@ -397,7 +418,7 @@ async fn main() -> Result<(), Error> {
         println!("{elapsed:.2}s,  {:.2} MB/s", input_size as f64 / (MB as f64 * elapsed));
     }
 
-    std::mem::forget(symbol_pool4);
+    std::mem::forget(symbol_pool5);
 
     Ok(())
 }
