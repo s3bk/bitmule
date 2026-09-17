@@ -76,6 +76,3 @@ futures = "*"
 #strip = "symbols"
 debug = 1
 lto = "thin"
-
-[build]
-rustflags = ["--cfg", "tokio_unstable"]

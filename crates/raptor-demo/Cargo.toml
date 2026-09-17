@@ -18,4 +18,4 @@ xxhash-rust = { version = "*", features = ["xxh3"] }
 tokio-stream = "*"
 serde = { version = "*", featues = ["derive"] }
 serde_with = "*"
-console-subscriber = "*"
+crossbeam = "*"
