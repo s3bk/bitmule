@@ -10,10 +10,11 @@ use std::{collections::HashSet, io, path::{Path, PathBuf}};
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use raptorq::{Decoder, ObjectTransmissionInformation, SourceBlockDecoder, SourceBlockEncoder, SourceBlockEncodingPlan};
-use tokio::{select, spawn, sync::mpsc};
+use tokio::{select, spawn, sync::mpsc, time::Instant};
 use tokio_uring::fs::{File, OpenOptions};
-use anyhow::{Error, anyhow};
+use anyhow::{Error, anyhow, bail};
 use clap::Parser;
+use xxhash_rust::xxh3::xxh3_64;
 
 #[derive(Parser, Debug)]
 #[command(about = "RaptorQ block-fountain demo (encode -> lossy channel -> decode -> verify)")]
@@ -42,7 +43,8 @@ struct Cli {
 
 struct InputBlock {
     block_nr: u64,
-    data: Vec<u8>
+    data: Vec<u8>,
+    hash: u64,
 }
 
 async fn read_loop(input: PathBuf, input_size: u64, tx: mpsc::Sender<InputBlock>) -> Result<(), Error> {
@@ -56,7 +58,8 @@ async fn read_loop(input: PathBuf, input_size: u64, tx: mpsc::Sender<InputBlock>
         data.resize(size, 0);
         let (res, mut data) = file.read_at(data, offset).await;
         data.resize(BLOCK_SIZE, 0);
-        tx.send(InputBlock { block_nr: n, data }).await?;
+        let hash = block_hash(&data);
+        tx.send(InputBlock { block_nr: n, data, hash }).await?;
     }
     Ok(())
 }
@@ -66,12 +69,12 @@ async fn encode_loop(mut rx: mpsc::Receiver<InputBlock>, tx: mpsc::Sender<Packet
     let plan = SourceBlockEncodingPlan::generate(symbol_count as u16);
     let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE as u16, 0, 1, 1);
 
-    while let Some(input) = rx.recv().await {
-        let encoder = SourceBlockEncoder::with_encoding_plan(1, &config, &input.data, &plan);
-        let packets = encoder.repair_packets(0, 1);
+    while let Some(InputBlock { block_nr, data, hash }) = rx.recv().await {
+        let encoder = SourceBlockEncoder::with_encoding_plan(1, &config, &data, &plan);
+        let packets = encoder.repair_packets(0, N_SYMBOLS as u32);
 
         for data in packets {
-            tx.send(Packet { block_nr: input.block_nr, data  }).await?;
+            tx.send(Packet { block_nr, data, hash  }).await?;
         }
     }
 
@@ -85,9 +88,11 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
     let mut decoder = SourceBlockDecoder::new(1, &config, ELEMENTS);
     let mut last_block = 0;
     let mut block_complete = false;
-    let mut complete = HashSet::new();
+    let mut complete = HashSet::with_capacity(num_blocks);
+    let mut symbols = Vec::with_capacity(N_SYMBOLS);
 
-    while let Some(Packet { block_nr, data }) = rx.recv().await {
+    while let Some(Packet { block_nr, data, hash }) = rx.recv().await {
+        //println!("{block_nr}:{}", data.payload_id().encoding_symbol_id());
         if complete.contains(&block_nr) {
             continue;
         }
@@ -96,19 +101,30 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
                 partial_tx.send(PartialBlock { block_nr, decoder }).await?;
             }
             decoder = SourceBlockDecoder::new(1, &config, ELEMENTS);
+            symbols.clear();
         }
         last_block = block_nr;
-        if let Some(data) = decoder.decode(std::iter::once(data)) {
-            complet_tx.send(CompleteBlock { block_nr, data }).await?;
-            block_complete = true;
-            complete.insert(block_nr);
-            if complete.len() == num_blocks {
-                break;
+        symbols.push(data);
+        if symbols.len() >= N_SYMBOLS {
+            if let Some(data) = decoder.decode(symbols.iter().cloned()) {
+                if block_hash(&data) != hash {
+                    bail!("incorrect block {block_nr}");
+                }
+                complet_tx.send(CompleteBlock { block_nr, data }).await?;
+                block_complete = true;
+                complete.insert(block_nr);
+                if complete.len() == num_blocks {
+                    break;
+                }
             }
         }
     }
-    Ok(())
 
+    if complete.len() != num_blocks {
+        bail!("transfer incomplete {}/{}", complete.len(), num_blocks);
+    }
+
+    Ok(())
 }
 
 struct PartialBlock {
@@ -119,6 +135,10 @@ struct CompleteBlock {
     block_nr: u64,
     data: Vec<u8>,
 }
+fn block_hash(data: &[u8]) -> u64 {
+    assert_eq!(data.len(), BLOCK_SIZE);
+    xxh3_64(data)
+}
 
 async fn save_output(mut rx: mpsc::Receiver<CompleteBlock>, output_file: PathBuf, file_size: u64, ) -> Result<(), Error> {
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&output_file)?;
@@ -128,8 +148,12 @@ async fn save_output(mut rx: mpsc::Receiver<CompleteBlock>, output_file: PathBuf
     let mut pending = FuturesUnordered::new();
     loop {
         select!{
-            Some(CompleteBlock { block_nr, data }) = rx.recv(), if !rx.is_closed() => {
+            Some(CompleteBlock { block_nr, mut data }) = rx.recv(), if !rx.is_closed() => {
                 let pos = block_nr * BLOCK_SIZE as u64;
+                let remaining = file_size - pos;
+                if remaining < BLOCK_SIZE as u64 {
+                    data.truncate(remaining as usize);
+                }
                 pending.push(file.write_all_at(data, pos).map(move |r| (block_nr, r)));
             }
             Some((block_nr, (r, buf))) = pending.next(), if !pending.is_empty() => {
@@ -143,6 +167,7 @@ async fn save_output(mut rx: mpsc::Receiver<CompleteBlock>, output_file: PathBuf
             }
         }
     }
+
     Ok(())
 }
 
@@ -181,6 +206,7 @@ async fn save_decoder(mut rx: mpsc::Receiver<PartialBlock>, dir: &Path) -> Resul
 struct Packet {
     block_nr: u64,
     data: raptorq::EncodingPacket,
+    hash: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -196,6 +222,7 @@ async fn main() -> Result<(), Error> {
     let (partial_tx, partial_rx) = mpsc::channel(16);
     let (complete_tx, complete_rx) = mpsc::channel(16);
 
+    let start = Instant::now();
     let t_read = std::thread::spawn(move || {
         tokio_uring::start(read_loop(args.input, input_size, input_tx))
     });
@@ -214,6 +241,9 @@ async fn main() -> Result<(), Error> {
     t_complete.join().unwrap()?;
     t_encode.await??;
     t_read.join().unwrap()?;
+
+    let elapsed = start.elapsed().as_secs_f64();
+    println!("{elapsed:.2}s,  {:.2} MB/s", input_size as f64 / (MB as f64 * elapsed));
 
     Ok(())
 }

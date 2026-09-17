@@ -9,8 +9,9 @@ repository.workspace = true
 [dependencies]
 raptorq = { path = "../../../raptorq", features = ["serde_support"] }
 tokio-uring = { version = "0.5.0" }
-tokio = { version = "*", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "*", features = ["macros", "rt-multi-thread", "time"] }
 anyhow = "*"
 clap = { version = "*", features = ["derive"] }
 postcard = { version = "*", features = ["use-std"] }
 futures = "*"
+xxhash-rust = { version = "*", features = ["xxh3"] }
