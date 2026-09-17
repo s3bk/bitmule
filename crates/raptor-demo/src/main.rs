@@ -133,6 +133,7 @@ struct InputBlock {
 async fn read_loop(input: PathBuf, input_size: u64, tx: mpsc::Sender<InputBlock>, mut buffer_rx: mpsc::Receiver<BlockBuffer>) -> Result<(), Error> {
     let file = File::open(&input).await?;
     let n_blocks = div_ceil(input_size, BLOCK_SIZE as u64);
+    dbg!(n_blocks);
 
     // TODO: fetch a few in parallel using FututesOrdered
     for n in 0 .. n_blocks {
@@ -153,16 +154,15 @@ async fn read_loop(input: PathBuf, input_size: u64, tx: mpsc::Sender<InputBlock>
     Ok(())
 }
 
-async fn encode_loop(mut rx: mpsc::Receiver<InputBlock>, tx: mpsc::Sender<Packet>, buffer_tx: mpsc::Sender<BlockBuffer>) -> Result<(), Error> {
-    let symbol_count = div_ceil(BLOCK_SIZE, SYMBOL_SIZE);
-    let plan = SourceBlockEncodingPlan::generate(symbol_count as u16);
+async fn encode_loop(mut rx: mpsc::Receiver<InputBlock>, tx: mpsc::Sender<Packet>, buffer_tx: mpsc::Sender<BlockBuffer>, overhead: u32) -> Result<(), Error> {
+    let plan = SourceBlockEncodingPlan::generate(N_SYMBOLS as u16);
     let config = ObjectTransmissionInformation::new(0, SYMBOL_SIZE as u16, 0, 1, 1);
 
     while let Some(InputBlock { block_nr, data, hash }) = rx.recv().await {
         let encoder = SourceBlockEncoder::with_encoding_plan(1, &config, &*data, &plan);
-        buffer_tx.send(data).await?;
+        let _ = buffer_tx.send(data).await;
 
-        let packets = encoder.repair_packets(0, N_SYMBOLS as u32);
+        let packets = encoder.repair_packets(0, N_SYMBOLS as u32 + overhead);
 
         for data in packets {
             tx.send(Packet { block_nr, data, hash  }).await?;
@@ -183,7 +183,7 @@ async fn decode_loop(mut rx: mpsc::Receiver<Packet>, partial_tx: mpsc::Sender<Pa
     let mut complete = HashSet::with_capacity(num_blocks);
 
     while let Some(Packet { block_nr, data, hash }) = rx.recv().await {
-        println!("{block_nr}:{}", data.payload_id().encoding_symbol_id());
+        //println!("{block_nr}:{}", data.payload_id().encoding_symbol_id());
         if complete.contains(&block_nr) {
             continue;
         }
@@ -327,7 +327,7 @@ async fn main() -> Result<(), Error> {
         tokio_uring::start(read_loop(args.input, input_size, input_tx, input_buffers_rx))
     });
 
-    let t_encode = spawn(encode_loop(input_rx, packet_tx, input_buffers_tx));
+    let t_encode = spawn(encode_loop(input_rx, packet_tx, input_buffers_tx, args.overhead_factor));
     let t_decode = spawn(decode_loop(packet_rx, partial_tx, complete_tx, num_blocks as usize));
     let t_partial = std::thread::spawn(move || {
         tokio_uring::start(save_decoder(partial_rx, &args.partial))
