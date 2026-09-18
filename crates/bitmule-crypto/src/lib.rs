@@ -23,7 +23,7 @@
 //! Same protection covers server-stored relay chunks.
 
 use anyhow::{anyhow, bail, Context, Result};
-use aes_gcm::{aead::Aead, AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
+use aes_gcm::{aead::{Aead, AeadInPlace}, AeadCore, Aes256Gcm, Key, KeyInit, Nonce, Tag};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
@@ -415,6 +415,34 @@ impl BulkKey {
             .decrypt(Nonce::from_slice(&nonce), ciphertext)
             .map_err(|e| anyhow!("decrypt_chunk {idx}: {e}"))
     }
+
+    /// In-place AEAD-encrypt `buf` under B with the deterministic chunk-index
+    /// nonce. Overwrites `buf` with ciphertext; returns the 16-byte AEAD tag
+    /// separately (detached). For streaming sender pipelines that read buffers
+    /// off disk and encrypt on the fly with no per-chunk Vec allocation.
+    ///
+    /// To interop with the non-in-place path (`decrypt_chunk`), the caller
+    /// treats the wire form as `buf || tag` (concatenate the detached tag
+    /// to the encrypted buffer).
+    pub fn encrypt_chunk_in_place(&self, idx: u64, buf: &mut [u8]) -> Result<[u8; 16]> {
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
+        let nonce = Self::chunk_nonce(idx);
+        let tag: Tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], buf)
+            .map_err(|e| anyhow!("encrypt_chunk_in_place {idx}: {e}"))?;
+        Ok(tag.into())
+    }
+
+    /// Const-generic fixed-size variant of `encrypt_chunk_in_place`. For
+    /// callsites that operate on known-size chunks (page/block-sized pipeline
+    /// buffers). Same detached-tag semantics.
+    pub fn encrypt_chunk_array_in_place<const N: usize>(
+        &self,
+        idx: u64,
+        buf: &mut [u8; N],
+    ) -> Result<[u8; 16]> {
+        self.encrypt_chunk_in_place(idx, buf.as_mut_slice())
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +469,47 @@ mod tests {
         let (nonce, ct) = wk.wrap_bulk_key(&b).unwrap();
         let unwrapped = wk.unwrap_bulk_key(&nonce, &ct).unwrap();
         assert_eq!(unwrapped.0, orig);
+    }
+
+    #[test]
+    fn chunk_in_place_roundtrip_matches_vec_path() {
+        let b = BulkKey::random();
+        let pt = b"the quick brown fox jumps over the lazy dog";
+        for idx in [0u64, 1, 42, u32::MAX as u64, u64::MAX / 2] {
+            let mut buf = pt.to_vec();
+            let tag = b.encrypt_chunk_in_place(idx, &mut buf).unwrap();
+            // wire form = buf || tag, must decrypt-round-trip via the Vec path
+            let mut wire = buf.clone();
+            wire.extend_from_slice(&tag);
+            let dec = b.decrypt_chunk(idx, &wire).unwrap();
+            assert_eq!(dec, pt);
+            // wrong index must fail (authenticated encryption)
+            let wrong = b.decrypt_chunk(idx.wrapping_add(1), &wire);
+            assert!(wrong.is_err());
+            // tampering with the buf portion must fail
+            let mut tampered = wire.clone();
+            tampered[0] ^= 0x01;
+            assert!(b.decrypt_chunk(idx, &tampered).is_err());
+        }
+    }
+
+    #[test]
+    fn chunk_array_in_place_roundtrip_matches_slice_path() {
+        let b = BulkKey::random();
+        // Fixed-size buffer, typical of a page-sized pipeline chunk.
+        const CHUNK: usize = 32;
+        let pt: [u8; CHUNK] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ];
+        let mut buf = pt;
+        let tag = b.encrypt_chunk_array_in_place::<CHUNK>(7, &mut buf).unwrap();
+        assert_ne!(buf, pt, "buffer must be transformed, not left as plaintext");
+        // wire form same as the slice variant
+        let mut wire = buf.to_vec();
+        wire.extend_from_slice(&tag);
+        let dec = b.decrypt_chunk(7, &wire).unwrap();
+        assert_eq!(dec, pt.to_vec());
     }
 
     #[test]
