@@ -21,6 +21,21 @@ fn concat_arrays<const N: usize, const M: usize, const O: usize>(a: &[u8; N], b:
     res
 }
 
+fn concat3<const N: usize, const M: usize, const P: usize, const O: usize>(
+    a: &[u8; N],
+    b: &[u8; M],
+    c: &[u8; P],
+) -> [u8; O] {
+    if N + M + P != O {
+        panic!("lengths don't match");
+    }
+    let mut res = [0u8; O];
+    res[..N].copy_from_slice(a);
+    res[N..N + M].copy_from_slice(b);
+    res[N + M..].copy_from_slice(c);
+    res
+}
+
 pub enum Error {
     Serde(postcard::Error),
     Crypto(aead::Error),
@@ -255,15 +270,13 @@ pub fn derive_session_key(
     // DH3 is symmetric on both sides: DH(EK_A_priv, EK_B_pub) = DH(EK_B_priv, EK_A_pub)
     let dh3: [u8; 32] = my_ek.secret.diffie_hellman(peer_ek_pub).to_bytes();
 
-    let mut ikm = [0u8; 96];
-    ikm[0..32].copy_from_slice(&dh1);
-    ikm[32..64].copy_from_slice(&dh2);
-    ikm[64..96].copy_from_slice(&dh3);
+    let ikm: [u8; 96] = concat3(&dh1, &dh2, &dh3);
 
-    let mut info = Vec::with_capacity(26 + 32 + 32);
-    info.extend_from_slice(b"bitmule-p2p session-key v1");
-    info.extend_from_slice(ik_a_pub.as_bytes());
-    info.extend_from_slice(ik_b_pub.as_bytes());
+    let info: [u8; 26 + 32 + 32] = concat3(
+        b"bitmule-p2p session-key v1",
+        ik_a_pub.as_bytes(),
+        ik_b_pub.as_bytes(),
+    );
 
     let hkdf = Hkdf::<Sha256>::new(Some(session_id.as_bytes()), &ikm);
     let mut key = [0u8; 32];
