@@ -378,35 +378,17 @@ pub enum StateError {
     InvalidTransition,
 }
 
-/// One frame in the X3DH sub-protocol. Both `Init` and `Response` carry a
-/// single X25519 ephemeral public — the state machine derives the session
-/// key once it holds both peers' ephemerals + both peers' identities.
+/// Single-variant X3DH frame. Both peers unconditionally send their
+/// ephemeral pub as soon as they know the peer's IK (post-add_peer), then
+/// wait to receive the counterpart's frame. The key derivation is symmetric
+/// so whoever arrives first triggers the transition to Established — no
+/// initiator/responder role bookkeeping needed on the wire.
 ///
-/// Wire-shape: this enum is what a caller wraps in
-/// `Envelope<OuterKeyKind, X3DHFrame>` before sending; on the receive side
-/// the caller unwraps the outer envelope and hands the frame to
-/// [`PeerState::recv_x3dh`].
+/// Wire-shape: caller wraps in `Envelope<OuterKeyKind, X3DHFrame>` before
+/// sending; on receive side, unwraps and hands to [`PeerState::recv_x3dh`].
 #[derive(Debug, Clone, Copy)]
-pub enum X3DHFrame {
-    /// First move by whichever peer sends first. Carries own ephemeral pub.
-    Init { ephemeral_pub: [u8; 32] },
-    /// Reply from the responder side. Same shape — carries own ephemeral pub.
-    /// The `Init`/`Response` distinction on the wire is bookkeeping; the
-    /// key derivation is symmetric so both peers arrive at the same
-    /// `SessionKey` regardless of who sent which.
-    Response { ephemeral_pub: [u8; 32] },
-}
-
-impl X3DHFrame {
-    fn ephemeral_pub(&self) -> [u8; 32] {
-        match self {
-            X3DHFrame::Init { ephemeral_pub } => *ephemeral_pub,
-            X3DHFrame::Response { ephemeral_pub } => *ephemeral_pub,
-        }
-    }
-    fn is_init(&self) -> bool {
-        matches!(self, X3DHFrame::Init { .. })
-    }
+pub struct X3DHFrame {
+    pub ephemeral_pub: [u8; 32],
 }
 
 /// Initial state — this peer has its own identity keypair but no peer info
@@ -458,15 +440,17 @@ impl PeerState {
     /// Called after the server delivers PeerJoined/SessionJoined and the
     /// caller has MAC-verified `peer_ik_bytes` against the URL-fragment
     /// `ShareKey`. Generates this side's ephemeral and returns the
-    /// `X3DHFrame::Init` the caller should wrap in an outer envelope and
-    /// ship to the peer.
+    /// `X3DHFrame` (carrying own ephemeral pub) to wrap in an outer envelope
+    /// and ship to the peer. Both peers fire their frame unconditionally
+    /// on this transition; whoever's `recv_x3dh` fires first triggers
+    /// derivation on that side.
     pub fn add_peer(self, peer_ik_bytes: [u8; 32]) -> Result<(Self, X3DHFrame), StateError> {
         let old = match self {
             PeerState::KeyExchange(s) => s,
             _ => return Err(StateError::InvalidTransition),
         };
         let my_ek = EphemeralKeypair::generate();
-        let init_frame = X3DHFrame::Init {
+        let frame = X3DHFrame {
             ephemeral_pub: *my_ek.public.as_bytes(),
         };
         Ok((
@@ -475,27 +459,25 @@ impl PeerState {
                 my_ek,
                 peer_ik: PublicKey::from(peer_ik_bytes),
             }),
-            init_frame,
+            frame,
         ))
     }
 
     /// SessionKey → Established.
     ///
-    /// Called when the peer's `X3DHFrame` (Init or Response) arrives. Derives
-    /// the session_key via the 3-DH X3DH derivation. If the incoming frame
-    /// was `Init` (peer initiated + hasn't necessarily seen our Init yet),
-    /// returns an `X3DHFrame::Response` for the caller to send back —
-    /// harmless-if-redundant when both sides Init concurrently.
+    /// Called when the peer's `X3DHFrame` arrives. Derives the session_key
+    /// via the 3-DH X3DH derivation and transitions to Established. Nothing
+    /// to send back — both peers already sent their frames from `add_peer`.
     pub fn recv_x3dh(
         self,
         frame: X3DHFrame,
         session_id: &SessionId,
-    ) -> Result<(Self, Option<X3DHFrame>), StateError> {
+    ) -> Result<Self, StateError> {
         let s = match self {
             PeerState::SessionKey(s) => s,
             _ => return Err(StateError::InvalidTransition),
         };
-        let peer_ek = PublicKey::from(frame.ephemeral_pub());
+        let peer_ek = PublicKey::from(frame.ephemeral_pub);
         let session_key = derive_session_key(
             &s.my_ik,
             &s.my_ek,
@@ -503,22 +485,12 @@ impl PeerState {
             &peer_ek,
             session_id,
         );
-        let outbound = if frame.is_init() {
-            Some(X3DHFrame::Response {
-                ephemeral_pub: *s.my_ek.public.as_bytes(),
-            })
-        } else {
-            None
-        };
-        Ok((
-            PeerState::Established(EstablishedState {
-                my_ik: s.my_ik,
-                peer_ik: s.peer_ik,
-                session_key,
-                send_counter: EnvelopeCounter::default(),
-                recv_counter: EnvelopeCounter::default(),
-            }),
-            outbound,
-        ))
+        Ok(PeerState::Established(EstablishedState {
+            my_ik: s.my_ik,
+            peer_ik: s.peer_ik,
+            session_key,
+            send_counter: EnvelopeCounter::default(),
+            recv_counter: EnvelopeCounter::default(),
+        }))
     }
 }
