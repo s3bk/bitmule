@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 
 use crate::SessionId;
 
-fn concat_arrays<const N: usize, const M: usize, const O: usize>(a: &[u8; N], b: &[u8; M]) -> [u8; O] {
+fn concat2<const N: usize, const M: usize, const O: usize>(a: &[u8; N], b: &[u8; M]) -> [u8; O] {
     if N + M != O {
         panic!("lengths don't match");
     }
@@ -133,7 +133,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
         // for its own AAD and needs the same value.
         counter.increment();
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.as_bytes());
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
@@ -160,7 +160,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key.0));
         let nonce = Nonce::from_slice(&self.nonce);
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &self.counter.to_le_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &self.counter.to_le_bytes());
 
         let plaintext = cipher.decrypt(nonce, Payload { msg: &self.data, aad: &aad })
             .map_err(Error::Crypto)?;
@@ -316,7 +316,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<InnerKeyKind, T> {
         // for its own AAD and needs the same value.
         counter.increment();
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.as_bytes());
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
@@ -342,7 +342,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<InnerKeyKind, T> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key.0));
         let nonce = Nonce::from_slice(&self.nonce);
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &self.counter.to_le_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &self.counter.to_le_bytes());
 
         let plaintext = cipher.decrypt(nonce, Payload { msg: &self.data, aad: &aad })
             .map_err(Error::Crypto)?;
