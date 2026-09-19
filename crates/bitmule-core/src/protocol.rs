@@ -190,7 +190,7 @@ use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::Envel
         SendTo {
             dest_id: ReceiverId,
             // encrypted with dest's public key and signed by senders public key
-            msg: Envelope<PeerToPeer>,
+            msg: Envelope<X3DH>,
         }
     }
     enum ServerToClient {
@@ -208,16 +208,20 @@ use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::Envel
             mac: SessionMac,
         },
         // someone sent us a message
-        Message {
+        X3DH {
             from: ReceiverId,
-            data: Envelope<PeerToPeer>,
+            data: Envelope<X3DH>,
+        },
+        PeerMessage {
+            from: ReceiverId,
+            data: Envelope<Peer2Peer>,
         }
     }
-    enum PeerToPeer {
+    enum X3DH {
         /// Initiator sends its X25519 ephemeral. Runs after the initiator
         /// has verified the counterpart's pub_key via `mac = HMAC(A, pub_key)`
         /// from PeerJoined — otherwise no point (nothing to bind identity to).
-        X3DHInit {
+        Init {
             ephemeral_pub: [u8; 32],
         },
 
@@ -234,20 +238,12 @@ use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::Envel
         /// The `IK_A_pub || IK_B_pub` binding in `info` is X3DH's "AD"
         /// (associated data) — prevents identity-key-substitution attacks
         /// where a third party swaps in different IKs but reuses ephemerals.
-        X3DHResponse {
+        Response {
             ephemeral_pub: [u8; 32],
-        },
-
-        /// Post-handshake app traffic. Nested Envelope sealed under
-        /// session_key (which has FS since it mixed both ephemerals) —
-        /// the outer Envelope<PeerToPeer> still uses static-key sealing,
-        /// this inner one adds FS on top.
-        App {
-            inner: Envelope<AppMessage>,
         },
     }
 
-    enum AppMessage {
+    enum Peer2Peer {
 
     }
 }

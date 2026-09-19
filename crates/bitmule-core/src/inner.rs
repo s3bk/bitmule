@@ -24,8 +24,11 @@ pub enum Error {
     Counter,
 }
 
+pub enum OuterKeyKind {}
+pub enum InnerKeyKind {}
 
-pub struct Envelope<T> {
+pub struct Envelope<KeyKind, T> {
+    _k: PhantomData<KeyKind>,
     _m: PhantomData<T>,
     counter: u32,
     nonce: [u8; 12], // EAED
@@ -84,7 +87,7 @@ impl EnvelopeCounter {
     }
 }
 
-impl<T: Serialize + DeserializeOwned> Envelope<T> {
+impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
     /// Seal `payload` under `key` with a fresh random nonce.
     /// `counter` should be monotonic per-key; caller tracks last-seen on
     /// the receive side and rejects non-monotonic envelopes as replays.
@@ -113,6 +116,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<T> {
         counter.increment();
 
         Ok(Envelope {
+            _k: PhantomData,
             _m: PhantomData,
             counter: counter.inner,
             nonce: nonce_bytes,
