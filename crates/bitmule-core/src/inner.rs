@@ -36,6 +36,7 @@ fn concat3<const N: usize, const M: usize, const P: usize, const O: usize>(
     res
 }
 
+#[derive(Debug)]
 pub enum Error {
     Serde(postcard::Error),
     Crypto(aead::Error),
@@ -127,12 +128,15 @@ impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
         let plaintext = postcard::to_stdvec(payload)
             .map_err(Error::Serde)?;
 
+        // Increment BEFORE computing AAD so the AAD matches the counter
+        // value we stamp into the envelope; open() reads envelope.counter
+        // for its own AAD and needs the same value.
+        counter.increment();
+
         let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
-
-        counter.increment();
 
         Ok(Envelope {
             _k: PhantomData,
@@ -307,12 +311,15 @@ impl<T: Serialize + DeserializeOwned> Envelope<InnerKeyKind, T> {
         let plaintext = postcard::to_stdvec(payload)
             .map_err(Error::Serde)?;
 
+        // Increment BEFORE computing AAD so the AAD matches the counter
+        // value we stamp into the envelope; open() reads envelope.counter
+        // for its own AAD and needs the same value.
+        counter.increment();
+
         let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
-
-        counter.increment();
 
         Ok(Envelope {
             _k: PhantomData,
@@ -492,5 +499,100 @@ impl PeerState {
             send_counter: EnvelopeCounter::default(),
             recv_counter: EnvelopeCounter::default(),
         }))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Simulate two peers running the full state machine and verify they
+    /// derive bit-identical session keys.
+    #[test]
+    fn two_peers_key_exchange() {
+        let session_id = SessionId([42u8; 32]);
+
+        let ik_a = IdentityKeypair::generate();
+        let ik_b = IdentityKeypair::generate();
+        let ik_a_pub_bytes = *ik_a.public.as_bytes();
+        let ik_b_pub_bytes = *ik_b.public.as_bytes();
+
+        // Both start in KeyExchange.
+        let state_a = PeerState::new(ik_a);
+        let state_b = PeerState::new(ik_b);
+
+        // Both add peer info, generating their ephemerals + X3DHFrames.
+        let (state_a, frame_a) = state_a.add_peer(ik_b_pub_bytes).unwrap();
+        let (state_b, frame_b) = state_b.add_peer(ik_a_pub_bytes).unwrap();
+
+        assert!(matches!(state_a, PeerState::SessionKey(_)));
+        assert!(matches!(state_b, PeerState::SessionKey(_)));
+
+        // Each receives the other's frame → Established.
+        let state_a = state_a.recv_x3dh(frame_b, &session_id).unwrap();
+        let state_b = state_b.recv_x3dh(frame_a, &session_id).unwrap();
+
+        let key_a = match state_a {
+            PeerState::Established(ref s) => s.session_key.0,
+            _ => panic!("A not Established"),
+        };
+        let key_b = match state_b {
+            PeerState::Established(ref s) => s.session_key.0,
+            _ => panic!("B not Established"),
+        };
+
+        assert_eq!(key_a, key_b, "both peers must derive identical session_key");
+    }
+
+    /// Full round-trip: complete X3DH, then A seals an app-level payload
+    /// under the derived session_key and B opens it via its own counter.
+    #[test]
+    fn round_trip_envelope_via_session_key() {
+        let session_id = SessionId([1u8; 32]);
+        let ik_a = IdentityKeypair::generate();
+        let ik_b = IdentityKeypair::generate();
+        let ik_a_pub = *ik_a.public.as_bytes();
+        let ik_b_pub = *ik_b.public.as_bytes();
+
+        let (a, frame_a) = PeerState::new(ik_a).add_peer(ik_b_pub).unwrap();
+        let (b, frame_b) = PeerState::new(ik_b).add_peer(ik_a_pub).unwrap();
+        let a = a.recv_x3dh(frame_b, &session_id).unwrap();
+        let b = b.recv_x3dh(frame_a, &session_id).unwrap();
+
+        let mut a_est = match a {
+            PeerState::Established(s) => s,
+            _ => panic!("A not Established"),
+        };
+        let mut b_est = match b {
+            PeerState::Established(s) => s,
+            _ => panic!("B not Established"),
+        };
+
+        let payload: u64 = 12345;
+        let env = Envelope::<InnerKeyKind, u64>::seal(
+            &payload,
+            &a_est.session_key,
+            &mut a_est.send_counter,
+            &session_id,
+        )
+        .unwrap();
+
+        let recovered = env
+            .open(&b_est.session_key, &session_id, &mut b_est.recv_counter)
+            .unwrap();
+        assert_eq!(recovered, 12345);
+    }
+
+    /// Attempting `recv_x3dh` before `add_peer` should reject with
+    /// InvalidTransition — you can't advance past KeyExchange without
+    /// setting peer info first.
+    #[test]
+    fn recv_before_add_peer_rejects() {
+        let session_id = SessionId([0u8; 32]);
+        let state = PeerState::new(IdentityKeypair::generate());
+        let bogus_frame = X3DHFrame { ephemeral_pub: [0u8; 32] };
+        let err = state.recv_x3dh(bogus_frame, &session_id);
+        assert!(matches!(err, Err(StateError::InvalidTransition)));
     }
 }
