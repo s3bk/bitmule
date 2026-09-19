@@ -294,7 +294,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<InnerKeyKind, T> {
         let plaintext = postcard::to_stdvec(payload)
             .map_err(Error::Serde)?;
 
-        let aad = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
@@ -322,7 +322,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<InnerKeyKind, T> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key.0));
         let nonce = Nonce::from_slice(&self.nonce);
 
-        let aad = concat_arrays(session_id.as_bytes(), &self.counter.to_le_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &self.counter.to_le_bytes());
 
         let plaintext = cipher.decrypt(nonce, Payload { msg: &self.data, aad: &aad })
             .map_err(Error::Crypto)?;
