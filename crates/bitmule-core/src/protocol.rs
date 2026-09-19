@@ -157,7 +157,7 @@ pub mod relay_frame {
 pub mod websocket {
     use bitflags::bitflags;
 
-use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::Envelope};
+use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Envelope, OuterKeyKind, InnerKeyKind}};
 
     bitflags! {
         pub struct PeerCaps: u8 {
@@ -190,7 +190,7 @@ use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::Envel
         SendTo {
             dest_id: ReceiverId,
             // encrypted with dest's public key and signed by senders public key
-            msg: Envelope<X3DH>,
+            msg: Envelope<OuterKeyKind, X3DH>,
         }
     }
     enum ServerToClient {
@@ -210,11 +210,11 @@ use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::Envel
         // someone sent us a message
         X3DH {
             from: ReceiverId,
-            data: Envelope<X3DH>,
+            data: Envelope<OuterKeyKind, X3DH>,
         },
         PeerMessage {
             from: ReceiverId,
-            data: Envelope<Peer2Peer>,
+            data: Envelope<InnerKeyKind, Peer2Peer>,
         }
     }
     enum X3DH {
