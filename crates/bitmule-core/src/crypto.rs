@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use crate::{Error, Result};
 use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
@@ -12,6 +14,8 @@ use sha2::Sha256;
 
 pub struct SessionKey(pub [u8; 32]);
 pub struct ContentKey(pub [u8; 32]);
+pub struct PublicKey(pub [u8; 32]);
+pub struct SessionMac(pub [u8; 32]);
 pub struct WrappedContentKey(pub Vec<u8>);
 
 /// X25519 key exchange for peer→peer session key agreement via signaling.
@@ -58,4 +62,3 @@ impl SessionKey {
             .map_err(|e| Error::Crypto(format!("decrypt: {e}")))
     }
 }
-

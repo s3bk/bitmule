@@ -27,6 +27,9 @@ impl SessionId {
     pub fn as_hex(&self) -> String {
         hex::encode(self.0)
     }
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 
     pub fn from_hex(s: &str) -> Result<Self> {
         let v = hex::decode(s).map_err(|e| Error::Protocol(format!("session hex: {e}")))?;
@@ -149,4 +152,102 @@ pub mod relay_frame {
 
     pub type FrameSize = u16;
     pub const FRAME_SIZE_BYTES: usize = size_of::<FrameSize>();
+}
+
+pub mod websocket {
+    use bitflags::bitflags;
+
+use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::Envelope};
+
+    bitflags! {
+        pub struct PeerCaps: u8 {
+            const RELAY = 1;
+            const WEBRTC = 2;
+        }
+    }
+
+    // wire-version part of the url
+    // session-id part of URL
+    // pow part of URL
+    // pow difficulto obtained via GET before connecting
+    enum ClientToServer {
+        /*
+         * server stores public-keys of session creator
+         * and sends it to joining peers
+         */
+        CreateSession {
+            id: ReceiverId,
+            capabilities: PeerCaps,
+            pub_key: PublicKey,
+            mac: SessionMac,
+        },
+        JoinSession {
+            id: ReceiverId,
+            capabilities: PeerCaps,
+            pub_key: PublicKey,
+            mac: SessionMac,
+        },
+        SendTo {
+            dest_id: ReceiverId,
+            // encrypted with dest's public key and signed by senders public key
+            msg: Envelope<PeerToPeer>,
+        }
+    }
+    enum ServerToClient {
+        SessionCreated,
+        // we just joined a session, here is the info of the session owner
+        SessionJoined {
+            sender_id: ReceiverId,
+            sender_pub_key: PublicKey,
+            sender_mac: SessionMac,
+        },
+        // a peer has joined a session that we created
+        PeerJoined {
+            id: ReceiverId,
+            pub_key: PublicKey,
+            mac: SessionMac,
+        },
+        // someone sent us a message
+        Message {
+            from: ReceiverId,
+            data: Envelope<PeerToPeer>,
+        }
+    }
+    enum PeerToPeer {
+        /// Initiator sends its X25519 ephemeral. Runs after the initiator
+        /// has verified the counterpart's pub_key via `mac = HMAC(A, pub_key)`
+        /// from PeerJoined — otherwise no point (nothing to bind identity to).
+        X3DHInit {
+            ephemeral_pub: [u8; 32],
+        },
+
+        /// Responder sends its X25519 ephemeral. Both sides now hold
+        /// (IK_A, IK_B, EK_A, EK_B) and derive:
+        ///   DH1 = DH(IK_a_priv, EK_b_pub)   // static-a × ephemeral-b
+        ///   DH2 = DH(EK_a_priv, IK_b_pub)   // ephemeral-a × static-b
+        ///   DH3 = DH(EK_a_priv, EK_b_pub)   // ephemeral-a × ephemeral-b
+        ///   session_key = HKDF-SHA256(
+        ///       ikm  = DH1 || DH2 || DH3,
+        ///       salt = session_id,
+        ///       info = b"bitmule-p2p session-key v1" || IK_A_pub || IK_B_pub,
+        ///   )
+        /// The `IK_A_pub || IK_B_pub` binding in `info` is X3DH's "AD"
+        /// (associated data) — prevents identity-key-substitution attacks
+        /// where a third party swaps in different IKs but reuses ephemerals.
+        X3DHResponse {
+            ephemeral_pub: [u8; 32],
+        },
+
+        /// Post-handshake app traffic. Nested Envelope sealed under
+        /// session_key (which has FS since it mixed both ephemerals) —
+        /// the outer Envelope<PeerToPeer> still uses static-key sealing,
+        /// this inner one adds FS on top.
+        App {
+            inner: Envelope<AppMessage>,
+        },
+    }
+
+    enum AppMessage {
+
+    }
 }
