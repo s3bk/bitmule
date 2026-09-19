@@ -10,8 +10,11 @@ use std::marker::PhantomData;
 
 use crate::SessionId;
 
-fn concat_arrays<const N: usize, const M: usize>(a: &[u8; N], b: &[u8; M]) -> [u8; N + M] {
-    let mut res = [0u8; N + M];
+fn concat_arrays<const N: usize, const M: usize, const O: usize>(a: &[u8; N], b: &[u8; M]) -> [u8; O] {
+    if N + M != O {
+        panic!("lengths don't match");
+    }
+    let mut res = [0u8; O];
     let (left, right) = res.split_at_mut(N);
     left.copy_from_slice(a);
     right.copy_from_slice(b);
@@ -79,6 +82,7 @@ pub struct EnvelopeCounter {
     inner: u32,
 }
 impl EnvelopeCounter {
+    pub const SIZE: usize = 4;
     fn as_bytes(&self) -> [u8; 4] {
         self.inner.to_le_bytes()
     }
@@ -108,7 +112,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
         let plaintext = postcard::to_stdvec(payload)
             .map_err(Error::Serde)?;
 
-        let aad = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &counter.as_bytes());
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
@@ -137,7 +141,7 @@ impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key.0));
         let nonce = Nonce::from_slice(&self.nonce);
 
-        let aad = concat_arrays(session_id.as_bytes(), &self.counter.to_le_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat_arrays(session_id.as_bytes(), &self.counter.to_le_bytes());
 
         let plaintext = cipher.decrypt(nonce, Payload { msg: &self.data, aad: &aad })
             .map_err(Error::Crypto)?;

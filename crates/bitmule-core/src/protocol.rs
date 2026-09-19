@@ -18,6 +18,7 @@ pub struct SessionId(pub [u8; 32]);
 pub struct ReceiverId(pub [u8; 32]);
 
 impl SessionId {
+    pub const SIZE: usize = 32;
     pub fn random() -> Self {
         let mut buf = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut buf);

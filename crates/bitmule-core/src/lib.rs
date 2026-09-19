@@ -2,7 +2,6 @@
 //!
 //! Designed to compile to both native (server, CLI) and wasm (browser).
 //! No I/O, no filesystem, no networking — those live in the caller.
-#![feature(generic_const_exprs)]
 
 pub mod manifest;
 pub mod chunk;
