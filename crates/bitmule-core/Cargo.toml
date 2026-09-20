@@ -30,3 +30,7 @@ bitflags = "*"
 aes-gcm = "0.10"
 zeroize = "1"
 postcard = { version = "1", features = ["use-std"] }
+bitmule-crypto = { path = "../bitmule-crypto" }
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+zip = { workspace = true }
+tempfile = "3"

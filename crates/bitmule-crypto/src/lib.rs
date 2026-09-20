@@ -179,6 +179,25 @@ impl CommitmentHasher {
     }
 }
 
+/// Stream a reader through a CommitmentHasher and fold in the bulk key.
+/// 64 KiB chunks; the whole payload is never held in memory. Shared by
+/// TransferBuilder (bitmule-core) and the native/mobile clients so the
+/// hashing recipe stays in one place.
+pub async fn commit_reader<R>(reader: &mut R, bulk_key: &BulkKey) -> Result<[u8; 32]>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut hasher = CommitmentHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await.context("commit_reader read")?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize(bulk_key))
+}
+
 /// Local half of the ephemeral X25519 pair, consumed on `derive_shared_key`.
 /// Wraps `EphemeralSecret` from `x25519-dalek` so callers can't accidentally
 /// use it twice — the derivation call moves the secret in.

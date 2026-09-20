@@ -159,6 +159,7 @@ pub mod websocket {
     use bitflags::bitflags;
     use bytes::Bytes;
 
+    use bitmule_crypto::BulkKey;
     use crate::{ContentKey, ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
 
     bitflags! {
@@ -272,11 +273,14 @@ pub mod websocket {
         // receiver has completed the transfer (and will exit)
         Complete,
     }
+    /// WebRTC session description, offer half. Wire form is the standard
+    /// SDP text blob (RFC 8866). The offer/answer distinction is carried
+    /// by the enum variant, so we don't repeat a `type` field inside.
     struct SdpOffer {
-        // fill in
+        sdp: String,
     }
     struct SdpAnswer {
-        // fill in
+        sdp: String,
     }
 
 
@@ -284,9 +288,9 @@ pub mod websocket {
         pub transfer_typ: TransferType,
         pub block_size: u32,
         pub transfer_size: u64,
-        pub bulk_key: ContentKey,
+        pub bulk_key: BulkKey,
     }
-    enum TransferType {
+    pub enum TransferType {
         SingleFile {
             compression: Option<Compression>,
         },
@@ -294,11 +298,11 @@ pub mod websocket {
             outer_compression: Option<Compression>,
         },
     }
-    struct FileMeta {
-        file_name: Option<String>,
-        file_size: u64, // uncompressed file size
+    pub struct FileMeta {
+        pub file_name: Option<String>,
+        pub file_size: u64, // uncompressed file size
     }
-    enum Compression {
+    pub enum Compression {
         Brotli,
         Zstd,
     }
