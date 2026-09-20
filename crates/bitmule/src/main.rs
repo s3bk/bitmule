@@ -634,10 +634,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn prepare_and_spawn_send_roundtrip() -> Result<()> {
         // --- server bring-up (same axum::Router shape as bitmule-server main) ---
-        let server_data_dir = tempfile::tempdir()?;
-        let store: Arc<dyn ChunkStore> =
-            Arc::new(FsChunkStore::new(server_data_dir.path()));
-        let state = AppState::new(store);
+        let state = AppState::new();
         let app = axum::Router::new()
             .route("/ws/:session", axum::routing::get(ws_join_session))
             .route(

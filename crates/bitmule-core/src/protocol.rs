@@ -157,8 +157,9 @@ pub mod relay_frame {
 
 pub mod websocket {
     use bitflags::bitflags;
+    use bytes::Bytes;
 
-use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Envelope, OuterKeyKind, InnerKeyKind}};
+    use crate::{ContentKey, ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
 
     bitflags! {
         pub struct PeerCaps: u8 {
@@ -173,9 +174,9 @@ use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Enve
     // pow difficulto obtained via GET before connecting
     enum ClientToServer {
         /*
-         * server stores public-keys of session creator
-         * and sends it to joining peers
-         */
+            * server stores public-keys of session creator
+            * and sends it to joining peers
+            */
         CreateSession {
             id: ReceiverId,
             capabilities: PeerCaps,
@@ -245,6 +246,60 @@ use crate::{ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Enve
     }
 
     enum Peer2Peer {
+        // turn into proper struct
+        IceCandidate(String),
+        SdpOffer(SdpOffer),
+        SdpAnswer(SdpAnswer),
 
+        // sender sends this to all connecting receivers
+        // inform the receiver what to expect
+        Manifest(TransferManifest),
+
+        // receivers send this to the sender
+        // request the given range of the data
+        Get { start: u64, end: u64 },
+
+        // sender -> client
+        // to the facilitate the transfer of small fires via websocket
+        InlineData {
+            start: u64,
+            data: Bytes,
+        },
+
+        // sender informs the client to fetch data via relay
+        JoinRelay,
+
+        // receiver has completed the transfer (and will exit)
+        Complete,
+    }
+    struct SdpOffer {
+        // fill in
+    }
+    struct SdpAnswer {
+        // fill in
+    }
+
+
+    pub struct TransferManifest {
+        pub transfer_typ: TransferType,
+        pub block_size: u32,
+        pub transfer_size: u64,
+        pub bulk_key: ContentKey,
+    }
+    enum TransferType {
+        SingleFile {
+            compression: Option<Compression>,
+        },
+        MultiFileZip {
+            outer_compression: Option<Compression>,
+        },
+    }
+    struct FileMeta {
+        file_name: Option<String>,
+        file_size: u64, // uncompressed file size
+    }
+    enum Compression {
+        Brotli,
+        Zstd,
     }
 }

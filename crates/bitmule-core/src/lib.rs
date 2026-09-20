@@ -10,6 +10,7 @@ pub mod protocol;
 pub mod traits;
 pub mod pow;
 pub mod inner;
+pub mod transfer;
 
 use std::ops;
 
