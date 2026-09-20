@@ -120,81 +120,64 @@ async fn single_file_commit(storage: &Storage, bulk_key: &BulkKey) -> anyhow::Re
     }
 }
 
-/// Build a zip of every file in `files` into a temp file, then stream that
-/// temp file through the CommitmentHasher. Returns (zip_size, commitment).
+/// Build a zip of every file in `files` via `async_zip` into a temp file,
+/// then stream that temp file through the CommitmentHasher. Returns
+/// (zip_size, commitment).
 ///
 /// Design notes:
-/// - `zip` crate v2 is blocking; we run the build inside `spawn_blocking`
-///   so the async runtime isn't stalled by disk I/O.
-/// - `outer_compression: None` at the manifest level means we tell the zip
-///   crate to Stored (no compression) — the AEAD wrapper downstream would
-///   defeat compression anyway.
-/// - Every `FileEntry` becomes one zip entry, name = entry.name or a
-///   synthesized `file_<idx>` fallback.
+/// - `async_zip` (0.0.19) has a wasm-compatible core, so this path stays
+///   usable in the browser once we wire it there.
+/// - Compression = Stored: AEAD downstream defeats it anyway.
+/// - Entry name = `entry.name` file_name, or `file_<idx>` fallback.
 async fn zip_and_commit(
     files: &[FileEntry],
     bulk_key: &BulkKey,
 ) -> anyhow::Result<(u64, [u8; 32])> {
+    use async_zip::base::write::ZipFileWriter;
+    use async_zip::{Compression, ZipEntryBuilder};
+    use futures_lite::io::AsyncWriteExt as _;
     use tokio::io::AsyncReadExt;
-
-    // Snapshot the file list into an owned form we can move into spawn_blocking.
-    // Storage::Bytes clones cheaply (Bytes is Arc'd); Storage::File is a path.
-    let snapshots: Vec<(String, Storage)> = files
-        .iter()
-        .enumerate()
-        .map(|(idx, e)| {
-            let name = e
-                .name
-                .as_ref()
-                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| format!("file_{idx}"));
-            let storage = match &e.storage {
-                Storage::File(p) => Storage::File(p.clone()),
-                Storage::Bytes(b) => Storage::Bytes(b.clone()),
-            };
-            (name, storage)
-        })
-        .collect();
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
 
     let tmp = tempfile::NamedTempFile::new()?;
     let tmp_path = tmp.path().to_path_buf();
+    let out = tokio::fs::File::create(&tmp_path).await?;
+    let mut writer = ZipFileWriter::new(out.compat_write());
 
-    // Build the zip synchronously off the async runtime.
-    let zip_size: u64 = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        use std::io::{Read, Write};
-        use zip::write::SimpleFileOptions;
+    for (idx, entry) in files.iter().enumerate() {
+        let name = entry
+            .name
+            .as_ref()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| format!("file_{idx}"));
+        let builder = ZipEntryBuilder::new(name.into(), Compression::Stored);
 
-        let out = std::fs::File::create(&tmp_path)?;
-        let mut zw = zip::ZipWriter::new(out);
-        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-
-        for (name, storage) in snapshots {
-            zw.start_file(name, opts)?;
-            match storage {
-                Storage::File(path) => {
-                    let mut f = std::fs::File::open(&path)?;
-                    let mut buf = vec![0u8; 64 * 1024];
-                    loop {
-                        let n = f.read(&mut buf)?;
-                        if n == 0 { break; }
-                        zw.write_all(&buf[..n])?;
-                    }
+        match &entry.storage {
+            Storage::File(path) => {
+                // Stream file → zip entry in 64 KiB chunks; whole file never
+                // held in memory.
+                let mut src = tokio::fs::File::open(path).await?;
+                let mut stream = writer.write_entry_stream(builder).await?;
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    let n = src.read(&mut buf).await?;
+                    if n == 0 { break; }
+                    stream.write_all(&buf[..n]).await?;
                 }
-                Storage::Bytes(b) => {
-                    zw.write_all(&b)?;
-                }
+                stream.close().await?;
+            }
+            Storage::Bytes(b) => {
+                writer.write_entry_whole(builder, b).await?;
             }
         }
-        zw.finish()?;
-        let size = std::fs::metadata(&tmp_path)?.len();
-        Ok(size)
-    })
-    .await??;
+    }
+    writer.close().await?;
+
+    let zip_size = tokio::fs::metadata(&tmp_path).await?.len();
 
     // Stream the built zip through CommitmentHasher.
     let mut f = tokio::fs::File::open(tmp.path()).await?;
     let commit = commit_reader(&mut f, bulk_key).await?;
-    // tmp drops here → file removed.
     drop(tmp);
 
     Ok((zip_size, commit))

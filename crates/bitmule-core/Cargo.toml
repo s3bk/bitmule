@@ -32,5 +32,7 @@ zeroize = "1"
 postcard = { version = "1", features = ["use-std"] }
 bitmule-crypto = { path = "../bitmule-crypto" }
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
-zip = { workspace = true }
+async_zip = { version = "0.0.19", features = ["tokio", "deflate"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures-lite = "2"
 tempfile = "3"
