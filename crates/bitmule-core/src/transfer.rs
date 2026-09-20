@@ -129,6 +129,12 @@ async fn single_file_commit(storage: &Storage, bulk_key: &BulkKey) -> anyhow::Re
 ///   usable in the browser once we wire it there.
 /// - Compression = Stored: AEAD downstream defeats it anyway.
 /// - Entry name = `entry.name` file_name, or `file_<idx>` fallback.
+///
+/// TODO(wasm): tempfile is native-only. For the browser build the temp
+/// staging should live on OPFS via StorageManager.getDirectory() →
+/// getFileHandle({create:true}) → FileSystemSyncAccessHandle inside a
+/// web worker (sync access handle is worker-scope only per MDN). Design
+/// the abstraction when we wire the wasm side, not before.
 async fn zip_and_commit(
     files: &[FileEntry],
     bulk_key: &BulkKey,
