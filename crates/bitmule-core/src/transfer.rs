@@ -440,4 +440,186 @@ mod opfs {
         }
         async fn drop_tmp_file(&self, file: Self::TempFile);
     }
+
+    // ─── AsyncWrite adapter for FileSystemWritableFileStream ──────────────
+    // Wraps an FSWFS in the async_zip-compatible AsyncWrite surface (the
+    // `futures_lite::io::AsyncWrite` variant, matching what the zip writer
+    // consumes on both native and wasm sides).
+    //
+    // Design:
+    //   - Every poll_write copies `buf` into a fresh Uint8Array and hands
+    //     it to `stream.write_with_u8_array(...)`. The returned Promise is
+    //     stored as a JsFuture in `in_flight` and the byte count is
+    //     latched in `in_flight_bytes` so a later poll can return the
+    //     right Ready(n).
+    //   - Subsequent poll_write / poll_flush / poll_close first drain the
+    //     in-flight promise (if any) before issuing a new one. Serialised
+    //     one-in-flight; matches FSWFS's own contract (writes queue on the
+    //     stream anyway, so overlapping poll_writes would just serialise
+    //     underneath us with no throughput gain).
+    //   - poll_close issues stream.close() as the final promise and holds
+    //     `closed = true` so re-polling after Ready(Ok(())) is a no-op.
+    //
+    // Not concurrency-safe (single-owner future by design). Errors from JS
+    // map to std::io::Error{Other, format!("{:?}", e)} — good enough for
+    // async_zip's error surface; refine if we start seeing specific JS
+    // exception shapes we want to disambiguate.
+    //
+    // Kenna 2026-09-21, per Seb's ask.
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use js_sys::{wasm_bindgen::JsCast, Uint8Array};
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::FileSystemWritableFileStream;
+
+    pub struct OpfsWritable {
+        stream: FileSystemWritableFileStream,
+        in_flight: Option<JsFuture>,
+        in_flight_bytes: usize,
+        closed: bool,
+    }
+
+    impl OpfsWritable {
+        pub fn new(stream: FileSystemWritableFileStream) -> Self {
+            Self {
+                stream,
+                in_flight: None,
+                in_flight_bytes: 0,
+                closed: false,
+            }
+        }
+
+        // Poll the currently-in-flight JsFuture. On Ready, clear it and
+        // return the pre-latched byte count (or Ok(()) if the caller
+        // doesn't need the byte count, per the `wants_bytes` flag).
+        fn poll_inflight(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            wants_bytes: bool,
+        ) -> Poll<io::Result<usize>> {
+            // Safety: we only project `in_flight`; the struct is not
+            // structurally pinned (JsFuture is Unpin).
+            let this = unsafe { self.get_unchecked_mut() };
+            match this.in_flight.as_mut() {
+                None => Poll::Ready(Ok(0)),
+                Some(fut) => match Pin::new(fut).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(_)) => {
+                        let n = if wants_bytes { this.in_flight_bytes } else { 0 };
+                        this.in_flight = None;
+                        this.in_flight_bytes = 0;
+                        Poll::Ready(Ok(n))
+                    }
+                    Poll::Ready(Err(e)) => {
+                        this.in_flight = None;
+                        this.in_flight_bytes = 0;
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("opfs write: {e:?}"),
+                        )))
+                    }
+                },
+            }
+        }
+    }
+
+    impl AsyncWrite for OpfsWritable {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            // Drain any prior write first (returns the earlier buf's byte
+            // count via the wants_bytes=true path).
+            if self.in_flight.is_some() {
+                match self.as_mut().poll_inflight(cx, true) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n)),
+                }
+            }
+            if self.closed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "opfs write on closed stream",
+                )));
+            }
+
+            // Start a new write. Copy `buf` into a Uint8Array so JS owns
+            // the bytes independent of our stack.
+            let arr = Uint8Array::new_with_length(buf.len() as u32);
+            arr.copy_from(buf);
+            let promise = match self
+                .stream
+                .write_with_u8_array(&mut arr.to_vec()[..])
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("opfs write init: {e:?}"),
+                    )));
+                }
+            };
+            // Latch byte count + stash the JsFuture, then Pending. The
+            // executor re-polls; next poll drains the future and returns
+            // Ready(Ok(n)).
+            let this = unsafe { self.get_unchecked_mut() };
+            this.in_flight_bytes = buf.len();
+            this.in_flight = Some(JsFuture::from(promise));
+            // Wake immediately so the executor calls us back without
+            // waiting for the promise resolution to fire the waker (which
+            // it will do too; belt-and-suspenders).
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            // Drain any in-flight write; no new-op needed since FSWFS
+            // serialises writes on its own queue.
+            match self.as_mut().poll_inflight(cx, false) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            }
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            // Two phases:
+            //   1. Drain any pending write.
+            //   2. Issue stream.close() and await its promise.
+            // We use the `closed` flag to route between phases: false =
+            // still in phase 1 (may start close after drain); true = close
+            // promise already in flight.
+            if !self.closed {
+                if self.in_flight.is_some() {
+                    match self.as_mut().poll_inflight(cx, false) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Ready(Ok(_)) => { /* fall through to issue close */ }
+                    }
+                }
+                // Nothing else in flight; fire close().
+                let promise = self.stream.close();
+                let this = unsafe { self.as_mut().get_unchecked_mut() };
+                this.closed = true;
+                this.in_flight = Some(JsFuture::from(promise));
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            // closed == true: drain the close-promise.
+            match self.as_mut().poll_inflight(cx, false) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            }
+        }
+    }
 }
