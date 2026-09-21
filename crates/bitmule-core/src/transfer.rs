@@ -399,7 +399,6 @@ mod opfs {
     use bitmule_crypto::BulkKey;
     use futures_lite::io::AsyncWrite;
 
-
     struct Opfs {
         root: FileSystemDirectoryHandle,
         tmp: FileSystemDirectoryHandle,
@@ -441,5 +440,4 @@ mod opfs {
         }
         async fn drop_tmp_file(&self, file: Self::TempFile);
     }
-
 }
