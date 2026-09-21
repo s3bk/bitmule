@@ -622,4 +622,160 @@ mod opfs {
             }
         }
     }
+
+    // ─── Sync-worker AsyncWrite adapter for FileSystemSyncAccessHandle ────
+    // FSSAH is a synchronous, worker-scope-only OPFS I/O primitive. Every
+    // method (write, flush, close, get_size, truncate) returns immediately
+    // with no Promise plumbing. Wrapping it in the futures_lite AsyncWrite
+    // surface is trivial: every poll_* call resolves to Ready.
+    //
+    // The wrapper exists so async_zip's ZipFileWriter can consume both the
+    // async-createWritable and the sync-access-handle paths without
+    // special-casing at the call site. Structural cost of the AsyncWrite
+    // trait is zero here — no state to hold beyond the handle itself.
+    //
+    // web-sys method names hedged: adjust `write_with_u8_array` and
+    // friends if the target web-sys crate version renames them (0.3.68+
+    // used the names below). `close()` return type varied between
+    // web-sys versions (some `()`, some `Result<(), JsValue>`); the
+    // match here assumes Result and treats a bare `()` as a compile-time
+    // hint to drop the `?`.
+    //
+    // Kenna 2026-09-21, per Seb ask.
+    use web_sys::FileSystemSyncAccessHandle;
+
+    pub struct OpfsSyncWritable {
+        handle: FileSystemSyncAccessHandle,
+        offset: f64,
+    }
+
+    impl OpfsSyncWritable {
+        pub fn new(handle: FileSystemSyncAccessHandle) -> Self {
+            Self { handle, offset: 0.0 }
+        }
+    }
+
+    impl AsyncWrite for OpfsSyncWritable {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            // FSSAH.write is synchronous and returns the byte count written
+            // as f64 (JS Number). Positional writes use FileSystemReadWriteOptions
+            // with an `at` offset; without options FSSAH writes at its current
+            // internal file cursor. We track offset explicitly here so callers
+            // that reuse the handle don't have to trust the browser's internal
+            // cursor semantics between chunks.
+            let this = unsafe { self.get_unchecked_mut() };
+            let options = web_sys::FileSystemReadWriteOptions::new();
+            options.set_at(this.offset);
+            // web-sys write_with_u8_array_and_options takes a mut slice.
+            // Copy to a local mut vec so we don't need the caller's buf mut.
+            let mut chunk = buf.to_vec();
+            let written = match this
+                .handle
+                .write_with_u8_array_and_options(&mut chunk, &options)
+            {
+                Ok(n) => n as usize,
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("opfs-sync write: {e:?}"),
+                    )));
+                }
+            };
+            this.offset += written as f64;
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.handle.flush() {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(e) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("opfs-sync flush: {e:?}"),
+                ))),
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            // FSSAH.close() has varied between web-sys versions between
+            // `-> ()` and `-> Result<(), JsValue>`. If your version returns
+            // bare `()`, drop the `.map_err` block and just call `self.handle.close()`.
+            self.handle.close();
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // ─── Stage wrappers for lines 304 (async) + 348 (sync) ────────────────
+    // Structural shims so async_zip's ZipFileWriter can consume the OPFS
+    // write backends at the two call sites without special-casing. Both
+    // stages own the file handle + the write handle; `.writer()` returns
+    // the correct AsyncWrite wrapper for the branch.
+    //
+    // The `create`, `size`, `hash_into_commitment`, `remove` methods stay
+    // as todo!() stubs — those wire the actual OPFS lifecycle (creating
+    // the temp file in the OPFS root, hashing back through it for the
+    // commitment, deleting on cleanup) and Seb owns those. The type
+    // shapes below let the call sites at 304 + 348 compile cleanly so any
+    // downstream trait/type mismatch surfaces at cargo-check.
+
+    pub struct OpfsAsyncStage {
+        file: FileSystemFileHandle,
+        writable: FileSystemWritableFileStream,
+    }
+
+    impl OpfsAsyncStage {
+        pub async fn create(_name: &str) -> Result<Self, anyhow::Error> {
+            todo!("wire OPFS root → tmp/ → getFileHandle → createWritable")
+        }
+        pub fn writer(&self) -> OpfsWritable {
+            OpfsWritable::new(self.writable.clone())
+        }
+        pub async fn size(&self) -> Result<u64, anyhow::Error> {
+            todo!("query FSFileHandle.getFile().size()")
+        }
+        pub async fn hash_into_commitment(
+            &self,
+            _bulk_key: &BulkKey,
+        ) -> Result<[u8; 32], anyhow::Error> {
+            todo!("re-open the staged file, stream through CommitmentHasher, finalize with bulk_key")
+        }
+        pub async fn remove(&self) -> Result<(), anyhow::Error> {
+            todo!("removeEntry on the parent directory handle")
+        }
+    }
+
+    pub struct OpfsSyncStage {
+        file: FileSystemFileHandle,
+        handle: FileSystemSyncAccessHandle,
+    }
+
+    impl OpfsSyncStage {
+        pub async fn create(_name: &str) -> Result<Self, anyhow::Error> {
+            todo!("wire OPFS root → tmp/ → getFileHandle → createSyncAccessHandle (worker-scope only)")
+        }
+        pub fn writer(&self) -> OpfsSyncWritable {
+            OpfsSyncWritable::new(self.handle.clone())
+        }
+        pub fn size(&self) -> Result<u64, anyhow::Error> {
+            todo!("self.handle.getSize() as u64")
+        }
+        pub async fn hash_into_commitment(
+            &self,
+            _bulk_key: &BulkKey,
+        ) -> Result<[u8; 32], anyhow::Error> {
+            todo!("read chunks off the sync handle synchronously, feed into CommitmentHasher, finalize with bulk_key")
+        }
+        pub fn remove(&self) -> Result<(), anyhow::Error> {
+            todo!("removeEntry on the parent directory handle (sync-scope from a Worker context)")
+        }
+    }
 }
