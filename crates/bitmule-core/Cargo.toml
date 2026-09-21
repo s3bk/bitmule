@@ -55,6 +55,7 @@ features = [
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
     "FileSystemWritableFileStream",
+    "FileSystemGetDirectoryOptions",
     "FileSystemGetFileOptions",
     "FileSystemCreateWritableOptions",
     "FileSystemSyncAccessHandle",

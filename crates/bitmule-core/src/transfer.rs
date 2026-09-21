@@ -1,7 +1,18 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, pin::Pin};
 
+use anyhow::Error;
+use async_trait::async_trait;
 use bitmule_crypto::{BulkKey, CommitmentHasher};
 use bytes::Bytes;
+use tempfile::NamedTempFile;
+use tokio::{fs::File, io::AsyncWrite};
+
+#[cfg(target_arch = "wasm32")]
+use js_sys::{wasm_bindgen::JsCast, Uint8Array};
+
+#[cfg(target_arch = "wasm32")]
+use web_sys::{FileSystemDirectoryHandle, FileSystemGetDirectoryOptions, Navigator, window};
+
 
 use crate::protocol::websocket::{TransferManifest, TransferType};
 
@@ -89,6 +100,8 @@ pub struct TransferEntry {
 pub enum Storage {
     File(PathBuf),
     Bytes(Bytes),
+    #[cfg(target_arch = "wasm32")]
+    ArrayBuffer(Uint8Array),
 }
 impl From<PathBuf> for Storage {
     fn from(path: PathBuf) -> Self { Self::File(path) }
@@ -96,6 +109,65 @@ impl From<PathBuf> for Storage {
 impl From<Bytes> for Storage {
     fn from(bytes: Bytes) -> Self { Storage::Bytes(bytes) }
 }
+
+#[async_trait]
+pub trait FsImpl: Sized {
+    type TempFile: AsyncWrite;
+    async fn create_tmp_file(&self) -> Self::TempFile;
+    async fn drop_tmp_file(&self, file: Self::TempFile);
+}
+struct NativeImpl;
+
+#[async_trait]
+impl FsImpl for NativeImpl {
+    type TempFile = NativeTempFile;
+    async fn create_tmp_file(&self) -> Result<Self::TempFile, Error> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let tmp_path = tmp.path().to_path_buf();
+        let file = tokio::fs::File::create(&tmp_path).await?;
+        Ok(NativeTempFile { tmp, file })
+    }
+    async fn drop_tmp_file(&self, file: Self::TempFile);
+}
+impl NativeTempFile {
+    fn file(self: Pin<&mut Self>) -> Pin<&mut File> {
+        // This is okay because `field` is pinned when `self` is.
+        unsafe { self.map_unchecked_mut(|s| &mut s.file) }
+    }
+}
+
+struct NativeTempFile {
+    tmp: NamedTempFile,
+    file: File,
+}
+impl AsyncWrite for NativeTempFile {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>>
+    {
+        self.file().poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        self.file().poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        self.file().poll_shutdown(cx)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>>
+    {
+        self.file().poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.file.is_write_vectored()
+    }
+}
+
 
 // ─── Native impl ──────────────────────────────────────────────────────────
 // tempfile + tokio::fs. Not compiled on wasm32 targets.
@@ -190,10 +262,7 @@ async fn zip_and_commit(
 async fn single_file_commit(storage: &Storage, bulk_key: &BulkKey) -> anyhow::Result<(u64, [u8; 32])> {
     match storage {
         Storage::File(_path) => {
-            // In-browser Storage::File semantics aren't defined yet — the
-            // browser side generally hands us Bytes from a File API blob.
-            // Left as todo! so the missing-piece surfaces if a wasm caller
-            // ever routes a filesystem path through here.
+            // Path in OPFS
             todo!("wasm: Storage::File is not defined in the browser; expect Storage::Bytes")
         }
         Storage::Bytes(b) => {
@@ -201,6 +270,22 @@ async fn single_file_commit(storage: &Storage, bulk_key: &BulkKey) -> anyhow::Re
             let mut hasher = CommitmentHasher::new();
             hasher.update(b);
             Ok((size, hasher.finalize(bulk_key)))
+        }
+        Storage::ArrayBuffer(data) => {
+            // read buffer in 1MB chunks and hash it
+            let chunk_size: u32 = 1024 * 1024;
+            let mut hasher = CommitmentHasher::new();
+            let mut buffer = vec![0u8; chunk_size as usize];
+            let size = data.length();
+            for off in (0..size).step_by(chunk_size as usize) {
+                let end = (off + chunk_size).min(size);
+
+                let slice = &mut buffer[.. (end - off) as usize];
+                data.slice(off, end).copy_to(slice);
+
+                hasher.update(&slice);
+            }
+            Ok((size as u64, hasher.finalize(bulk_key)))
         }
     }
 }
@@ -232,6 +317,9 @@ async fn zip_and_commit(
             }
             Storage::Bytes(b) => {
                 writer.write_entry_whole(builder, b).await?;
+            }
+            Storage::ArrayBuffer(data) => {
+                todo!()
             }
         }
     }
@@ -274,6 +362,9 @@ pub async fn zip_and_commit_sync_worker(
             Storage::Bytes(b) => {
                 writer.write_entry_whole(builder, b).await?;
             }
+            Storage::ArrayBuffer(data) => {
+                todo!()
+            }
         }
     }
     writer.close().await?;
@@ -308,49 +399,41 @@ mod opfs {
     use bitmule_crypto::BulkKey;
     use futures_lite::io::AsyncWrite;
 
-    pub(super) struct OpfsAsyncStage {
-        // future fields: FileSystemFileHandle, WritableFileStream
+
+    struct Opfs {
+        root: FileSystemDirectoryHandle,
+        tmp: FileSystemDirectoryHandle,
+    }
+    impl Opfs {
+        pub async fn new_window() -> Result<Self> {
+            let root = window().ok_or(anyhow!("no window"))?.navigator().storage().get_directory().await?
+                .dyn_into::<FileSystemDirectoryHandle>()?;
+
+            let options = FileSystemGetDirectoryOptions::new();
+            options.set_create(true);
+            let tmp = self.root.get_file_handle_with_options("tmp", &options).await?
+                .dyn_into::<FileSystemDirectoryHandle>()?;
+
+            Ok(Opfs {
+                root, tmp
+            })
+        }
     }
 
-    impl OpfsAsyncStage {
-        pub(super) async fn create(_name: &str) -> anyhow::Result<Self> {
-            todo!("web-sys StorageManager.getDirectory() → getFileHandle({{create:true}}) → createWritable()")
-        }
-        pub(super) fn writer(&self) -> impl AsyncWrite + Unpin + '_ {
-            #[allow(unreachable_code)]
-            futures_lite::io::sink()
-        }
-        pub(super) async fn size(&self) -> anyhow::Result<u64> {
-            todo!("FileSystemFileHandle.getFile().size")
-        }
-        pub(super) async fn hash_into_commitment(&self, _bulk_key: &BulkKey) -> anyhow::Result<[u8; 32]> {
-            todo!("stream File.stream() through CommitmentHasher.finalize(bulk_key)")
-        }
-        pub(super) async fn remove(&self) -> anyhow::Result<()> {
-            todo!("parent DirectoryHandle.removeEntry(name)")
-        }
-    }
+    #[async_trait]
+    impl FsImpl for Opfs {
+        type TempFile = OpfsTempFile;
+        async fn create_tmp_file(&self) -> Result<Self::TempFile, Error> {
+            let name = uuid::Uuid::new_v4();
+            let options = &FileSystemGetFileOptions::new();
+            options.set_create(true);
+            let file = self.tmp.get_file_handle_with_options(&name.to_string(), &options).await?.dyn_into::<FileSystemFileHandle>()?;
+            let writable = file.create_writable();
 
-    pub(super) struct OpfsSyncStage {
-        // future fields: FileSystemSyncAccessHandle
-    }
+            Ok(OpfsTempFile {
 
-    impl OpfsSyncStage {
-        pub(super) async fn create(_name: &str) -> anyhow::Result<Self> {
-            todo!("Worker-scope only: getFileHandle → createSyncAccessHandle()")
+            })
         }
-        pub(super) fn writer(&self) -> impl AsyncWrite + Unpin + '_ {
-            #[allow(unreachable_code)]
-            futures_lite::io::sink()
-        }
-        pub(super) fn size(&self) -> anyhow::Result<u64> {
-            todo!("FileSystemSyncAccessHandle.getSize()")
-        }
-        pub(super) async fn hash_into_commitment(&self, _bulk_key: &BulkKey) -> anyhow::Result<[u8; 32]> {
-            todo!("SyncAccessHandle.read() loop → CommitmentHasher.finalize(bulk_key)")
-        }
-        pub(super) fn remove(&self) -> anyhow::Result<()> {
-            todo!("close() + parent DirectoryHandle.removeEntry(name) via saved handle")
-        }
+        async fn drop_tmp_file(&self, file: Self::TempFile);
     }
 }
