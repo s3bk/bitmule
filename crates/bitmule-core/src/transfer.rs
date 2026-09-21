@@ -404,6 +404,10 @@ mod opfs {
         root: FileSystemDirectoryHandle,
         tmp: FileSystemDirectoryHandle,
     }
+    struct OpfsTempFile {
+        file: FileSystemFileHandle,
+        writable: FileSystemWritableFileStream,
+    }
     impl Opfs {
         pub async fn new_window() -> Result<Self> {
             let root = window().ok_or(anyhow!("no window"))?.navigator().storage().get_directory().await?
@@ -428,12 +432,14 @@ mod opfs {
             let options = &FileSystemGetFileOptions::new();
             options.set_create(true);
             let file = self.tmp.get_file_handle_with_options(&name.to_string(), &options).await?.dyn_into::<FileSystemFileHandle>()?;
-            let writable = file.create_writable();
+            let writable = file.create_writable.await?().dyn_into::<FileSystemFileHandle>()?;
 
             Ok(OpfsTempFile {
-
+                file,
+                writable,
             })
         }
         async fn drop_tmp_file(&self, file: Self::TempFile);
     }
+
 }
