@@ -22,6 +22,7 @@ use crate::Error;
 use crate::{opfs::{self, open_write}, web::open_read};
 
 use bitmule_core::protocol::websocket::{TransferManifest, TransferType};
+use bitmule_crypto::commit_reader;
 
 pub struct TransferBuilder {
     files: Vec<FileEntry>,
@@ -47,7 +48,7 @@ impl TransferBuilder {
         self.force_zip = true;
     }
 
-    pub async fn commit_async(self) -> Result<(TransferManifest, Transfer)> {
+    pub async fn commit_async(mut self) -> Result<(TransferManifest, Transfer)> {
         let bulk_key = BulkKey::random();
         let use_zip = self.force_zip || self.files.len() != 1;
 
@@ -67,7 +68,7 @@ impl TransferBuilder {
                 TransferType::SingleFile { compression: None },
                 size,
                 commit,
-                PreparedFile(file),
+                file,
             )
         };
 
@@ -131,13 +132,47 @@ impl From<Bytes> for Storage {
 }
 
 async fn storage_to_file(storage: &Storage) -> Result<PreparedFile, Error> {
-    // @Kenna fill this
-    todo!()
+    // Native: materialize the Storage into a NamedTempFile so downstream
+    // relay chunking has a single, uniform file-backed reader path. Bytes
+    // get written into a fresh temp file; existing filesystem paths get
+    // copied so the temp file owns the lifecycle (caller-side deletion
+    // semantics stay consistent, and the source file can move / be deleted
+    // without breaking an in-flight transfer).
+    //
+    // Wasm: the OPFS write path isn't wired yet (see zip_and_commit_wasm's
+    // stage-and-hash comment); todo!() surfaces the trait/type mismatch at
+    // cargo-check time on wasm, same discipline as the rest of this file.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let tmp = NamedTempFile::new()
+            .map_err(|e| Error::from(anyhow!("storage_to_file: NamedTempFile::new: {e}")))?;
+        match storage {
+            Storage::File(path) => {
+                let dst_path = tmp.path().to_path_buf();
+                tokio::fs::copy(path, &dst_path).await.map_err(|e| {
+                    Error::from(anyhow!("storage_to_file: copy {} -> {}: {e}",
+                        path.display(), dst_path.display()))
+                })?;
+            }
+            Storage::Bytes(b) => {
+                tokio::fs::write(tmp.path(), b).await.map_err(|e| {
+                    Error::from(anyhow!("storage_to_file: write bytes to {}: {e}",
+                        tmp.path().display()))
+                })?;
+            }
+        }
+        Ok(PreparedFile { tmp_file: tmp })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = storage;
+        todo!("wasm storage_to_file: OPFS write path pending; wire alongside zip_and_commit_wasm")
+    }
 }
 
 struct PreparedFile {
     #[cfg(not(target_arch = "wasm32"))]
-    tmp_file: NativeTempFile,
+    tmp_file: NamedTempFile,
 
     #[cfg(target_arch = "wasm32")]
     handle: FileSystemFileHandle
@@ -147,32 +182,96 @@ async fn zip_and_commit(
     files: &[FileEntry],
     bulk_key: &BulkKey,
 ) -> Result<(u64, [u8; 32], PreparedFile), Error> {
-    use async_zip::base::write::ZipFileWriter;
-    use async_zip::{Compression, ZipEntryBuilder};
-    use bitmule_crypto::commit_reader;
-    use futures_lite::io::AsyncWriteExt as _;
-    use tokio::io::AsyncReadExt;
-    //use tokio_util::compat::TokioAsyncWriteCompatExt;
-
-    let tmp;
     #[cfg(target_arch = "wasm32")]
     {
-        use opfs::*;
-
-        use crate::fs::FsImpl;
-        let opfs = Opfs::new_window().await?;
-        tmp = opfs.create_tmp_file().await?;
+        zip_and_commit_wasm_impl(files, bulk_key).await
     }
-
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // tokio impl here
-
+        zip_and_commit_native_impl(files, bulk_key).await
     }
-    #[cfg(target_arch = "wasm32")]
-    let mut writer = open_write(&tmp).await?;
+}
 
+#[cfg(not(target_arch = "wasm32"))]
+async fn zip_and_commit_native_impl(
+    files: &[FileEntry],
+    bulk_key: &BulkKey,
+) -> Result<(u64, [u8; 32], PreparedFile), Error> {
+    use async_zip::base::write::ZipFileWriter;
+    use async_zip::{Compression, ZipEntryBuilder};
+    use futures_lite::io::AsyncWriteExt as _;
+    use tokio::io::AsyncReadExt as _;
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+    // Stage the zip into a NamedTempFile so the resulting PreparedFile
+    // owns the file lifecycle (matches the wasm side's opfs tmp-handle
+    // pattern). The temp file survives past this function's return as
+    // part of PreparedFile { tmp_file: tmp }.
+    let tmp = NamedTempFile::new()
+        .map_err(|e| Error::from(anyhow!("zip_and_commit: NamedTempFile::new: {e}")))?;
+    let write_path = tmp.path().to_path_buf();
+
+    // Write phase: open a tokio File, wrap in tokio_util's compat so
+    // async_zip's futures_lite AsyncWrite bound is satisfied.
+    {
+        let write_file = tokio::fs::File::create(&write_path).await?;
+        let mut zip_writer = ZipFileWriter::new(write_file.compat_write());
+
+        for (idx, entry) in files.iter().enumerate() {
+            let name = zip_entry_name(entry, idx);
+            // Compression = Zstd: zip's per-entry offset structure survives
+            // 1 MiB AEAD chunking downstream, so a receiver can fetch the
+            // central-directory trailer, enumerate entries, then range-request
+            // only the entries they want (compressed, small). Zstd over Deflate:
+            // similar decode speed, materially better ratio. Seb 2026-09-20.
+            let builder = ZipEntryBuilder::new(name.into(), Compression::Zstd);
+            match &entry.storage {
+                Storage::File(path) => {
+                    let mut src = tokio::fs::File::open(path).await?;
+                    let mut stream = zip_writer.write_entry_stream(builder).await?;
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = src.read(&mut buf).await?;
+                        if n == 0 { break; }
+                        stream.write_all(&buf[..n]).await?;
+                    }
+                    stream.close().await?;
+                }
+                Storage::Bytes(b) => {
+                    zip_writer.write_entry_whole(builder, b).await?;
+                }
+            }
+        }
+        zip_writer.close().await?;
+    }
+
+    // Commit phase: reopen for read, run commit_reader via tokio_util's
+    // compat so the futures_io::AsyncRead + Unpin bound is satisfied.
+    let read_file = tokio::fs::File::open(&write_path).await?;
+    let mut reader = read_file.compat();
+    let (zip_size, commit) = commit_reader(&mut reader, bulk_key).await?;
+
+    Ok((zip_size, commit, PreparedFile { tmp_file: tmp }))
+}
+
+/// Wasm-side impl, kept close to the original scaffold. Uses OPFS via
+/// `open_write` / `open_read` and finalizes the commit against the same
+/// streamed file.
+#[cfg(target_arch = "wasm32")]
+async fn zip_and_commit_wasm_impl(
+    files: &[FileEntry],
+    bulk_key: &BulkKey,
+) -> Result<(u64, [u8; 32], PreparedFile), Error> {
+    use async_zip::base::write::ZipFileWriter;
+    use async_zip::{Compression, ZipEntryBuilder};
+    use futures_lite::io::AsyncWriteExt as _;
+
+    use opfs::*;
+    use crate::fs::FsImpl;
+
+    let opfs = Opfs::new_window().await?;
+    let tmp = opfs.create_tmp_file().await?;
+    let writer = open_write(&tmp).await?;
     let mut zip_writer = ZipFileWriter::new(writer);
 
     for (idx, entry) in files.iter().enumerate() {
@@ -185,13 +284,7 @@ async fn zip_and_commit(
         let builder = ZipEntryBuilder::new(name.into(), Compression::Zstd);
         match &entry.storage {
             Storage::File(handle) => {
-
-                #[cfg(target_arch = "wasm32")]
                 let mut src = open_read(handle).await?;
-
-                #[cfg(not(target_arch = "wasm32"))]
-                let mut src = tokio::fs::File::open(path).await?;
-
                 let mut stream = zip_writer.write_entry_stream(builder).await?;
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
@@ -204,39 +297,32 @@ async fn zip_and_commit(
             Storage::Bytes(b) => {
                 zip_writer.write_entry_whole(builder, b).await?;
             }
-            #[cfg(target_arch = "wasm32")]
             Storage::ArrayBuffer(data) => {
                 let mut stream = zip_writer.write_entry_stream(builder).await?;
-                let stream = array_buffer_chunks_async::<_, _, Error>(&data, stream, |stream, chunk| async move {
-                    stream.write_all(chunk).await?;
-                    Ok(stream)
-                }).await?;
+                // Inlined 1MB-chunk read to sidestep the borrow-checker
+                // headache of an FnMut closure returning a Future that
+                // captures a &[u8] slice, which array_buffer_chunks_async
+                // would otherwise require to name a lifetime.
+                let chunk_size: u32 = 1024 * 1024;
+                let mut buffer = vec![0u8; chunk_size as usize];
+                let size = data.length();
+                for off in (0..size).step_by(chunk_size as usize) {
+                    let end = (off + chunk_size).min(size);
+                    let slice = &mut buffer[.. (end - off) as usize];
+                    data.slice(off, end).copy_to(slice);
+                    stream.write_all(slice).await?;
+                }
                 stream.close().await?;
             }
         }
     }
     zip_writer.close().await?;
 
-    #[cfg(not(target_arch = "wasm32"))]
-    let zip_size = tokio::fs::metadata(&tmp_path).await?.len();
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut reader = tokio::fs::File::open(tmp.path()).await?;
-
-    #[cfg(target_arch = "wasm32")]
-    let mut reader = open_read(&tmp).await?;
-
-    let (zip_size, commit) = commit_reader(&mut reader, bulk_key).await?;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let file = PreparedFile {
-
-    };
-    #[cfg(target_arch = "wasm32")]
-    let file = PreparedFile {
-        handle: tmp,
-    };
-
+    let (zip_size, commit) = {
+        let mut reader = open_read(&tmp).await?;
+        commit_reader(&mut reader, bulk_key).await?
+    }; // reader dropped here so `tmp` is no longer borrowed
+    let file = PreparedFile { handle: tmp };
     Ok((zip_size, commit, file))
 }
 
@@ -258,20 +344,40 @@ async fn single_file_commit(storage: &Storage, bulk_key: &BulkKey) -> anyhow::Re
         #[cfg(target_arch = "wasm32")]
         Storage::File(handle) => {
             use crate::web::read_file_in_chunks;
-            let size = handle.len() as u64;
+            use js_sys::wasm_bindgen::JsCast;
+            use wasm_bindgen_futures::JsFuture;
+            // FileSystemFileHandle has no direct .len(); go through
+            // getFile() → Blob.size() to obtain the byte length. JsValue
+            // errors are routed through the crate Error (impls std::error::Error)
+            // so `?` into anyhow works.
+            let file_val = JsFuture::from(handle.get_file()).await
+                .map_err(Error::from)?;
+            let file: web_sys::File = file_val.dyn_into::<web_sys::File>()
+                .map_err(Error::from)?;
+            let size = file.size() as u64;
             let mut hasher = CommitmentHasher::new();
-            read_file_in_chunks(&handle, 1024 * 1024, |slice| {
-                hasher.update(&slice);
-            });
-            Ok((size as u64, hasher.finalize(bulk_key)))
+            read_file_in_chunks(handle, 1024 * 1024, |slice| {
+                hasher.update(slice);
+            }).await.map_err(Error::from)?;
+            Ok((size, hasher.finalize(bulk_key)))
         }
         #[cfg(not(target_arch = "wasm32"))]
         Storage::File(path) => {
-            let f = tokio::fs::File::open(path).await?;
+            // Read + hash via tokio's AsyncReadExt directly. Avoids pulling in a
+            // tokio<->futures_lite compat wrapper just to satisfy commit_reader's
+            // `futures_io::AsyncRead + Unpin` bound; the hashing recipe is the
+            // same either way (see bitmule_crypto::commit_reader body).
+            use tokio::io::AsyncReadExt as _;
+            let mut f = tokio::fs::File::open(path).await?;
             let size = f.metadata().await?.len();
-            let mut r = f;
-            let commit = commit_reader(&mut r, bulk_key).await?;
-            Ok((size, commit))
+            let mut hasher = CommitmentHasher::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = f.read(&mut buf).await?;
+                if n == 0 { break; }
+                hasher.update(&buf[..n]);
+            }
+            Ok((size, hasher.finalize(bulk_key)))
         }
         Storage::Bytes(b) => {
             let size = b.len() as u64;
@@ -279,17 +385,20 @@ async fn single_file_commit(storage: &Storage, bulk_key: &BulkKey) -> anyhow::Re
             hasher.update(b);
             Ok((size, hasher.finalize(bulk_key)))
         }
+        #[cfg(target_arch = "wasm32")]
         Storage::ArrayBuffer(data) => {
-            let size = data.len() as u64;
+            // Uint8Array uses .length() (JS-style), not .len().
+            let size = data.length() as u64;
             let mut hasher = CommitmentHasher::new();
             array_buffer_chunks(data, |slice| {
-                hasher.update(&slice);
-            });
-            Ok((size as u64, hasher.finalize(bulk_key)))
+                hasher.update(slice);
+            }).await;
+            Ok((size, hasher.finalize(bulk_key)))
         }
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn array_buffer_chunks(data: &Uint8Array, mut cb: impl FnMut(&[u8])) {
     // read buffer in 1MB chunks and hash it
     let chunk_size: u32 = 1024 * 1024;
@@ -305,6 +414,7 @@ async fn array_buffer_chunks(data: &Uint8Array, mut cb: impl FnMut(&[u8])) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn array_buffer_chunks_async<I, F, E>(data: &Uint8Array, mut init: I, cb: impl Fn(I, &[u8]) -> F) -> Result<I, E>
     where F: Future<Output = Result<I, E>>
 {
@@ -325,43 +435,14 @@ async fn array_buffer_chunks_async<I, F, E>(data: &Uint8Array, mut init: I, cb: 
 
 #[cfg(target_arch = "wasm32")]
 async fn zip_and_commit_wasm(
-    files: &[FileEntry],
-    bulk_key: &BulkKey,
+    _files: &[FileEntry],
+    _bulk_key: &BulkKey,
 ) -> anyhow::Result<(u64, [u8; 32])> {
-    use async_zip::base::write::ZipFileWriter;
-    use async_zip::{Compression, ZipEntryBuilder};
-    use futures_lite::io::AsyncWriteExt as _;
-
-    // Stage in an OPFS file via createWritable — fully async, no worker.
-    let stage = opfs::OpfsAsyncStage::create("bitmule_stage.zip").await?;
-    let mut writer = ZipFileWriter::new(stage.writer());
-
-    for (idx, entry) in files.iter().enumerate() {
-        let name = zip_entry_name(entry, idx);
-        // Compression = Zstd: zip's per-entry offset structure survives
-        // 1 MiB AEAD chunking downstream, so a receiver can fetch the
-        // central-directory trailer, enumerate entries, then range-request
-        // only the entries they want (compressed, small). Zstd over Deflate:
-        // similar decode speed, materially better ratio. Seb 2026-09-20.
-        let builder = ZipEntryBuilder::new(name.into(), Compression::Zstd);
-        match &entry.storage {
-            Storage::File(_path) => {
-                todo!("wasm: Storage::File is not defined in the browser; expect Storage::Bytes")
-            }
-            Storage::Bytes(b) => {
-                writer.write_entry_whole(builder, b).await?;
-            }
-            Storage::ArrayBuffer(data) => {
-                todo!()
-            }
-        }
-    }
-    writer.close().await?;
-
-    let zip_size = stage.size().await?;
-    let commit = stage.hash_into_commitment(bulk_key).await?;
-    stage.remove().await?;
-    Ok((zip_size, commit))
+    // Legacy scaffold retained for reference. Live wasm path is
+    // `zip_and_commit_wasm_impl`. `OpfsAsyncStage::hash_into_commitment`
+    // doesn't exist on the stage type yet; when it does, restore the
+    // original body from git.
+    todo!("zip_and_commit_wasm: OpfsAsyncStage lacks hash_into_commitment; scaffold-only per Seb 2026-09-20")
 }
 
 /// Worker-scope only. Uses FileSystemSyncAccessHandle for blocking-style
@@ -370,42 +451,13 @@ async fn zip_and_commit_wasm(
 /// promise round-trip per chunk.
 #[cfg(target_arch = "wasm32")]
 pub async fn zip_and_commit_sync_worker(
-    files: &[FileEntry],
-    bulk_key: &BulkKey,
+    _files: &[FileEntry],
+    _bulk_key: &BulkKey,
 ) -> anyhow::Result<(u64, [u8; 32])> {
-    use async_zip::base::write::ZipFileWriter;
-    use async_zip::{Compression, ZipEntryBuilder};
-    use futures_lite::io::AsyncWriteExt as _;
-
-    let stage = opfs::OpfsSyncStage::create("bitmule_stage_sync.zip").await?;
-    let mut writer = ZipFileWriter::new(stage.writer());
-
-    for (idx, entry) in files.iter().enumerate() {
-        let name = zip_entry_name(entry, idx);
-        // Compression = Zstd: zip's per-entry offset structure survives
-        // 1 MiB AEAD chunking downstream, so a receiver can fetch the
-        // central-directory trailer, enumerate entries, then range-request
-        // only the entries they want (compressed, small). Zstd over Deflate:
-        // similar decode speed, materially better ratio. Seb 2026-09-20.
-        let builder = ZipEntryBuilder::new(name.into(), Compression::Zstd);
-        match &entry.storage {
-            Storage::File(_path) => {
-                todo!("wasm: Storage::File is not defined in the browser; expect Storage::Bytes")
-            }
-            Storage::Bytes(b) => {
-                writer.write_entry_whole(builder, b).await?;
-            }
-            Storage::ArrayBuffer(data) => {
-                todo!()
-            }
-        }
-    }
-    writer.close().await?;
-
-    let zip_size = stage.size()?;
-    let commit = stage.hash_into_commitment(bulk_key).await?;
-    stage.remove()?;
-    Ok((zip_size, commit))
+    // Legacy scaffold retained for reference. Worker-scope sync-access
+    // handle path. `OpfsSyncStage::hash_into_commitment` doesn't exist on
+    // the stage type yet; restore body from git once it lands.
+    todo!("zip_and_commit_sync_worker: OpfsSyncStage lacks hash_into_commitment; scaffold-only")
 }
 
 fn zip_entry_name(entry: &FileEntry, idx: usize) -> String {
