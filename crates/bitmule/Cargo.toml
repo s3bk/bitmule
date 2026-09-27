@@ -39,7 +39,6 @@ tempfile = { workspace = true }
 # signaling + relay stack on a random localhost port without shelling
 # out to the CLI. Same axum::Router shape as `bitmule-server` main.
 bitmule-server = { path = "../bitmule-server" }
-bitmule-server-store-fs = { path = "../bitmule-server-store-fs" }
 bitmule-core = { path = "../bitmule-core" }
 axum = { workspace = true }
 tempfile = "3"

@@ -26,7 +26,7 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { workspace = true }
-str0m = "0.23"
+str0m = { version = "0.23", default-features = false }
 mdns = "3.0.0"
 x25519-dalek.workspace = true
 sha2.workspace = true
@@ -46,8 +46,8 @@ biter = "*"
 
 
 # version pins
-dimpl = "0.7.3"
-rcgen = "=0.14.7"
+dimpl =  { version = "0.7.3", default-features = false }
+rcgen = { version = "0.14.7", default-features = false }
 time = "=0.3.45"
 icu_normalizer = "=2.0.1"
 icu_provider = "=2.1.1"

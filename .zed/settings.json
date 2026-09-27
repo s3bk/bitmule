@@ -1,0 +1,28 @@
+// Folder-specific settings
+//
+// For a full list of overridable settings, and general information on folder-specific settings,
+// see the documentation: https://zed.dev/docs/configuring-zed#settings-files
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "target": "wasm32-unknown-unknown",
+          "extraArgs": [
+            "--exclude", "bitmule",
+            "--exclude", "bitmule-server",
+            "--exclude", "bitmule-server-signal-ws",
+            "--exclude", "bitmule-client-native",
+            "--exclude", "bitmule-e2e-tests",
+            "--exclude", "bitmule-qt6",
+            "--exclude", "bitmule-gtk4",
+            "--exclude", "bitmule-mobile-ffi",
+            "--exclude", "fountain-demo",
+            "--exclude", "fountain-demo-v2",
+            "--exclude", "raptor-demo",
+          ]
+        },
+      },
+    },
+  },
+}

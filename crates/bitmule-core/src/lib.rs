@@ -7,10 +7,8 @@ pub mod manifest;
 pub mod chunk;
 pub mod crypto;
 pub mod protocol;
-pub mod traits;
 pub mod pow;
 pub mod inner;
-pub mod transfer;
 
 use std::ops;
 
@@ -18,7 +16,6 @@ pub use manifest::{Manifest, FileEntry, ChunkSize};
 pub use chunk::{ChunkId, ChunkHeader, ChunkPayload};
 pub use crypto::{SessionKey, ContentKey, WrappedContentKey, KeyExchange};
 pub use protocol::{SessionId, ReceiverId, ChunkBitmap};
-pub use traits::{ChunkStore, SignalTransport};
 use xxhash_rust::xxh3;
 
 #[derive(Debug, thiserror::Error)]

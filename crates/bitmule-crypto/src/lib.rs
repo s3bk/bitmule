@@ -24,6 +24,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use aes_gcm::{aead::{Aead, AeadInPlace}, AeadCore, Aes256Gcm, Key, KeyInit, Nonce, Tag};
+use futures_lite::{AsyncRead, AsyncReadExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
@@ -183,19 +184,20 @@ impl CommitmentHasher {
 /// 64 KiB chunks; the whole payload is never held in memory. Shared by
 /// TransferBuilder (bitmule-core) and the native/mobile clients so the
 /// hashing recipe stays in one place.
-pub async fn commit_reader<R>(reader: &mut R, bulk_key: &BulkKey) -> Result<[u8; 32]>
+pub async fn commit_reader<R>(reader: &mut R, bulk_key: &BulkKey) -> Result<(u64, [u8; 32])>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt;
     let mut hasher = CommitmentHasher::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
     loop {
         let n = reader.read(&mut buf).await.context("commit_reader read")?;
         if n == 0 { break; }
         hasher.update(&buf[..n]);
+        total += n as u64;
     }
-    Ok(hasher.finalize(bulk_key))
+    Ok((total, hasher.finalize(bulk_key)))
 }
 
 /// Local half of the ephemeral X25519 pair, consumed on `derive_shared_key`.

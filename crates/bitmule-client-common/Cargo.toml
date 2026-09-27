@@ -1,0 +1,48 @@
+[package]
+name = "bitmule-client-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bitmule-core = { path = "../bitmule-core" }
+bitmule-crypto = { path = "../bitmule-crypto" }
+async_zip = { version = "0.0.19", features = ["zstd"] }
+futures-lite = "2"
+async-trait = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tempfile = "3"
+
+# Wasm-only: web bindings for OPFS (async main-thread + sync worker-scope).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+wasm-streams = "0.4"
+js-sys = "0.3"
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Navigator",
+    "StorageManager",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemWritableFileStream",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemCreateWritableOptions",
+    "FileSystemSyncAccessHandle",
+    "FileSystemReadWriteOptions",
+    "File",
+    "Blob",
+    "ReadableStream"
+]

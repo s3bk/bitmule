@@ -6,7 +6,6 @@ members = [
     "crates/bitmule-crypto",
     "crates/bitmule-server",
     "crates/bitmule-server-signal-ws",
-    "crates/bitmule-server-store-fs",
     "crates/bitmule-client-wasm",
     "crates/bitmule-client-native",
     "crates/bitmule-e2e-tests",
@@ -14,18 +13,20 @@ members = [
     "crates/bitmule-gtk4",
     "crates/bitmule-mobile-ffi",
     "crates/fountain-demo",
-    "crates/fountain-demo-v2", "crates/raptor-demo",
+    "crates/fountain-demo-v2",
+    "crates/raptor-demo",
+    "crates/bitmule-client-common",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 authors = ["Sebastian K. <s3bk@qdat.net>", "Kenna <kenna@isecom.org>"]
 repository = "https://github.com/s3bk/bitmule"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1" }
 tokio-stream = "*"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

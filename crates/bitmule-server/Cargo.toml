@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 bitmule-core = { path = "../bitmule-core" }
-bitmule-server-store-fs = { path = "../bitmule-server-store-fs" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
