@@ -212,7 +212,7 @@ pub struct LiveSession {
 /// return the unspecified address, which str0m's ICE agent didn't
 /// recognize as any known local candidate → drops. Per-IP sockets give
 /// each recv a specific, matchable destination.
-async fn build_socket_pool() -> Result<SocketPool> {
+pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
     // Decide which IPs to bind on.
     let mut announced: Vec<IpAddr> = Vec::new();
     if let Ok(ip) = discover_outbound_ip().await {
@@ -387,14 +387,18 @@ async fn discover_outbound_ip() -> Result<std::net::IpAddr> {
 /// for offer, produce + send answer, run loop until ChannelOpen (which
 /// carries the id str0m assigned on the passive side).
 pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveSession> {
+    use crate::negotiator::{Command as NegCmd, HandleEvent as NegHandleEv};
+
     let session_hex = share_key.session_id_hex();
     let session_id = SessionId::from_hex(&session_hex)
         .map_err(|e| anyhow!("session_id from hex: {e}"))?;
     info!(session = %session_hex, "opening receiver WS + Rtc");
 
     let mut ws = crate::open_ws(server_url, &session_hex).await?;
-    let (mut rtc, mut pool) = build_rtc().await?;
-    let mut next_timeout = drain_rtc(&mut rtc, &pool).await?;
+    // Pool + negotiator + pump wired in one call. The pump handles UDP
+    // recv/send + Tick scheduling; only WsFrame + ChannelOpen surface
+    // here through neg_handle.event_rx.
+    let mut neg = crate::negotiator::spawn_with_pool().await?;
 
     let (late_cand_tx, mut late_cand_rx) = mpsc::unbounded_channel::<Candidate>();
 
@@ -434,8 +438,6 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let mut opened: Option<ChannelId> = None;
 
     while opened.is_none() || bulk_key.is_none() {
-        let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
-
         tokio::select! {
             maybe_msg = ws.next() => {
                 let frame = match parse_ws_frame(maybe_msg)? {
@@ -445,8 +447,8 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                 match frame {
                     SignalFrame::Ice { candidate: Some(c) } => {
                         if let Some(remote) = dispatch_cand_outcome(parse_ice_candidate(&c), &late_cand_tx) {
-                            rtc.add_remote_candidate(remote);
-                            next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
+                            neg.cmd_tx.send(NegCmd::RemoteCandidate(remote))
+                                .map_err(|_| anyhow!("negotiator command channel closed"))?;
                         }
                     }
                     SignalFrame::PeerJoined { wire_version, .. } => {
@@ -466,16 +468,9 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                         }
                     }
                     SignalFrame::Sdp { kind, sdp } if kind == "offer" => {
-                        let offer = SdpOffer::from_sdp_string(&sdp)
-                            .map_err(|e| anyhow!("parse offer: {e}"))?;
-                        let answer = rtc.sdp_api().accept_offer(offer)
-                            .map_err(|e| anyhow!("accept_offer: {e}"))?;
-                        ws_send(&mut ws, &SignalFrame::Sdp {
-                            kind: "answer".into(),
-                            sdp: answer.to_sdp_string(),
-                        }).await?;
-                        debug!("answer sent");
-                        next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
+                        neg.cmd_tx.send(NegCmd::RemoteSdp { kind, sdp })
+                            .map_err(|_| anyhow!("negotiator command channel closed"))?;
+                        debug!("offer forwarded to negotiator");
                     }
                     SignalFrame::KexPub { pub_hex, mac_hex } => {
                         if wrap_key.is_some() {
@@ -526,28 +521,16 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                 }
             }
 
-            maybe_pr = pool.recv() => {
-                let pr = maybe_pr.ok_or_else(|| anyhow!("pool recv closed"))?;
-                info!("RX ← {} → {} ({} bytes)", pr.source, pr.destination, pr.bytes.len());
-                let input = Input::Receive(Instant::now(), Receive {
-                    proto: Protocol::Udp,
-                    source: pr.source,
-                    destination: pr.destination,
-                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
-                });
-                rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
-                next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
-            }
-
             Some(late) = late_cand_rx.recv() => {
-                rtc.add_remote_candidate(late);
-                next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
+                neg.cmd_tx.send(NegCmd::RemoteCandidate(late))
+                    .map_err(|_| anyhow!("negotiator command channel closed"))?;
             }
 
-            _ = tokio::time::sleep(dur) => {
-                rtc.handle_input(Input::Timeout(Instant::now()))
-                    .map_err(|e| anyhow!("handle_input timeout: {e}"))?;
-                next_timeout = drain_rtc_capture_id(&mut rtc, &pool, &mut opened).await?;
+            Some(ev) = neg.event_rx.recv() => {
+                match ev {
+                    NegHandleEv::WsFrame(f) => { ws_send(&mut ws, &f).await?; }
+                    NegHandleEv::ChannelOpen(id) => { opened = Some(id); }
+                }
             }
         }
     }
@@ -557,6 +540,12 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
     let wrap_key = wrap_key.ok_or_else(|| anyhow!("exited handshake loop without KEX complete"))?;
     let meta_key = meta_key.ok_or_else(|| anyhow!("exited handshake loop without KEX complete"))?;
     let bulk_key = bulk_key.ok_or_else(|| anyhow!("exited handshake loop without bulk key"))?;
+
+    // Reclaim (Rtc, SocketPool) from the pump for the file-transfer
+    // phase. shutdown_and_reclaim sends Shutdown, drops cmd_tx,
+    // drains remaining events, and joins the pump task.
+    let (rtc, pool) = neg.shutdown_and_reclaim().await?;
+
     Ok(LiveSession {
         session_id, role: Role::Receiver, rtc, pool, ws, channel_id,
         wrap_key, meta_key, bulk_key: Some(bulk_key), share_key,
