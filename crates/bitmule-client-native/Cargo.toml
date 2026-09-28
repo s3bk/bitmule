@@ -42,8 +42,8 @@ tempfile = { workspace = true }
 walkdir = { workspace = true }
 indexmap = { workspace = true }
 futures = { workspace = true }
-biter = "*"
-
+bitvec = { workspace = true }
+zstd = "0.14.0"
 
 # version pins
 dimpl =  { version = "0.7.3", default-features = false }

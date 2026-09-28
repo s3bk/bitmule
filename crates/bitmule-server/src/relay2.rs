@@ -20,14 +20,13 @@
 use std::{borrow::Cow, collections::HashMap, convert::Infallible, io, pin::Pin, sync::Arc, task::{Context, Poll}};
 
 use axum::{body::{Body, BodyDataStream}, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::IntoResponse};
-use biter::{Biter};
+use bitvec::{order::Lsb0, view::BitView};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{TryStreamExt};
 use futures_util::{Stream, StreamExt};
 use tokio::{pin, sync::{AcquireError, Mutex, Semaphore, mpsc::{self, error::TrySendError}}};
 use tokio_util::{codec::{Decoder, FramedRead}, io::StreamReader};
 use itertools::izip;
-
 use bitmule_core::{ReceiverId, SessionId, pow, protocol::relay_frame::*};
 
 use crate::{AppState, state::SessionState};
@@ -122,7 +121,7 @@ pub async fn run_session(state: Arc<SessionState>, stream: BodyDataStream) -> Re
 
         match frame_type {
             F_DATA => {
-                let bitset = || Biter::from(&*selection_bits);
+                let bitset = || selection_bits.view_bits::<Lsb0>().iter().by_vals();
 
                 let n_required = izip!(bitset(), routing_table.iter_mut()).filter(|&(include, ref dest)| include && dest.is_some()).count();
                 let mut permits = session.semaphore.acquire_many(n_required as u32).await?;
@@ -131,7 +130,7 @@ pub async fn run_session(state: Arc<SessionState>, stream: BodyDataStream) -> Re
                     if !include {
                         continue;
                     }
-                    let Some(ref dest) = dest_opt else { continue };
+                    let Some(ref dest) = *dest_opt else { continue };
 
                     match dest.tx.try_send(data.clone()) {
                         Ok(()) => {

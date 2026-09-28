@@ -27,7 +27,7 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 tower-http = { version = "0.5", features = ["fs", "trace"] }
 tokio-util = { version = "*", features = ["codec", "io"] }
-biter = "*"
+bitvec = { workspace = true }
 itertools = "*"
 futures = "*"
 tokio-stream = "*"

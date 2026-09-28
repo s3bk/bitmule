@@ -20,6 +20,7 @@
 //! attach on top of the data channel in a follow-up.
 
 pub mod str0m_client;
+pub(crate) mod negotiator;
 pub mod crypto;
 pub mod pipeline;
 pub mod multipeer;
