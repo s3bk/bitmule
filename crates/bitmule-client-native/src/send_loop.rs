@@ -1,8 +1,8 @@
 use std::{collections::HashSet, io::SeekFrom};
 
-use biter::MutBiter;
 use bitmule_core::{ChunkBitmap, ChunkHasher, ChunkSize, ReceiverId};
 use bitmule_crypto::{BulkKey, ShareKey, ShareLink};
+use bitvec::{order::Lsb0, view::BitView};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::Stream;
 use indexmap::IndexMap;
@@ -146,7 +146,7 @@ async fn send_relay_loop(mut cmd_rx: mpsc::Receiver<SendRelayCmd>, mut file: Fil
 
             // compute selection mask
             selection_mask.fill(0);
-            for (mut bit, needed) in MutBiter::from(&mut selection_mask).zip(bitmaps.values()) {
+            for (mut bit, needed) in selection_mask.view_bits_mut::<Lsb0>().into_iter().zip(bitmaps.values()) {
                 *bit = needed.has(chunk_idx);
             }
             if selection_mask != prev_selection_mask {
