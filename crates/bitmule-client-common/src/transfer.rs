@@ -165,8 +165,28 @@ async fn storage_to_file(storage: &Storage) -> Result<PreparedFile, Error> {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = storage;
-        todo!("wasm storage_to_file: OPFS write path pending; wire alongside zip_and_commit_wasm")
+        use web_sys::FileSystemWritableFileStream;
+        use crate::{fs::FsImpl, opfs::Opfs};
+
+        match storage {
+            Storage::ArrayBuffer(buffer) => {
+                let opfs = Opfs::new_window().await?;
+                let handle = opfs.create_tmp_file().await?;
+                let writable = handle.create_writable().await?.dyn_into::<FileSystemWritableFileStream>()?;
+
+                writable.write_with_buffer_source(buffer)?.await?;
+                Ok(PreparedFile { handle })
+            }
+            Storage::Bytes(data) => {
+                let opfs = Opfs::new_window().await?;
+                let handle = opfs.create_tmp_file().await?;
+                let writable = handle.create_writable().await?.dyn_into::<FileSystemWritableFileStream>()?;
+
+                writable.write_with_u8_array(&data)?.await?;
+                Ok(PreparedFile { handle })
+            }
+            Storage::File(handle) => Ok(PreparedFile { handle: handle.clone() })
+        }
     }
 }
 
@@ -412,52 +432,6 @@ async fn array_buffer_chunks(data: &Uint8Array, mut cb: impl FnMut(&[u8])) {
 
         cb(&slice);
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn array_buffer_chunks_async<I, F, E>(data: &Uint8Array, mut init: I, cb: impl Fn(I, &[u8]) -> F) -> Result<I, E>
-    where F: Future<Output = Result<I, E>>
-{
-    // read buffer in 1MB chunks and hash it
-    let chunk_size: u32 = 1024 * 1024;
-    let mut buffer = vec![0u8; chunk_size as usize];
-    let size = data.length();
-    for off in (0..size).step_by(chunk_size as usize) {
-        let end = (off + chunk_size).min(size);
-
-        let slice = &mut buffer[.. (end - off) as usize];
-        data.slice(off, end).copy_to(slice);
-
-        init = cb(init, &slice).await?;
-    }
-    Ok(init)
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn zip_and_commit_wasm(
-    _files: &[FileEntry],
-    _bulk_key: &BulkKey,
-) -> anyhow::Result<(u64, [u8; 32])> {
-    // Legacy scaffold retained for reference. Live wasm path is
-    // `zip_and_commit_wasm_impl`. `OpfsAsyncStage::hash_into_commitment`
-    // doesn't exist on the stage type yet; when it does, restore the
-    // original body from git.
-    todo!("zip_and_commit_wasm: OpfsAsyncStage lacks hash_into_commitment; scaffold-only per Seb 2026-09-20")
-}
-
-/// Worker-scope only. Uses FileSystemSyncAccessHandle for blocking-style
-/// I/O against OPFS. Same shape as the async variant; picked when the
-/// caller is already inside a Worker context and wants to avoid the
-/// promise round-trip per chunk.
-#[cfg(target_arch = "wasm32")]
-pub async fn zip_and_commit_sync_worker(
-    _files: &[FileEntry],
-    _bulk_key: &BulkKey,
-) -> anyhow::Result<(u64, [u8; 32])> {
-    // Legacy scaffold retained for reference. Worker-scope sync-access
-    // handle path. `OpfsSyncStage::hash_into_commitment` doesn't exist on
-    // the stage type yet; restore body from git once it lands.
-    todo!("zip_and_commit_sync_worker: OpfsSyncStage lacks hash_into_commitment; scaffold-only")
 }
 
 fn zip_entry_name(entry: &FileEntry, idx: usize) -> String {
