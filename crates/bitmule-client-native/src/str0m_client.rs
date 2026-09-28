@@ -18,6 +18,7 @@ use std::{collections::HashMap, net::{IpAddr, SocketAddr}, path::{Path, PathBuf}
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitmule_core::SessionId;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use str0m::{
     change::{SdpAnswer, SdpOffer},
@@ -44,7 +45,7 @@ use crate::crypto::{BulkKey, Ephemeral, MetaKey, ShareKey, WrapKey};
 /// ≤4 KiB and N is few tens of peers, so fine — see docs/multipeer.md §5.
 #[derive(Clone)]
 pub struct PoolRecv {
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
     pub source: SocketAddr,
     pub destination: SocketAddr,
 }
@@ -270,7 +271,7 @@ pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
                 match sock.recv_from(&mut buf).await {
                     Ok((n, source)) => {
                         let pr = PoolRecv {
-                            bytes: buf[..n].to_vec(),
+                            bytes: Bytes::copy_from_slice(&buf[..n]),
                             source,
                             destination: dest,
                         };
@@ -339,7 +340,7 @@ pub(crate) fn dispatch_pool_recv_to_rtcs(
         proto: Protocol::Udp,
         source: pr.source,
         destination: pr.destination,
-        contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
+        contents: (&*pr.bytes).try_into().map_err(|_| anyhow!("packet oversize"))?,
     });
     for (idx, rtc) in rtcs.iter_mut().enumerate() {
         if rtc.accepts(&input) {
@@ -620,7 +621,7 @@ async fn channel_write_all(
                     proto: Protocol::Udp,
                     source: pr.source,
                     destination: pr.destination,
-                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
+                    contents: (&*pr.bytes).try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
                 next_timeout = drain_rtc(&mut session.rtc, &session.pool).await?;
@@ -760,7 +761,7 @@ pub async fn recv_file_over_dc(
                     proto: Protocol::Udp,
                     source: pr.source,
                     destination: pr.destination,
-                    contents: pr.bytes.as_slice().try_into().map_err(|_| anyhow!("packet oversize"))?,
+                    contents: (&*pr.bytes).try_into().map_err(|_| anyhow!("packet oversize"))?,
                 });
                 session.rtc.handle_input(input).map_err(|e| anyhow!("handle_input recv: {e}"))?;
                 next_timeout = drain_rtc_capture_data(

@@ -148,9 +148,7 @@ async fn run(
                         proto: Protocol::Udp,
                         source: pr.source,
                         destination: pr.destination,
-                        contents: pr
-                            .bytes
-                            .as_slice()
+                        contents: (&*pr.bytes)
                             .try_into()
                             .map_err(|_| anyhow!("packet oversize"))?,
                     },
