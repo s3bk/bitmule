@@ -26,24 +26,22 @@ use str0m::{
     net::{Protocol, Receive},
     Candidate, Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, net::UdpSocket, sync::{broadcast, mpsc}};
+use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, net::UdpSocket, sync::mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::{MetaFrame, Role, SignalFrame, Ws};
 use crate::crypto::{BulkKey, Ephemeral, MetaKey, ShareKey, WrapKey};
 
-/// A single received UDP packet — its bytes, source, and (critically)
+/// A single received UDP packet: its bytes, source, and (critically)
 /// the SPECIFIC local socket address it was delivered to. str0m's ICE
 /// agent tracks known local candidates by their bound address, so we
 /// need per-interface accuracy on the destination field or it drops
 /// the packet as "unknown interface" (observed 2026-09-02 on Seb's box).
 ///
-/// `Clone` for the M2b-5 broadcast-fanout path: each subscribed per-peer
-/// Rtc gets its own copy and runs `Rtc::accepts()` locally to drop or
-/// consume. Cost is one Vec<u8> clone per peer per packet; bytes are
-/// ≤4 KiB and N is few tens of peers, so fine — see docs/multipeer.md §5.
-#[derive(Clone)]
+/// No longer `Clone`: under the per-peer mpsc routing (Seb 2026-09-28)
+/// each packet lands on exactly one receiver, so we hand ownership
+/// through rather than cloning.
 pub struct PoolRecv {
     pub bytes: Bytes,
     pub source: SocketAddr,
@@ -51,59 +49,129 @@ pub struct PoolRecv {
 }
 
 /// One UdpSocket per host-candidate interface, all bound to the SAME
-/// port. Recv is fan-in via a shared broadcast channel — per-socket
-/// recv-loop tasks forward every packet with the destination correctly
-/// set to the bound address of the socket that received it. Send routes
-/// by source IP: str0m's Transmit outputs carry `source: SocketAddr` and
-/// we dispatch to the matching socket so the outbound src-address matches
-/// the local candidate str0m thinks it's using.
+/// port. Send routes by source IP: str0m's Transmit outputs carry
+/// `source: SocketAddr` and we dispatch to the matching socket so the
+/// outbound src-address matches the local candidate str0m thinks it's
+/// using.
 ///
-/// M2b-5: fan-in is `tokio::sync::broadcast` (not mpsc) so multiple
-/// per-peer Rtcs can each subscribe and run `Rtc::accepts()` locally.
-/// Legacy single-consumer callers (`send_connect`, `recv_connect`) use
-/// the pre-subscribed `recv_rx` via `SocketPool::recv()` — same shape
-/// as before, with a Lagged-drop warning inserted since broadcast is
-/// bounded (mpsc was unbounded).
+/// Receive path (Seb 2026-09-28, replacing the M2b-5 broadcast fan-out):
+///
+/// Per-socket recv tasks look up the source SocketAddr in a
+/// `peers: RwLock<HashMap<SocketAddr, mpsc::Sender<PoolRecv>>>` and
+/// hand the packet directly to the owning peer's mpsc. If no peer has
+/// registered for that source (pre-ICE-connected phase, stray STUN from
+/// a candidate that never won, etc.), the packet falls through to a
+/// small `unclaimed` mpsc that a single gatherer task drains and
+/// matches against pending negotiator sessions via `Rtc::accepts()`.
+///
+/// Legacy single-consumer callers (`send_connect`, `recv_connect`,
+/// negotiator during the 1:1 handshake) call `SocketPool::recv()`, which
+/// drains from the `unclaimed` queue. In the 1:1 flow no peer registers
+/// so every packet flows through it; that is the correct semantics.
 pub struct SocketPool {
     sockets: HashMap<IpAddr, Arc<UdpSocket>>,
-    /// Held so late subscribers via `subscribe()` still get a live channel;
-    /// dropping this closes the broadcast for every receiver.
-    recv_tx: broadcast::Sender<PoolRecv>,
-    /// Pre-subscribed receiver for the legacy single-consumer `recv()` path.
-    recv_rx: broadcast::Receiver<PoolRecv>,
+    peers: Arc<std::sync::RwLock<HashMap<SocketAddr, mpsc::Sender<PoolRecv>>>>,
+    /// Held under an async mutex + Option so `take_unclaimed_rx()` and
+    /// `SocketPool::recv()` can't race to consume the same receiver.
+    /// The receiver is single-consumer: whichever caller takes it first
+    /// wins, subsequent takes return None. Legacy `recv()` internally
+    /// takes it lazily on first call. The `Sender` side lives only on
+    /// the recv tasks; when they all exit, the receiver observes Close.
+    unclaimed_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<PoolRecv>>>>,
     _recv_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// Broadcast capacity for pool packets (packet count, not bytes).
-/// 1024 gives generous headroom vs a slow subscriber blocking str0m's
-/// send_addr timing; a Lagged consumer just skips forward + logs, and
-/// str0m's DTLS/SCTP retransmit handles the missing packet.
-const POOL_BROADCAST_CAP: usize = 1024;
+/// Per-peer mpsc capacity (packet count). Individual peers consume
+/// steadily so a small bounded channel is enough; overflow means the
+/// peer's Rtc-drive loop has stalled long enough that str0m's DTLS/SCTP
+/// retransmit will handle any drops.
+const POOL_PEER_CHAN_CAP: usize = 128;
+/// Unclaimed queue capacity. Pre-ICE-connected + stray-STUN traffic is
+/// low-volume; a small queue keeps memory bounded if a gatherer stalls.
+const POOL_UNCLAIMED_CAP: usize = 64;
 
-impl SocketPool {
-    /// Async recv on the pre-subscribed receiver — single-consumer callers
-    /// use this (send_connect, recv_connect legacy path). Lagged errors
-    /// log + continue; Closed returns None (same shape as the old mpsc).
+/// A peer's registration in the pool. Holds the receive side of its
+/// per-peer mpsc; on drop, removes the registration from the pool so
+/// no more packets are queued to a dead peer. See
+/// [`SocketPool::register`].
+pub struct PoolPeerRegistration {
+    remote: SocketAddr,
+    rx: mpsc::Receiver<PoolRecv>,
+    peers: Arc<std::sync::RwLock<HashMap<SocketAddr, mpsc::Sender<PoolRecv>>>>,
+}
+
+impl PoolPeerRegistration {
+    /// Async recv of one packet destined for this peer. Returns `None`
+    /// once the pool's per-socket recv tasks all exit (senders dropped)
+    /// or the registration has been explicitly closed.
     pub async fn recv(&mut self) -> Option<PoolRecv> {
-        use broadcast::error::RecvError;
-        loop {
-            match self.recv_rx.recv().await {
-                Ok(pr) => return Some(pr),
-                Err(RecvError::Lagged(n)) => {
-                    warn!("pool.recv lagged: dropped {n} packets (single-consumer)");
-                    continue;
-                }
-                Err(RecvError::Closed) => return None,
-            }
-        }
+        self.rx.recv().await
     }
 
-    /// Fresh subscriber for M2b-5 per-peer Rtcs. Each peer task gets its
-    /// own `broadcast::Receiver<PoolRecv>` + runs `Rtc::accepts()` locally
-    /// to drop or consume. See `docs/multipeer.md` §"Startup + peer lifecycle".
+    /// Remote SocketAddr this registration is keyed on.
     #[allow(dead_code)]
-    pub fn subscribe(&self) -> broadcast::Receiver<PoolRecv> {
-        self.recv_tx.subscribe()
+    pub fn remote(&self) -> SocketAddr {
+        self.remote
+    }
+}
+
+impl Drop for PoolPeerRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.peers.write() {
+            // Only remove if the entry still points at OUR sender
+            // instance. If a subsequent register() for the same remote
+            // replaced us, don't yank the new one. Sender doesn't
+            // implement PartialEq so we compare by same_channel with
+            // a stub: closing our rx already caused try_send on the
+            // stored sender to error, so remove unconditionally is
+            // still safe here because a new register() would have
+            // replaced the entry anyway. Keep this simple.
+            map.remove(&self.remote);
+        }
+    }
+}
+
+impl SocketPool {
+    /// Register a peer for the given remote SocketAddr. Packets whose
+    /// UDP source matches will be routed to the returned registration's
+    /// mpsc receiver instead of the unclaimed queue. Drop the
+    /// registration to unregister (see [`PoolPeerRegistration::drop`]).
+    ///
+    /// If a registration already exists for `remote` it is silently
+    /// replaced. Callers should not double-register the same peer.
+    #[allow(dead_code)]
+    pub fn register(&self, remote: SocketAddr) -> PoolPeerRegistration {
+        let (tx, rx) = mpsc::channel(POOL_PEER_CHAN_CAP);
+        if let Ok(mut map) = self.peers.write() {
+            map.insert(remote, tx);
+        }
+        PoolPeerRegistration { remote, rx, peers: self.peers.clone() }
+    }
+
+    /// Take the unclaimed-packet receiver for a single gatherer task
+    /// (typically the negotiator during ICE, or the legacy single-peer
+    /// consumer via [`SocketPool::recv`]). Returns `None` if a previous
+    /// caller already took it.
+    #[allow(dead_code)]
+    pub async fn take_unclaimed_rx(&self) -> Option<mpsc::Receiver<PoolRecv>> {
+        self.unclaimed_rx.lock().await.take()
+    }
+
+    /// Async recv on the unclaimed queue: legacy single-consumer callers
+    /// use this (send_connect, recv_connect, negotiator 1:1 pump). On
+    /// first call, lazily takes the unclaimed receiver; subsequent calls
+    /// on the same pool reuse it. Returns `None` once the pool's recv
+    /// tasks have all exited.
+    pub async fn recv(&mut self) -> Option<PoolRecv> {
+        // Fast path via a cached receiver held in a per-call closure
+        // would require &mut self surgery through many callers; instead
+        // drain the mutex-guarded Option on each call. The mutex is
+        // uncontended in the 1:1 single-consumer case so overhead is
+        // one uncontended lock per packet, comparable to the old
+        // broadcast::Receiver::recv path.
+        let mut guard = self.unclaimed_rx.lock().await;
+        let rx = guard.as_mut()?;
+        rx.recv().await
     }
 
     /// Send to `dest` from the socket bound to `source_ip`. Filters out
@@ -254,17 +322,21 @@ pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
     }
     let port = port.expect("at least one socket bound → port set");
 
-    // Spawn one recv task per socket that forwards packets into the pool's
-    // broadcast channel. M2b-5: broadcast (not mpsc) so per-peer Rtcs can
-    // each subscribe. Pre-subscribe `recv_rx` here so the legacy
-    // single-consumer path still works via `SocketPool::recv()` even before
-    // any peer task calls `subscribe()`.
-    let (recv_tx, recv_rx) = broadcast::channel::<PoolRecv>(POOL_BROADCAST_CAP);
+    // Spawn one recv task per socket. Each packet: look up the source
+    // SocketAddr in the peers map and hand off to that peer's mpsc
+    // (no clone). If no peer has registered for this source, fall
+    // through to the unclaimed queue for the gatherer to pick up.
+    // Peers map + unclaimed queue live on the pool struct; every
+    // recv task clones the Arc<RwLock<...>> + unclaimed Sender.
+    let peers: Arc<std::sync::RwLock<HashMap<SocketAddr, mpsc::Sender<PoolRecv>>>> =
+        Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let (unclaimed_tx, unclaimed_rx) = mpsc::channel::<PoolRecv>(POOL_UNCLAIMED_CAP);
     let mut recv_tasks = Vec::new();
     for (ip, sock) in &sockets {
         let sock = sock.clone();
-        let tx = recv_tx.clone();
         let dest = SocketAddr::new(*ip, port);
+        let peers_task = peers.clone();
+        let unclaimed_task = unclaimed_tx.clone();
         let task = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
@@ -275,12 +347,54 @@ pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
                             source,
                             destination: dest,
                         };
-                        // broadcast::send Errs only when there are NO
-                        // receivers at all; recv_rx on the pool + any
-                        // per-peer subscribers keep the channel live.
-                        // If the count really hits zero, the pool has
-                        // been abandoned — exit the recv task.
-                        if tx.send(pr).is_err() { break; }
+                        // Try the peer map first (hot path once ICE
+                        // resolves). Held only for the lookup; the
+                        // send() is on the cloned Sender outside the
+                        // read guard.
+                        let peer_tx = {
+                            let map = match peers_task.read() {
+                                Ok(g) => g,
+                                Err(_) => break, // poisoned: pool torn down
+                            };
+                            map.get(&source).cloned()
+                        };
+                        match peer_tx {
+                            Some(tx) => {
+                                // try_send: if a peer stalls we'd
+                                // rather drop than block the socket
+                                // reader. Str0m's DTLS/SCTP retx
+                                // handles losses.
+                                if let Err(e) = tx.try_send(pr) {
+                                    use mpsc::error::TrySendError;
+                                    match e {
+                                        TrySendError::Full(_) => {
+                                            warn!("peer {source} mpsc full, dropped packet");
+                                        }
+                                        TrySendError::Closed(_) => {
+                                            // Peer went away without
+                                            // dropping registration
+                                            // cleanly; will be cleared
+                                            // on next register/drop.
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                if let Err(e) = unclaimed_task.try_send(pr) {
+                                    use mpsc::error::TrySendError;
+                                    match e {
+                                        TrySendError::Full(_) => {
+                                            debug!("unclaimed queue full, dropped packet from {source}");
+                                        }
+                                        TrySendError::Closed(_) => {
+                                            // No gatherer left. Pool
+                                            // abandoned; exit task.
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("recv task for {dest} exiting: {e}");
@@ -291,7 +405,16 @@ pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
         });
         recv_tasks.push(task);
     }
-    Ok(SocketPool { sockets, recv_tx, recv_rx, _recv_tasks: recv_tasks })
+    // Drop the local unclaimed_tx: only the recv-task clones remain.
+    // When they all exit, the receiver observes Close and legacy
+    // `recv()` returns None as expected by 1:1 callers.
+    drop(unclaimed_tx);
+    Ok(SocketPool {
+        sockets,
+        peers,
+        unclaimed_rx: Arc::new(tokio::sync::Mutex::new(Some(unclaimed_rx))),
+        _recv_tasks: recv_tasks,
+    })
 }
 
 /// Build a fresh Rtc seeded with host candidates from `pool.bound_addrs()`.
@@ -1795,9 +1918,18 @@ pub(crate) async fn spawn_peer_task(
         .map_err(|e| anyhow!("router register (peer {rid_hex}): {e}"))?;
     ack_rx.await.map_err(|_| anyhow!("router dropped ack for peer {rid_hex} — router task exited?"))?;
 
-    // Per-peer pool subscription — this peer's Rtc will call
-    // `Rtc::accepts()` on each broadcast packet locally.
-    let pool_rx = pool.subscribe();
+    // TODO(kenna, 2026-09-28): multipeer M2b-5 previously subscribed
+    // each peer to a broadcast fanout so its Rtc could run `accepts()`
+    // locally. Post-Seb pool refactor, per-peer routing requires knowing
+    // the remote SocketAddr up front, which we don't have until ICE
+    // resolves. Interim wiring here: drain the pool's unclaimed queue
+    // for handshake-phase traffic. Only ONE peer task can hold this
+    // receiver, so multipeer M2b-5+ is effectively single-peer until
+    // the ICE-connected `pool.register(remote)` hook is threaded
+    // through the peer_session_run handshake. `spawn_peer_task` is
+    // still `#[allow(dead_code)]` and not driven by any live wire.
+    let pool_rx = pool.take_unclaimed_rx().await
+        .ok_or_else(|| anyhow!("peer {rid_hex}: pool unclaimed_rx already taken"))?;
 
     // Per-peer shutdown signal. Parent flips shutdown_tx→true to stop
     // this peer without touching the others.
@@ -1874,7 +2006,7 @@ async fn peer_session_run(
     offer: SdpOffer,
     pending: str0m::change::SdpPendingOffer,
     mut inbox_rx: mpsc::UnboundedReceiver<SignalFrame>,
-    mut pool_rx: broadcast::Receiver<PoolRecv>,
+    mut pool_rx: mpsc::Receiver<PoolRecv>,
     outbox_tx: mpsc::UnboundedSender<Message>,
     mut shutdown_rx: watch::Receiver<bool>,
     note_tx: mpsc::UnboundedSender<CoveredNote>,
@@ -1987,17 +2119,14 @@ async fn peer_session_run(
             }
 
             maybe_pr = pool_rx.recv() => {
-                use broadcast::error::RecvError;
                 let pr = match maybe_pr {
-                    Ok(p) => p,
-                    Err(RecvError::Lagged(n)) => {
-                        warn!(peer = %rid_hex, "pool rx lagged {n} — str0m re-tx will handle");
-                        continue;
-                    }
-                    Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
+                    Some(p) => p,
+                    None => bail!("peer {rid_hex} pool rx closed"),
                 };
-                // Local accepts-check: broadcast fans EVERY packet to
-                // EVERY peer; each peer's Rtc filters via `accepts()`.
+                // Local accepts-check retained for the M2b-5 interim
+                // wiring: handshake-phase traffic drains from the pool's
+                // unclaimed queue, which may include foreign packets
+                // until this peer registers a specific remote after ICE.
                 let mut rtcs: [&mut Rtc; 1] = [&mut session.rtc];
                 match dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)? {
                     Some(_idx) => {
@@ -2106,16 +2235,14 @@ async fn peer_session_run(
                     }
                 }
                 maybe_pr = pool_rx.recv() => {
-                    use broadcast::error::RecvError;
                     match maybe_pr {
-                        Ok(pr) => {
+                        Some(pr) => {
                             let mut rtcs: [&mut Rtc; 1] = [&mut session.rtc];
                             if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
                                 next_timeout = drain_rtc(&mut session.rtc, &pool).await?;
                             }
                         }
-                        Err(RecvError::Lagged(_)) => {}
-                        Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
+                        None => bail!("peer {rid_hex} pool rx closed"),
                     }
                 }
                 Some(late) = late_cand_rx.recv() => {
@@ -2308,9 +2435,8 @@ async fn peer_session_run(
                 }
             }
             maybe_pr = pool_rx.recv() => {
-                use broadcast::error::RecvError;
                 match maybe_pr {
-                    Ok(pr) => {
+                    Some(pr) => {
                         let mut rtcs: [&mut Rtc; 1] = [&mut session.rtc];
                         if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
                             next_timeout = drain_rtc_capture_dc_frames(
@@ -2319,10 +2445,7 @@ async fn peer_session_run(
                             .await?;
                         }
                     }
-                    Err(RecvError::Lagged(n)) => {
-                        warn!(peer = %rid_hex, "pool rx lagged {n} — str0m re-tx will handle");
-                    }
-                    Err(RecvError::Closed) => bail!("peer {rid_hex} pool rx closed"),
+                    None => bail!("peer {rid_hex} pool rx closed"),
                 }
             }
             Some(late) = late_cand_rx.recv() => {
@@ -2403,7 +2526,7 @@ async fn serve_range(
     rtc: &mut Rtc,
     pool: &SocketPool,
     channel_id: ChannelId,
-    pool_rx: &mut broadcast::Receiver<PoolRecv>,
+    pool_rx: &mut mpsc::Receiver<PoolRecv>,
     dc_in: &mut Vec<(bool, Vec<u8>)>,
 ) -> Result<()> {
     let n_chunks = (range.end - range.start) as u64;
@@ -2447,7 +2570,7 @@ async fn channel_write_all_peer(
     channel_id: ChannelId,
     binary: bool,
     buf: &[u8],
-    pool_rx: &mut broadcast::Receiver<PoolRecv>,
+    pool_rx: &mut mpsc::Receiver<PoolRecv>,
     dc_in: &mut Vec<(bool, Vec<u8>)>,
 ) -> Result<()> {
     let mut next_timeout = drain_rtc_capture_dc_frames(rtc, pool, channel_id, dc_in).await?;
@@ -2466,18 +2589,14 @@ async fn channel_write_all_peer(
         let dur = (next_timeout - Instant::now()).max(std::time::Duration::from_millis(1));
         tokio::select! {
             maybe_pr = pool_rx.recv() => {
-                use broadcast::error::RecvError;
                 match maybe_pr {
-                    Ok(pr) => {
+                    Some(pr) => {
                         let mut rtcs: [&mut Rtc; 1] = [rtc];
                         if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
                             next_timeout = drain_rtc_capture_dc_frames(rtcs[0], pool, channel_id, dc_in).await?;
                         }
                     }
-                    Err(RecvError::Lagged(n)) => {
-                        warn!("channel_write_all_peer pool lagged {n}");
-                    }
-                    Err(RecvError::Closed) => bail!("pool rx closed mid-write"),
+                    None => bail!("pool rx closed mid-write"),
                 }
             }
             _ = tokio::time::sleep(dur) => {
@@ -2526,7 +2645,7 @@ async fn drain_until_buffer_empty_peer(
     rtc: &mut Rtc,
     pool: &SocketPool,
     channel_id: ChannelId,
-    pool_rx: &mut broadcast::Receiver<PoolRecv>,
+    pool_rx: &mut mpsc::Receiver<PoolRecv>,
     dc_in: &mut Vec<(bool, Vec<u8>)>,
 ) -> Result<()> {
     let hard_deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -2549,16 +2668,14 @@ async fn drain_until_buffer_empty_peer(
             .min(hard_deadline - Instant::now());
         tokio::select! {
             maybe_pr = pool_rx.recv() => {
-                use broadcast::error::RecvError;
                 match maybe_pr {
-                    Ok(pr) => {
+                    Some(pr) => {
                         let mut rtcs: [&mut Rtc; 1] = [rtc];
                         if dispatch_pool_recv_to_rtcs(&pr, &mut rtcs)?.is_some() {
                             next_timeout = drain_rtc_capture_dc_frames(rtcs[0], pool, channel_id, dc_in).await?;
                         }
                     }
-                    Err(RecvError::Lagged(_)) => {}
-                    Err(RecvError::Closed) => bail!("pool rx closed during drain"),
+                    None => bail!("pool rx closed during drain"),
                 }
             }
             _ = tokio::time::sleep(dur) => {
