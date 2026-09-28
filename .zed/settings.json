@@ -6,7 +6,7 @@
   "lsp": {
     "rust-analyzer": {
       "initialization_options": {
-        "cargo": {
+        "_cargo": {
           "target": "wasm32-unknown-unknown",
           "extraArgs": [
             "--exclude", "bitmule",
@@ -20,6 +20,14 @@
             "--exclude", "fountain-demo",
             "--exclude", "fountain-demo-v2",
             "--exclude", "raptor-demo",
+          ]
+        },
+        "cargo": {
+          "extraArgs": [
+            "--exclude", "bitmule-e2e-tests",
+            "--exclude", "bitmule-qt6",
+            "--exclude", "bitmule-gtk4",
+            "--exclude", "bitmule-mobile-ffi",
           ]
         },
       },
