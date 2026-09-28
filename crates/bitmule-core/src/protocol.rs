@@ -190,12 +190,12 @@ pub mod websocket {
             pub_key: PublicKey,
             mac: SessionMac,
         },
-        SendToX3DH {
+        SendTo1 {
             dest_id: ReceiverId,
             // encrypted with dest's public key and signed by senders public key
-            msg: Envelope<OuterKeyKind, X3DH>,
+            msg: Envelope<OuterKeyKind, ECDH>,
         },
-        SendTo {
+        SendTo2 {
             dest_id: ReceiverId,
             // encrypted with the peers X3DH key
             msg: Envelope<InnerKeyKind, Peer2Peer>,
@@ -216,16 +216,16 @@ pub mod websocket {
             mac: SessionMac,
         },
         // someone sent us a message
-        PeerMessageX3DH {
+        PeerMessage1 {
             from: ReceiverId,
-            data: Envelope<OuterKeyKind, X3DH>,
+            data: Envelope<OuterKeyKind, ECDH>,
         },
-        PeerMessage {
+        PeerMessage2 {
             from: ReceiverId,
             data: Envelope<InnerKeyKind, Peer2Peer>,
         }
     }
-    struct X3DH {
+    struct ECDH {
         /// Initiator sends its X25519 ephemeral. Runs after the initiator
         /// has verified the counterpart's pub_key via `mac = HMAC(A, pub_key)`
         /// from PeerJoined — otherwise no point (nothing to bind identity to).
@@ -272,6 +272,7 @@ pub mod websocket {
         // sender informs the client to fetch data via relay
         JoinRelay,
 
+        Progress(u64),
         // receiver has completed the transfer (and will exit)
         Complete,
     }

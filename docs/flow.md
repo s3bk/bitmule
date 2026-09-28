@@ -4,14 +4,13 @@ R := relay
 
 C1 -> R     GET /api/v0.1/pow-level
 C1 -> R     connect to /api/v0.1/create?sid=abdefg&pow=42
-              wire-version = v0.1
-              session-id = abdefg
-              pow=42
+              server verifies POW before the websocket handshake
+
 C1 -> R     send CreateSession
               id (our id, randomly generated)
               capabilities (relay + SDP optional)
               pub_key (our public key, valid for this sid)
-              mac (proof that we know the transfer key)
+              mac (proof that we know the share key)
 R -> C1     send SessionCreated
 
 C2 -> R     connect to /api/v0.1/join?sid=abdefg
@@ -19,27 +18,27 @@ C2 -> R     send JoinSession
               id (our id, randomly generated)
               capabilities (relay + SDP optional)
               pub_key (our public key, valid for this sid)
-              mac (proof that we know the transfer key)
+              mac (proof that we know the share key)
 R -> C2     send SessionJoined
               C2 now knows C1's id, caps, pub_key and has verfied mac
 R -> C1     send PeerJoined
               C1 now knows C2's id, caps, pub_key and has verfied mac
 
-C1 & C2 generate their X3DH keys for the (C1, C2) connection
+C1 & C2 generate their ECDH keys for the (C1, C2) connection
 
-C1 -> R     send SendToX3DH
+C1 -> R     send SendTo1
               dest_id = C2
               data = X25519 ephemeral
-R -> C2     send PeerMessageX3DH (data from C1)
+R -> C2     send PeerMessage1 (data from C1)
 
-C2 -> R     send SendToX3DH
+C2 -> R     send SendTo1
                 dest_id = C1
                 data = X25519 ephemeral
-R -> C1     send PeerMessageX3DH (data from C2)
+R -> C1     send PeerMessage1 (data from C2)
 
-C1 & C2     finish the X3DH handshake and compute the new encryption keys
+C1 & C2     finish the ECDH handshake and compute the new encryption keys
 
-The following messages are Peer2Peer tunneled though the relay via SendTo and recieved via PeerMessage
+The following messages are Peer2Peer tunneled though the relay via SendTo and recieved via PeerMessage2
 
 C1 -> C2    send Manifest
 C2          decides to initiate SDP or not.
