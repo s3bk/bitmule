@@ -190,10 +190,15 @@ pub mod websocket {
             pub_key: PublicKey,
             mac: SessionMac,
         },
-        SendTo {
+        SendToX3DH {
             dest_id: ReceiverId,
             // encrypted with dest's public key and signed by senders public key
             msg: Envelope<OuterKeyKind, X3DH>,
+        },
+        SendTo {
+            dest_id: ReceiverId,
+            // encrypted with the peers X3DH key
+            msg: Envelope<InnerKeyKind, Peer2Peer>,
         }
     }
     enum ServerToClient {
@@ -211,7 +216,7 @@ pub mod websocket {
             mac: SessionMac,
         },
         // someone sent us a message
-        X3DH {
+        PeerMessageX3DH {
             from: ReceiverId,
             data: Envelope<OuterKeyKind, X3DH>,
         },
@@ -220,13 +225,10 @@ pub mod websocket {
             data: Envelope<InnerKeyKind, Peer2Peer>,
         }
     }
-    enum X3DH {
+    struct X3DH {
         /// Initiator sends its X25519 ephemeral. Runs after the initiator
         /// has verified the counterpart's pub_key via `mac = HMAC(A, pub_key)`
         /// from PeerJoined — otherwise no point (nothing to bind identity to).
-        Init {
-            ephemeral_pub: [u8; 32],
-        },
 
         /// Responder sends its X25519 ephemeral. Both sides now hold
         /// (IK_A, IK_B, EK_A, EK_B) and derive:
@@ -241,9 +243,9 @@ pub mod websocket {
         /// The `IK_A_pub || IK_B_pub` binding in `info` is X3DH's "AD"
         /// (associated data) — prevents identity-key-substitution attacks
         /// where a third party swaps in different IKs but reuses ephemerals.
-        Response {
-            ephemeral_pub: [u8; 32],
-        },
+
+        ephemeral_pub: [u8; 32],
+
     }
 
     enum Peer2Peer {
