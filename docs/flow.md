@@ -8,18 +8,28 @@ C1 -> R     connect to /api/v0.1/create?sid=abdefg&pow=42
               session-id = abdefg
               pow=42
 C1 -> R     send CreateSession
+              id (our id, randomly generated)
+              capabilities (relay + SDP optional)
+              pub_key (our public key, valid for this sid)
+              mac (proof that we know the transfer key)
 R -> C1     send SessionCreated
 
 C2 -> R     connect to /api/v0.1/join?sid=abdefg
 C2 -> R     send JoinSession
+              id (our id, randomly generated)
+              capabilities (relay + SDP optional)
+              pub_key (our public key, valid for this sid)
+              mac (proof that we know the transfer key)
 R -> C2     send SessionJoined
+              C2 now knows C1's id, caps, pub_key and has verfied mac
 R -> C1     send PeerJoined
+              C1 now knows C2's id, caps, pub_key and has verfied mac
 
 C1 & C2 generate their X3DH keys for the (C1, C2) connection
 
 C1 -> R     send SendToX3DH
               dest_id = C2
-              data=X3DH
+              data = X25519 ephemeral
 R -> C2     send PeerMessageX3DH (data from C1)
 
 C2 -> R     send SendToX3DH
@@ -27,7 +37,7 @@ C2 -> R     send SendToX3DH
                 data = X25519 ephemeral
 R -> C1     send PeerMessageX3DH (data from C2)
 
-C1 & C2     finish the X3DH handshake
+C1 & C2     finish the X3DH handshake and compute the new encryption keys
 
 The following messages are Peer2Peer tunneled though the relay via SendTo and recieved via PeerMessage
 
