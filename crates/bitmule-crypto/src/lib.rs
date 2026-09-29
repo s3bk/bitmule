@@ -29,6 +29,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
 use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 use zeroize::Zeroize;
@@ -401,6 +402,7 @@ impl WrapKey {
 
 /// Bulk stream key B. Fresh per transfer, wiped on drop.
 #[derive(Clone)]
+#[derive(Serialize, Deserialize)]
 pub struct BulkKey(pub [u8; 32]);
 impl Drop for BulkKey { fn drop(&mut self) { self.0.zeroize(); } }
 

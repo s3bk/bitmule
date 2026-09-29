@@ -1,8 +1,9 @@
 use std::marker::PhantomData;
 
-use crate::{Error, Result};
+use crate::{Error};
 use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 /// Two-layer crypto model:
@@ -14,9 +15,22 @@ use sha2::Sha256;
 
 pub struct SessionKey(pub [u8; 32]);
 pub struct ContentKey(pub [u8; 32]);
+#[derive(Serialize, Deserialize)]
 pub struct PublicKey(pub [u8; 32]);
+#[derive(Serialize, Deserialize)]
 pub struct SessionMac(pub [u8; 32]);
 pub struct WrappedContentKey(pub Vec<u8>);
+
+impl From<x25519_dalek::PublicKey> for PublicKey {
+    fn from(value: x25519_dalek::PublicKey) -> Self {
+        PublicKey(value.to_bytes())
+    }
+}
+impl Into<x25519_dalek::PublicKey> for PublicKey {
+    fn into(self) -> x25519_dalek::PublicKey {
+        x25519_dalek::PublicKey::from(self.0)
+    }
+}
 
 /// X25519 key exchange for peer→peer session key agreement via signaling.
 pub struct KeyExchange {
@@ -48,14 +62,14 @@ impl KeyExchange {
 }
 
 impl SessionKey {
-    pub fn encrypt_chunk(&self, nonce: &[u8; 24], plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub fn encrypt_chunk(&self, nonce: &[u8; 24], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
         let cipher = XChaCha20Poly1305::new(self.0.as_slice().into());
         cipher
             .encrypt(XNonce::from_slice(nonce), plaintext)
             .map_err(|e| Error::Crypto(format!("encrypt: {e}")))
     }
 
-    pub fn decrypt_chunk(&self, nonce: &[u8; 24], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt_chunk(&self, nonce: &[u8; 24], ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let cipher = XChaCha20Poly1305::new(self.0.as_slice().into());
         cipher
             .decrypt(XNonce::from_slice(nonce), ciphertext)

@@ -20,3 +20,4 @@ base64 = "0.22"
 getrandom = { version = "0.2", features = ["js"] }
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 futures-lite = "2"
+serde = { workspace = true, features = ["derive"] }

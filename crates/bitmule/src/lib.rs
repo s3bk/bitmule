@@ -84,6 +84,7 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
 pub use native::TransportMode;
+mod v2;
 
 // -----------------------------------------------------------------------
 // Errors

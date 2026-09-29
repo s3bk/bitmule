@@ -1,7 +1,8 @@
-use crate::{Error, Result};
+use crate::{Error};
+use bytes::Bytes;
 use rand::RngCore;
 use roaring::RoaringBitmap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 
 /// Unique identifier for a transfer session.
 ///
@@ -32,7 +33,7 @@ impl SessionId {
         &self.0
     }
 
-    pub fn from_hex(s: &str) -> Result<Self> {
+    pub fn from_hex(s: &str) -> Result<Self, Error> {
         let v = hex::decode(s).map_err(|e| Error::Protocol(format!("session hex: {e}")))?;
         if v.len() != 32 {
             return Err(Error::Protocol(format!(
@@ -57,7 +58,7 @@ impl ReceiverId {
         hex::encode(self.0)
     }
 
-    pub fn from_hex(s: &str) -> Result<Self> {
+    pub fn from_hex(s: &str) -> Result<Self, Error> {
         let v = hex::decode(s).map_err(|e| Error::Protocol(format!("receiver hex: {e}")))?;
         if v.len() != 32 {
             return Err(Error::Protocol(format!(
@@ -160,9 +161,11 @@ pub mod websocket {
     use bytes::Bytes;
 
     use bitmule_crypto::BulkKey;
+use serde::{Deserialize, Serialize};
     use crate::{ContentKey, ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
 
     bitflags! {
+        #[derive(Serialize, Deserialize)]
         pub struct PeerCaps: u8 {
             const RELAY = 1;
             const WEBRTC = 2;
@@ -173,7 +176,8 @@ pub mod websocket {
     // session-id part of URL
     // pow part of URL
     // pow difficulto obtained via GET before connecting
-    enum ClientToServer {
+    #[derive(Serialize, Deserialize)]
+    pub enum ClientToServer {
         /*
             * server stores public-keys of session creator
             * and sends it to joining peers
@@ -201,7 +205,12 @@ pub mod websocket {
             msg: Envelope<InnerKeyKind, Peer2Peer>,
         }
     }
-    enum ServerToClient {
+
+    #[derive(Serialize, Deserialize)]
+    pub enum ServerToClient {
+        // just display it or ignore it
+        Text(String),
+
         SessionCreated,
         // we just joined a session, here is the info of the session owner
         SessionJoined {
@@ -225,7 +234,9 @@ pub mod websocket {
             data: Envelope<InnerKeyKind, Peer2Peer>,
         }
     }
-    struct ECDH {
+
+    #[derive(Serialize, Deserialize)]
+    pub struct ECDH {
         /// Initiator sends its X25519 ephemeral. Runs after the initiator
         /// has verified the counterpart's pub_key via `mac = HMAC(A, pub_key)`
         /// from PeerJoined — otherwise no point (nothing to bind identity to).
@@ -244,11 +255,12 @@ pub mod websocket {
         /// (associated data) — prevents identity-key-substitution attacks
         /// where a third party swaps in different IKs but reuses ephemerals.
 
-        ephemeral_pub: [u8; 32],
+        pub ephemeral_pub: PublicKey,
 
     }
 
-    enum Peer2Peer {
+    #[derive(Serialize, Deserialize)]
+    pub enum Peer2Peer {
         // turn into proper struct
         IceCandidate(String),
         SdpOffer(SdpOffer),
@@ -279,20 +291,24 @@ pub mod websocket {
     /// WebRTC session description, offer half. Wire form is the standard
     /// SDP text blob (RFC 8866). The offer/answer distinction is carried
     /// by the enum variant, so we don't repeat a `type` field inside.
-    struct SdpOffer {
-        sdp: String,
+    #[derive(Serialize, Deserialize)]
+    pub struct SdpOffer {
+        pub sdp: String,
     }
-    struct SdpAnswer {
-        sdp: String,
+    #[derive(Serialize, Deserialize)]
+    pub struct SdpAnswer {
+        pub sdp: String,
     }
 
-
+    #[derive(Serialize, Deserialize, Clone)]
     pub struct TransferManifest {
         pub transfer_typ: TransferType,
         pub block_size: u32,
         pub transfer_size: u64,
         pub bulk_key: BulkKey,
     }
+
+    #[derive(Serialize, Deserialize, Clone)]
     pub enum TransferType {
         SingleFile {
             compression: Option<Compression>,
@@ -305,8 +321,49 @@ pub mod websocket {
         pub file_name: Option<String>,
         pub file_size: u64, // uncompressed file size
     }
+
+    #[derive(Serialize, Deserialize, Clone)]
     pub enum Compression {
-        Brotli,
         Zstd,
+    }
+}
+
+pub struct Encoded<T> {
+    value: T,
+    bytes: Bytes,
+}
+impl<T> std::ops::Deref for Encoded<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+impl<T: Serialize> From<T> for Encoded<T> {
+    fn from(value: T) -> Self {
+        let bytes = postcard::to_stdvec(&value).unwrap().into();
+        Encoded { value, bytes }
+    }
+}
+impl<T> Serialize for Encoded<T> {
+    fn serialize<S>(&self, serializer: S) -> std::prelude::v1::Result<S::Ok, S::Error>
+    where
+        S: Serializer
+    {
+        self.bytes.serialize(serializer)
+    }
+}
+impl<'de, T> Deserialize<'de> for Encoded<T>
+where
+    T: DeserializeOwned,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let bytes = Bytes::deserialize(deserializer)?;
+        let value = postcard::from_bytes::<T>(&bytes).map_err(D::Error::custom)?;
+        Ok(Encoded { value, bytes })
     }
 }

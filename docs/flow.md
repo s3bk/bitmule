@@ -2,8 +2,12 @@ C1 := client 1
 C2 := client 2
 R := relay
 
-C1 -> R     GET /api/v0.1/pow-level
-C1 -> R     connect to /api/v0.1/create?sid=abdefg&pow=42
+C1 -> R     GET /api/v0.1/pow/challenge
+              returns level, magic
+C1          generate reconnect token and solve
+            HASH(session_id, reconnect_token, magic, nonce).leading_zeros() == level
+            
+C1 -> R     connect to /api/v0.1/create?sid=abdefg&pow=42&token=deadcat
               server verifies POW before the websocket handshake
 
 C1 -> R     send CreateSession
@@ -24,7 +28,7 @@ R -> C2     send SessionJoined
 R -> C1     send PeerJoined
               C1 now knows C2's id, caps, pub_key and has verfied mac
 
-C1 & C2 generate their ECDH keys for the (C1, C2) connection
+C1 & C2     generate their ECDH keys for the (C1, C2) connection
 
 C1 -> R     send SendTo1
               dest_id = C2

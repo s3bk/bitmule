@@ -32,8 +32,6 @@ pub enum Error {
     BadManifest(String),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
-
 pub struct ChunkHasher {
     inner: xxh3::Xxh3
 }

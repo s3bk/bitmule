@@ -1,3 +1,4 @@
+use serde::{Deserialize, Deserializer, Serializer};
 use x25519_dalek::{PublicKey, StaticSecret, SharedSecret};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -8,7 +9,7 @@ use zeroize::Zeroize;
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 
-use crate::SessionId;
+use crate::{SessionId, crypto};
 
 fn concat2<const N: usize, const M: usize, const O: usize>(a: &[u8; N], b: &[u8; M]) -> [u8; O] {
     if N + M != O {
@@ -54,7 +55,6 @@ pub struct Envelope<KeyKind, T> {
     data: Vec<u8>,
 }
 
-
 /// Peer static identity: X25519 keypair.
 pub struct IdentityKeypair {
     secret: StaticSecret,
@@ -66,6 +66,9 @@ impl IdentityKeypair {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         Self { secret, public }
+    }
+    pub fn public_key(&self) -> crate::crypto::PublicKey {
+        crate::crypto::PublicKey(self.public.to_bytes())
     }
 
     /// Derive the outer_key shared with `peer_pub` under this session.
@@ -207,6 +210,9 @@ impl EphemeralKeypair {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         Self { secret, public }
+    }
+    pub fn public_key(&self) -> crypto::PublicKey {
+        crypto::PublicKey(self.public.to_bytes())
     }
 }
 
@@ -594,5 +600,48 @@ mod tests {
         let bogus_frame = X3DHFrame { ephemeral_pub: [0u8; 32] };
         let err = state.recv_x3dh(bogus_frame, &session_id);
         assert!(matches!(err, Err(StateError::InvalidTransition)));
+    }
+}
+
+
+#[derive(Serialize)]
+#[serde(rename = "Envelope")]
+struct EnvelopeRef<'a> {
+    counter: u32,
+    nonce: [u8; 12],
+    // #[serde(with = "serde_bytes")] // optional, see note below
+    data: &'a [u8],
+}
+
+// Owned form for deserializing
+#[derive(Deserialize)]
+#[serde(rename = "Envelope")]
+struct EnvelopeOwned {
+    counter: u32,
+    nonce: [u8; 12],
+    // #[serde(with = "serde_bytes")] // optional, see note below
+    data: Vec<u8>,
+}
+impl<KeyKind, T> Serialize for Envelope<KeyKind, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        EnvelopeRef {
+            counter: self.counter,
+            nonce: self.nonce,
+            data: &self.data,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de, KeyKind, T> Deserialize<'de> for Envelope<KeyKind, T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let EnvelopeOwned { counter, nonce, data } = EnvelopeOwned::deserialize(deserializer)?;
+        Ok(Envelope {
+            _k: PhantomData,
+            _m: PhantomData,
+            counter,
+            nonce,
+            data,
+        })
     }
 }
