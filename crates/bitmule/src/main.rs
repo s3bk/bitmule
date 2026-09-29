@@ -622,7 +622,6 @@ mod tests {
     use std::sync::Arc;
     use bitmule_core::traits::ChunkStore;
     use bitmule_server::{state::AppState, ws::ws_join_session};
-    use bitmule_server_store_fs::FsChunkStore;
 
     /// End-to-end round-trip: spawn an in-process bitmule-server on a
     /// random localhost port, call `prepare_and_spawn_send` on a random
