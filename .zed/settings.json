@@ -22,14 +22,6 @@
             "--exclude", "raptor-demo",
           ]
         },
-        "cargo": {
-          "extraArgs": [
-            "--exclude", "bitmule-e2e-tests",
-            "--exclude", "bitmule-qt6",
-            "--exclude", "bitmule-gtk4",
-            "--exclude", "bitmule-mobile-ffi",
-          ]
-        },
       },
     },
   },
