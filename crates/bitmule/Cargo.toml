@@ -13,13 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 bitmule-core = { path = "../bitmule-core" }
+bitmule-client-common = { path = "../bitmule-client-common" }
 bitmule-client-native = { path = "../bitmule-client-native" }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 bytes = { workspace = true }
@@ -33,6 +34,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 percent-encoding = "2"
 tempfile = { workspace = true }
+thiserror = "2"
 
 [dev-dependencies]
 # In-process bitmule-server for integration tests — lets us spawn the

@@ -19,52 +19,39 @@
 use std::sync::Arc;
 
 use crate::{
-    room::{PeerEntry, PeerSink, Role}, state::{AppState, SessionState},
+    Magic, room::{PeerEntry, PeerSink, Role, SendError}, state::{AppState, SessionState},
 };
+use anyhow::bail;
 use axum::{
     extract::{
-        Path, State, ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State, ws::{Message, WebSocket, WebSocketUpgrade},
     }, http::StatusCode, response::IntoResponse,
 };
-use bitmule_core::{ReceiverId, SessionId, pow};
+use bitmule_core::{ReceiverId, SessionId, pow, protocol::websocket::{ClientToServer, ServerToClient}};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::{select, sync::mpsc};
+use tracing::{error, warn};
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum JoinFrame {
-    /// Sender opens a new session slot on this ws.
-    SessionCreate {
-        /// Client wire-protocol version. Server stores per peer and
-        /// includes in `peer_joined` notifications so the counterpart
-        /// can detect version mismatch and prompt an update.
-        #[serde(default)]
-        wire_version: Option<u32>,
-        /// Chunk-transports this side is willing to speak (preference
-        /// order). Values from `{"webrtc","relay"}`. Server copies into
-        /// the counterpart's PeerJoined so each side picks the
-        /// intersection at KEX time. `None` = pre-v3 client, treated
-        /// as `["webrtc","relay"]` by the peer for backward-compat.
-        #[serde(default)]
-        transports: Option<Vec<String>>,
-    },
-    /// Receiver joins an existing session slot on this ws.
-    SessionJoin {
-        receiver_id: ReceiverId,
-        #[serde(default)]
-        wire_version: Option<u32>,
-        #[serde(default)]
-        transports: Option<Vec<String>>,
-    },
+#[derive(Deserialize)]
+pub struct CreateSessionArgs {
+    sid: String,
+    magic: Magic,
+    nonce: u64,
 }
+
+#[derive(Deserialize)]
+pub struct JoinSessionArgs {
+    sid: String,
+}
+
 
 pub async fn ws_join_session(
     ws: WebSocketUpgrade,
-    Path(session_hex): Path<String>,
-    State(state): State<AppState>,
+    Query(args): Query<JoinSessionArgs>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let session_id = match SessionId::from_hex(&session_hex) {
+    let session_id = match SessionId::from_hex(&args.sid) {
         Ok(id) => id,
         Err(_) => {
             return axum::http::Response::builder()
@@ -77,344 +64,149 @@ pub async fn ws_join_session(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, false))
         .into_response()
 }
 
 pub async fn ws_create_session(
     ws: WebSocketUpgrade,
-    Path((session_hex, nounce)): Path<(String, u64)>,
-    State(state): State<AppState>,
+    Query(args): Query<CreateSessionArgs>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let session_id = match SessionId::from_hex(&session_hex) {
+    let session_id = match SessionId::from_hex(&args.sid) {
         Ok(id) => id,
         Err(_) => {
-            return axum::http::Response::builder()
-                .status(axum::http::StatusCode::BAD_REQUEST)
-                .body(axum::body::Body::from("invalid session id"))
-                .unwrap();
+            return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
         }
     };
-    if !pow::verify(&session_id, nounce, 20) {
+    let (difficulty, magic1, magic2) = state.difficulty_and_magic();
+    if !(args.magic == magic1 || args.magic == magic2) {
+        return (StatusCode::BAD_REQUEST, "bad magic").into_response();
+    }
+    if !pow::verify_c(&session_id, args.magic.0, args.nonce, difficulty.0) {
         return (StatusCode::BAD_REQUEST, "bad nounce").into_response();
     }
-    let session = state.create_session(session_id).await;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, true))
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: SessionId, session: Arc<SessionState>) {
-    // Wait for the initial SessionCreate or SessionJoin frame.
-    let (role, receiver_id, wire_version, transports) = match read_join(&mut socket).await {
-        Some(v) => v,
-        None => {
-            let _ = socket.close().await;
-            return;
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, session_id: SessionId, is_owner: bool) {
+    match handle_socket_inner(socket, state, session_id, is_owner).await {
+        Err(e) => {
+            error!("during handle_socket_inner: {e:?}");
         }
-    };
-
-    let room = session.room();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-
-    // Register into the room. After registering, notify each side of the
-    // OTHER'S wire_version + transports via `peer_joined` frames so a
-    // client can bail cleanly on version mismatch OR pick the negotiated
-    // chunk transport from the intersection. `to_incumbent` tells the
-    // already-present peer about the newcomer; `to_newcomer` tells the
-    // newcomer about the incumbent (needed on our side because the
-    // newcomer's own registration ran after the incumbent's already-sent
-    // frames drained).
-    let self_entry = PeerEntry { sink: tx.clone(), wire_version, transports: transports.clone() };
-    let (to_incumbent, to_newcomer_frames): (Option<(Role, String)>, Vec<String>);
-    {
-        let mut r = room.lock().await;
-        match role {
-            Role::Sender => {
-                if r.sender.is_some() {
-                    let _ = socket.close().await;
-                    return;
-                }
-                // Newcomer is sender; incumbents are all receivers.
-                // Each notification carries the incumbent receiver's id
-                // so the sender's per-peer router can pre-register.
-                let incumbent_frames: Vec<String> = r.receivers.iter()
-                    .map(|(rid, entry)| build_peer_joined("receiver", entry.wire_version, Some(rid), entry.transports.as_deref()))
-                    .collect();
-                r.sender = Some(self_entry.clone());
-                to_incumbent = if r.receivers.is_empty() {
-                    None
-                } else {
-                    Some((
-                        Role::Receiver,
-                        // Sender→receiver notification: sender has no
-                        // receiver_id (unique-per-receiver-only concept).
-                        build_peer_joined("sender", wire_version, None, transports.as_deref()),
-                    ))
-                };
-                to_newcomer_frames = incumbent_frames;
-            }
-            Role::Receiver => {
-                let rid = match receiver_id {
-                    Some(id) => id,
-                    None => {
-                        let _ = socket.close().await;
-                        return;
-                    }
-                };
-                // Newcomer is receiver; incumbent is at most one sender.
-                let incumbent_frames: Vec<String> = r.sender.as_ref()
-                    .map(|entry| vec![build_peer_joined("sender", entry.wire_version, None, entry.transports.as_deref())])
-                    .unwrap_or_default();
-                r.receivers.insert(rid, self_entry.clone());
-                to_incumbent = if r.sender.is_some() {
-                    Some((
-                        Role::Sender,
-                        // Notification to the sender about the newcomer
-                        // receiver — INCLUDE the newcomer's id so the
-                        // sender-side router can register the per-peer
-                        // dispatch route.
-                        build_peer_joined("receiver", wire_version, Some(&rid), transports.as_deref()),
-                    ))
-                } else {
-                    None
-                };
-                to_newcomer_frames = incumbent_frames;
-            }
-        }
+        Ok(()) => {}
     }
-    // Fire notifications AFTER releasing the room lock so we don't hold it
-    // across the send-half sink calls.
-    if let Some((target, frame)) = to_incumbent {
-        let r = room.lock().await;
-        match target {
-            Role::Sender => r.route_to_sender(&frame),
-            Role::Receiver => {
-                drop(r);
-                let mut r2 = room.lock().await;
-                r2.fan_to_receivers(&frame);
-            }
-        }
-    }
-    for frame in to_newcomer_frames {
-        let _ = tx.send(frame);
-    }
-
-    let (mut sink, mut stream) = socket.split();
-
-    // Pump outbound frames from the room into this socket.
-    let out = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if sink.send(Message::Text(frame.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Read inbound frames and relay to the other side of the room.
-    while let Some(msg) = stream.next().await {
-        let Ok(msg) = msg else { break };
-        match msg {
-            Message::Text(t) => {
-                let s = t.to_string();
-                let mut r = room.lock().await;
-                match role {
-                    Role::Sender => {
-                        // Multi-peer routing (M1): a sender-originated frame
-                        // may carry a top-level `to_receiver_id` string. If
-                        // present, route to that receiver only. If absent,
-                        // fan to all receivers (backward-compat with the
-                        // single-receiver stack).
-                        let target = serde_json::from_str::<serde_json::Value>(&s)
-                            .ok()
-                            .and_then(|v| v.get("to_receiver_id")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_string()));
-                        match target.as_deref().and_then(|s| ReceiverId::from_hex(s).ok()) {
-                            Some(rid) => r.route_to_receiver(&rid, &s),
-                            None => r.fan_to_receivers(&s),
-                        }
-                    }
-                    Role::Receiver => {
-                        // Anti-spoof: if the receiver populated
-                        // `from_receiver_id`, it must match the id they
-                        // registered with. Prevents receiver A from
-                        // impersonating receiver B on the sender's
-                        // per-peer dispatch. Absent field = backward-compat
-                        // (single-receiver stack, sender doesn't
-                        // disambiguate).
-                        let claimed = serde_json::from_str::<serde_json::Value>(&s)
-                            .ok()
-                            .and_then(|v| v.get("from_receiver_id")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_string()));
-                        if let Some(claim) = claimed.as_deref() {
-                            let actual = receiver_id.as_ref().map(|r| r.as_hex());
-                            match actual.as_deref() {
-                                Some(a) if a == claim => { /* verified */ }
-                                Some(a) => {
-                                    tracing::warn!(
-                                        "dropping receiver frame: claimed from_receiver_id={} != actual={}",
-                                        claim, a
-                                    );
-                                    continue;
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        "dropping receiver frame with from_receiver_id={} — receiver has no registered id",
-                                        claim
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        // Inject from_receiver_id if the receiver didn't set
-                        // it — the sender-side multipeer WS router uses this
-                        // to dispatch SDP answers, Ice, KexPub etc. to the
-                        // right per-peer inbox. Anti-spoof check above still
-                        // stands for the case where the receiver DID claim
-                        // an id (must match its registered id).
-                        let outgoing = if claimed.is_none() {
-                            if let Some(rid) = receiver_id.as_ref() {
-                                match serde_json::from_str::<serde_json::Value>(&s) {
-                                    Ok(mut v) => {
-                                        if let Some(obj) = v.as_object_mut() {
-                                            obj.insert(
-                                                "from_receiver_id".to_string(),
-                                                serde_json::Value::String(rid.as_hex()),
-                                            );
-                                            v.to_string()
-                                        } else {
-                                            s.clone()
-                                        }
-                                    }
-                                    Err(_) => s.clone(),
-                                }
-                            } else {
-                                s.clone()
-                            }
-                        } else {
-                            s.clone()
-                        };
-                        r.route_to_sender(&outgoing);
-                    }
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    // Unregister and notify the other side.
-    //
-    // `peer_left` frames let the counterparty prune stale UI + tear
-    // down orphaned peer state without waiting on ICE timeouts. Frame
-    // shape mirrors `peer_hello`: {"type":"peer_left","role":<role>,
-    // "receiver_id"?:<hex>,"from_receiver_id"?:<hex>}. A departing
-    // receiver's frame lists its receiver_id so the sender can look
-    // up the right per-peer entry to close.
-    {
-        let mut r = room.lock().await;
-        match role {
-            Role::Sender => {
-                r.sender = None;
-                // Fan a sender-departed notice to every receiver.
-                r.fan_to_receivers(r#"{"type":"peer_left","role":"sender"}"#);
-            }
-            Role::Receiver => {
-                if let Some(rid) = receiver_id {
-                    r.receivers.remove(&rid);
-                    // Notify the sender that THIS receiver went away.
-                    let hex = rid.as_hex();
-                    let frame = format!(
-                        r#"{{"type":"peer_left","role":"receiver","receiver_id":"{hex}","from_receiver_id":"{hex}"}}"#
-                    );
-                    r.route_to_sender(&frame);
-                }
-            }
-        }
-    }
-    state.maybe_drop_room(session_id).await;
-    out.abort();
 }
 
-async fn read_join(socket: &mut WebSocket) -> Option<(Role, Option<ReceiverId>, Option<u32>, Option<Vec<String>>)> {
-    while let Some(msg) = socket.next().await {
-        let raw = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!("read_join: ws error before join frame: {e}");
-                return None;
-            }
-        };
-        match raw {
-            Message::Text(t) => {
-                let text = t.to_string();
-                match serde_json::from_str::<JoinFrame>(&text) {
-                    Ok(parsed) => {
-                        return Some(match parsed {
-                            JoinFrame::SessionCreate { wire_version, transports } => {
-                                (Role::Sender, None, wire_version, transports)
-                            }
-                            JoinFrame::SessionJoin { receiver_id, wire_version, transports } => {
-                                (Role::Receiver, Some(receiver_id), wire_version, transports)
-                            }
-                        });
+async fn handle_socket_inner(mut socket: WebSocket, state: Arc<AppState>, session_id: SessionId, is_owner: bool) -> Result<(), anyhow::Error> {
+    let (dispatch_tx, mut dispatch_rx) = mpsc::channel(16);
+
+    let session;
+    let our_id;
+    loop {
+        match socket.recv().await {
+            None => return Ok(()),
+            Some(Ok(Message::Binary(data))) => match postcard::from_bytes(&data) {
+                Ok(ClientToServer::CreateSession { id, capabilities, pub_key, mac }) if is_owner => {
+                    let peer = PeerEntry {
+                        sink: dispatch_tx,
+                        caps: capabilities,
+                        mac,
+                        pub_key
+                    };
+                    session = state.create_session(session_id, id, peer).await;
+                    our_id = id;
+                    break;
+                }
+                Ok(ClientToServer::JoinSession { id, capabilities, pub_key, mac }) if !is_owner => {
+                    let peer = PeerEntry {
+                        sink: dispatch_tx,
+                        caps: capabilities,
+                        mac,
+                        pub_key
+                    };
+                    match state.get_session(session_id).await {
+                        Some(s) => {
+                            s.add_peer(id, peer).await;
+                            session = s;
+                            our_id = id;
+                            break;
+                        }
+                        None => {
+                            socket.send(Message::Text("No such session".into())).await?;
+                            bail!("invalid session id")
+                        }
                     }
+                }
+                Ok(_) => {
+                    warn!("client did not send the correct message");
+                    bail!("wrong message");
+                }
+                Err(e) => {
+                    warn!("invalid data: {e:?}");
+                    socket.send(Message::Text(e.to_string())).await?;
+                    bail!("invalid data");
+                }
+            }
+            Some(Ok(Message::Ping(data))) => {
+                socket.send(Message::Pong(data)).await?;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                warn!("client error: {e:?}");
+            }
+        }
+    }
+
+    loop {
+        select! {
+            Some(ev) = socket.recv() => {
+                match ev {
+                    Ok(Message::Binary(data)) => match postcard::from_bytes(&data) {
+                        Ok(ClientToServer::SendTo1 { dest_id, msg: data }) => {
+                            let msg = ServerToClient::PeerMessage1 { from: our_id, data };
+                            checked_send(&session, dest_id, msg, &mut socket).await?;
+                        }
+                        Ok(ClientToServer::SendTo2 { dest_id, msg: data }) => {
+                            let msg = ServerToClient::PeerMessage2 { from: our_id, data };
+                            checked_send(&session, dest_id, msg, &mut socket).await?;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("invalid data: {e:?}");
+                            socket.send(Message::Text(e.to_string())).await;
+                            bail!("invalid data");
+                        }
+                    }
+                    Ok(Message::Ping(data)) => {
+                        socket.send(Message::Pong(data)).await?;
+                    }
+                    Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!("read_join: reject frame ({e}) body={text}");
-                        return None;
+                        warn!("client error: {e:?}");
                     }
                 }
             }
-            Message::Close(_) => return None,
-            _ => continue,
+            Some(msg) = dispatch_rx.recv() => {
+                send_msg(&mut socket, msg).await?;
+            }
         }
     }
-    None
 }
-
-/// Build a `peer_joined` notification frame. Wraps counterpart's role +
-/// wire_version so the recipient can bail on version mismatch. When
-/// `peer_receiver_id` is `Some` (server notifying the sender about a
-/// receiver), also injects `from_receiver_id` at the envelope level so
-/// the sender-side WS router can dispatch subsequent per-peer frames
-/// (KexPub, SDP answer, Ice) to the right peer task.
-///
-/// Kept as a helper so the two call sites (incumbent-notified,
-/// newcomer-notified) stay in sync.
-fn build_peer_joined(
-    peer_role: &str,
-    wire_version: Option<u32>,
-    peer_receiver_id: Option<&ReceiverId>,
-    peer_transports: Option<&[String]>,
-) -> String {
-    let mut v = serde_json::json!({
-        "type": "peer_joined",
-        "role": peer_role,
-    });
-    if let Some(ver) = wire_version {
-        v["wire_version"] = serde_json::Value::from(ver);
+async fn checked_send(session: &SessionState, dest: ReceiverId, msg: ServerToClient, socket: &mut WebSocket) -> Result<(), anyhow::Error> {
+    match session.room().lock().await.send_to(dest, msg) {
+        Ok(()) => Ok(()),
+        Err(SendError::Disconnected) => {
+            send_msg(socket, ServerToClient::PeerDisconnected { id: dest }).await
+        }
+        Err(SendError::Full) => {
+            send_msg(socket, ServerToClient::PeerFull { id: dest }).await
+        }
     }
-    if let Some(ts) = peer_transports {
-        v["transports"] = serde_json::Value::from(
-            ts.iter().map(|s| serde_json::Value::from(s.clone())).collect::<Vec<_>>()
-        );
-    }
-    if let Some(rid) = peer_receiver_id {
-        let hex = rid.as_hex();
-        // Include BOTH:
-        //   - `receiver_id` in the body (matches the SignalFrame::PeerJoined
-        //     variant on the client side; the receiver_id field is where
-        //     the sender reads the paired receiver's id from).
-        //   - `from_receiver_id` at the envelope level (the sender-side
-        //     WS router keys per-peer inbox dispatch off this field).
-        v["receiver_id"] = serde_json::Value::from(hex.clone());
-        v["from_receiver_id"] = serde_json::Value::from(hex);
-    }
-    v.to_string()
 }
-
-// Tag-along: PeerSink is re-exported for cross-module type reference in
-// case a follow-up wants to construct sinks outside this file.
-#[allow(dead_code)]
-type _PeerSinkAlias = PeerSink;
+async fn send_msg(socket: &mut WebSocket, msg: ServerToClient) -> Result<(), anyhow::Error> {
+    let bytes = postcard::to_stdvec(&msg).unwrap();
+    socket.send(Message::Binary(bytes.into())).await?;
+    Ok(())
+}

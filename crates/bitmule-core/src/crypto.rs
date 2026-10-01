@@ -15,22 +15,8 @@ use sha2::Sha256;
 
 pub struct SessionKey(pub [u8; 32]);
 pub struct ContentKey(pub [u8; 32]);
-#[derive(Serialize, Deserialize)]
-pub struct PublicKey(pub [u8; 32]);
-#[derive(Serialize, Deserialize)]
-pub struct SessionMac(pub [u8; 32]);
 pub struct WrappedContentKey(pub Vec<u8>);
 
-impl From<x25519_dalek::PublicKey> for PublicKey {
-    fn from(value: x25519_dalek::PublicKey) -> Self {
-        PublicKey(value.to_bytes())
-    }
-}
-impl Into<x25519_dalek::PublicKey> for PublicKey {
-    fn into(self) -> x25519_dalek::PublicKey {
-        x25519_dalek::PublicKey::from(self.0)
-    }
-}
 
 /// X25519 key exchange for peer→peer session key agreement via signaling.
 pub struct KeyExchange {

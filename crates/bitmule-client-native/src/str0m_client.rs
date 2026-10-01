@@ -538,11 +538,11 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
 
     // Crypto handshake — same symmetric KEX as send_connect.
     let local_ephemeral = Ephemeral::generate();
-    let local_pub = local_ephemeral.public_bytes();
+    let local_pub = local_ephemeral.public_keypublic_key();
     let local_mac = share_key.mac_ephemeral_pub(&local_pub);
     ws_send(&mut ws, &SignalFrame::KexPub {
-        pub_hex: hex_encode(&local_pub),
-        mac_hex: hex_encode(&local_mac),
+        pub_hex: hex_encode(&local_pub.0),
+        mac_hex: hex_encode(&local_mac.0),
     }).await?;
     let mut ephemeral_holder = Some(local_ephemeral);
     let mut wrap_key: Option<WrapKey> = None;
@@ -1467,7 +1467,7 @@ pub(crate) async fn handshake_bulk_key_over_ws(
     use futures_util::{StreamExt};
     // Local ephemeral, MAC'd with share_key so the peer can authenticate us.
     let local_ephemeral = Ephemeral::generate();
-    let local_pub = local_ephemeral.public_bytes();
+    let local_pub = local_ephemeral.public_keypublic_key();
     let local_mac = share_key.mac_ephemeral_pub(&local_pub);
     ws_send(ws, &SignalFrame::KexPub {
         pub_hex: hex_encode(&local_pub),
@@ -2026,7 +2026,7 @@ async fn peer_session_run(
     // KEX: send our ephemeral immediately, wait for peer's KexPub in
     // the loop below (concurrent with SDP exchange).
     let local_ephemeral = Ephemeral::generate();
-    let local_pub = local_ephemeral.public_bytes();
+    let local_pub = local_ephemeral.public_keypublic_key();
     let local_mac = session.shared.share_key.mac_ephemeral_pub(&local_pub);
     ws_enqueue_targeted(
         &outbox_tx,

@@ -225,7 +225,7 @@ pub fn parse_session(hex: &str) -> Result<SessionId, Error> {
 
 pub async fn post(
     Path((session_hex, receiver_hex)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     body: Body,
 ) -> Result<(), Error> {
     let session_id = parse_session(&session_hex)?;
@@ -237,7 +237,7 @@ pub async fn post(
 }
 pub async fn get(
     Path((session_hex, receiver_hex)): Path<(String, String)>,
-    State(state): State<AppState>
+    State(state): State<Arc<AppState>>
 ) -> Result<Body, Error> {
     let session_id = parse_session(&session_hex)?;
     let receiver_id = ReceiverId::from_hex(&receiver_hex).map_err(|e| Error::BadReceiverId)?;

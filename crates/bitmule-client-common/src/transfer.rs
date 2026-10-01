@@ -85,6 +85,9 @@ impl TransferBuilder {
         };
         Ok((manifest, transfer))
     }
+    pub async fn commit_stream(mut self) -> Result<()> {
+        todo!("streaming commit");
+    }
 }
 
 impl Default for TransferBuilder {

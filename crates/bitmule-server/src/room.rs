@@ -9,13 +9,12 @@
 //! last peer disconnects. State that must survive restart (chunks, delivery
 //! ledger, quota) lives in the [`bitmule_core::traits::ChunkStore`].
 
-use bitmule_core::ReceiverId;
+use bitmule_core::{ReceiverId, crypto::{PublicKey, SessionMac}, protocol::websocket::{PeerCaps, ServerToClient}};
+use bytes::Bytes;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 
-/// One-way channel to a peer's WebSocket sink. Text frames only — binary
-/// signaling is JSON-over-text.
-pub type PeerSink = mpsc::UnboundedSender<String>;
+pub type PeerSink = mpsc::Sender<ServerToClient>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -29,47 +28,38 @@ pub enum Role {
 #[derive(Clone)]
 pub struct PeerEntry {
     pub sink: PeerSink,
-    pub wire_version: Option<u32>,
-    /// Chunk-transports this peer advertised at SessionCreate/SessionJoin
-    /// time (preference order). Server copies into the counterpart's
-    /// PeerJoined so each side can pick the highest-preference mutual
-    /// entry from the intersection. `None` = pre-v3 peer that didn't
-    /// advertise.
-    pub transports: Option<Vec<String>>,
+    pub caps: PeerCaps,
+    pub pub_key: PublicKey,
+    pub mac: SessionMac,
 }
 
 /// One session's live signaling state.
-#[derive(Default)]
 pub struct Room {
-    pub sender: Option<PeerEntry>,
+    pub owner: ReceiverId,
     pub receivers: HashMap<ReceiverId, PeerEntry>,
 }
 
 impl Room {
     pub fn is_empty(&self) -> bool {
-        self.sender.is_none() && self.receivers.is_empty()
+        self.receivers.is_empty()
     }
 
-    /// Fan a sender-originated frame out to all receivers currently in the room.
-    /// Silently drops sinks whose receive half has been closed.
-    pub fn fan_to_receivers(&mut self, frame: &str) {
-        self.receivers
-            .retain(|_, entry| entry.sink.send(frame.to_string()).is_ok());
+    pub fn get_sink(&self, dest: ReceiverId) -> Option<PeerSink> {
+        self.receivers.get(&dest).map(|peer| peer.sink.clone())
     }
-
-    /// Route a receiver-originated frame to the sender if present.
-    pub fn route_to_sender(&self, frame: &str) {
-        if let Some(entry) = &self.sender {
-            let _ = entry.sink.send(frame.to_string());
+    pub fn send_to(&self, dest: ReceiverId, msg: ServerToClient) -> Result<(), SendError> {
+        if let Some(recv) = self.receivers.get(&dest) {
+            match recv.sink.try_send(msg) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Closed(_)) => Err(SendError::Disconnected),
+                Err(TrySendError::Full(_)) => Err(SendError::Full)
+            }
+        } else {
+            Err(SendError::Disconnected)
         }
     }
-
-    /// Route a sender-originated frame to exactly one receiver (by id).
-    /// Silently drops if the receiver isn't registered — sender may be
-    /// racing a receiver-departed notification.
-    pub fn route_to_receiver(&self, rid: &ReceiverId, frame: &str) {
-        if let Some(entry) = self.receivers.get(rid) {
-            let _ = entry.sink.send(frame.to_string());
-        }
-    }
+}
+pub enum SendError {
+    Disconnected,
+    Full
 }

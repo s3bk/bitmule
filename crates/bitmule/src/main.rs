@@ -4,6 +4,8 @@
 //! SPA client (which is `bitmule-client-wasm` compiled from bitmule-core).
 
 use anyhow::{anyhow, Context, Result};
+use bitmule::v2;
+use bitmule_client_common::transfer::{Storage, TransferBuilder};
 use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
 use bitmule_client_native::{recv_file, send_file_multi, send_file_relay, ServeMode, TransportMode};
 use clap::{Parser, Subcommand};
@@ -106,22 +108,6 @@ enum IdentityAction {
         #[arg(long, default_value = identity::DEFAULT_CONTACT_BASE)]
         contact_base: String,
     },
-}
-
-fn resolve_mode(webrtc: bool, relay: bool) -> TransportMode {
-    // Default (no flag) = Auto: try WebRTC first with a bounded budget
-    // (bitmule_client_native::AUTO_WEBRTC_BUDGET), fall back to relay
-    // if the DC doesn't open in time. --webrtc forces WebRTC only,
-    // --relay forces relay only. clap's `conflicts_with` prevents both
-    // being passed together. Kenna 2026-09-13 — reinstated after the
-    // CLI transport matrix showed the earlier "auto = Webrtc" left
-    // mixed-mode pairs broken.
-    match (webrtc, relay) {
-        (false, false) => TransportMode::Auto,
-        (true,  false) => TransportMode::Webrtc,
-        (false, true)  => TransportMode::Relay,
-        (true,  true)  => unreachable!("clap conflicts_with prevents this"),
-    }
 }
 
 fn mode_label(m: TransportMode) -> &'static str {
@@ -377,90 +363,19 @@ where
 // mobile FFI can share the same on-the-fly bundling.
 
 async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, multi: bool) -> Result<()> {
-    // Bundling decision is duplicated with `prepare_and_spawn_send` for the
-    // progress-line label only. The real send uses whatever
-    // `prepare_and_spawn_send` decides.
-    let will_bundle = paths.len() > 1 || (paths.len() == 1 && paths[0].is_dir());
-    let name_for_progress = if will_bundle {
-        "bundle.zip".to_string()
-    } else {
-        paths[0].file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file.bin".to_string())
-    };
-    let mut last_pct = 0u64;
-    let on_progress = move |sent: u64, total: u64| {
-        if total == 0 { return }
-        let pct = sent * 100 / total;
-        if pct != last_pct {
-            last_pct = pct;
-            eprint!("\r{}: {}%    ", name_for_progress, pct);
-            use std::io::Write;
-            let _ = std::io::stderr().flush();
-        }
-    };
-
-    if will_bundle {
-        eprintln!("bundling {} entr{} into store-mode zip…",
-            paths.len(),
-            if paths.len() == 1 { "y" } else { "ies" });
-    }
-    eprintln!("computing file commitment…");
-    let SendSpawn { session_hex, share_url, file_name, file_size, handle } =
-        prepare_and_spawn_send(server.to_string(), paths, mode, multi, on_progress).await?;
-
-    println!("session: {}", session_hex);
-    println!("share:   {share_url}");
-    // Render the share URL as a terminal QR so a phone camera can
-    // pick it up without pasting. Fits in a standard 80-col shell
-    // for an 86-char b64 fragment at Dense1x2.
-    match QrCode::new(share_url.as_bytes()) {
-        Ok(qr) => {
-            let rendered = qr
-                .render::<unicode::Dense1x2>()
-                .dark_color(unicode::Dense1x2::Light)
-                .light_color(unicode::Dense1x2::Dark)
-                .quiet_zone(true)
-                .build();
-            println!("{rendered}");
-        }
-        Err(e) => eprintln!("(qr render skipped: {e})"),
-    }
-    match (multi, mode) {
-        (true, TransportMode::Relay) => {
-            println!("mode:    relay-multi (server-relay, URL stays valid — Ctrl-C to stop)");
-        }
-        (false, TransportMode::Relay) => {
-            println!("mode:    relay only (single-peer)");
-        }
-        (true, TransportMode::Webrtc) => {
-            println!("mode:    multi-peer (WebRTC, never exits — Ctrl-C to stop)");
-        }
-        (false, TransportMode::Webrtc) => {
-            println!("mode:    complete (WebRTC, exits after first receiver has the file)");
-        }
-        (_, TransportMode::Auto) => {
-            println!("mode:    auto (WebRTC first, relay fallback after {}s)",
-                bitmule_client_native::AUTO_WEBRTC_BUDGET.as_secs());
+    let mut transfer = TransferBuilder::new();
+    for path in paths {
+        if path.is_file() {
+            let name = path.file_name().map(|s| Path::new(s).to_path_buf());
+            transfer.add_file(Storage::File(path), name);
+        } else if path.is_dir() {
+            // let path.read_dir()
+            // TODO: recursively add this folder
         }
     }
-    println!("sending {} ({} bytes)…", file_name, file_size);
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-
-    match handle.await {
-        Ok(Ok(())) => {
-            eprintln!();
-            if multi {
-                println!("multi-peer server exited.");
-            } else {
-                println!("done.");
-            }
-            Ok(())
-        }
-        Ok(Err(e)) => Err(e),
-        Err(je) => Err(anyhow!("send task join: {je}")),
-    }
+    let (manifest, transfer) = transfer.commit_async().await?;
+    v2::run_send(manifest, transfer).await?;
+    Ok(())
 }
 
 async fn cmd_recv(
@@ -507,58 +422,7 @@ async fn cmd_recv(
     println!("mode:      {}", mode_label(mode));
     println!("signature: {}", if expected_signature.is_some() { "present (will verify post-transfer)" } else { "none (skipped)" });
     println!("waiting for transfer…");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
 
-    let mut last_pct = 0u64;
-    let outcome = recv_file(server, share_key, expected_signature, &out, mode, move |received, total, name| {
-        if total == 0 { return }
-        let pct = received * 100 / total;
-        if pct != last_pct {
-            last_pct = pct;
-            eprint!("\r{}: {}%    ", name, pct);
-            let _ = std::io::stderr().flush();
-        }
-    }).await?;
-    eprintln!();
-    let path = outcome.path;
-    if expected_signature.is_some() {
-        println!("received (signature verified): {}", path.display());
-    } else {
-        println!("received: {}", path.display());
-    }
-
-    // F2: if the sender flagged a container, unpack it. Today the only
-    // container is "zip-store"; unknown values are surfaced but not
-    // touched so an older receiver on a newer container still lands the
-    // bytes on disk for the user to open manually.
-    if let Some(container) = outcome.container.as_deref() {
-        match container {
-            "zip-store" => {
-                let unpack_dir = bitmule_client_native::container::unpack_dir_for(&path);
-                match bitmule_client_native::container::unpack_zip_store(&path, &unpack_dir).await {
-                    Ok(entries) => {
-                        // Zip is redundant now — the caller wanted the files, not the archive.
-                        // Best-effort delete; log but don't fail if it stays.
-                        if let Err(e) = tokio::fs::remove_file(&path).await {
-                            eprintln!("(kept received zip at {} — remove failed: {e})", path.display());
-                        }
-                        println!("unpacked {} entr{} into {}",
-                            entries,
-                            if entries == 1 { "y" } else { "ies" },
-                            unpack_dir.display());
-                    }
-                    Err(e) => {
-                        eprintln!("warning: container=zip-store but unpack failed: {e:#}");
-                        eprintln!("(zip kept at {} for manual extraction)", path.display());
-                    }
-                }
-            }
-            other => {
-                eprintln!("warning: sender flagged container={other:?} but this receiver only knows \"zip-store\" — leaving file as-is");
-            }
-        }
-    }
     Ok(())
 }
 
@@ -633,7 +497,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn prepare_and_spawn_send_roundtrip() -> Result<()> {
         // --- server bring-up (same axum::Router shape as bitmule-server main) ---
-        let state = AppState::new();
+        let state = Arc::new(AppState::new());
         let app = axum::Router::new()
             .route("/ws/:session", axum::routing::get(ws_join_session))
             .route(

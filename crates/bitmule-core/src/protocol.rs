@@ -165,7 +165,7 @@ use serde::{Deserialize, Serialize};
     use crate::{ContentKey, ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
 
     bitflags! {
-        #[derive(Serialize, Deserialize)]
+        #[derive(Serialize, Deserialize, Clone)]
         pub struct PeerCaps: u8 {
             const RELAY = 1;
             const WEBRTC = 2;
@@ -181,7 +181,7 @@ use serde::{Deserialize, Serialize};
         /*
             * server stores public-keys of session creator
             * and sends it to joining peers
-            */
+        */
         CreateSession {
             id: ReceiverId,
             capabilities: PeerCaps,
@@ -232,6 +232,12 @@ use serde::{Deserialize, Serialize};
         PeerMessage2 {
             from: ReceiverId,
             data: Envelope<InnerKeyKind, Peer2Peer>,
+        },
+        PeerFull {
+            id: ReceiverId
+        },
+        PeerDisconnected {
+            id: ReceiverId
         }
     }
 

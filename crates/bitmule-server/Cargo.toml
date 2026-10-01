@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 bitmule-core = { path = "../bitmule-core" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 axum = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }
@@ -28,6 +28,8 @@ async-trait = { workspace = true }
 tower-http = { version = "0.5", features = ["fs", "trace"] }
 tokio-util = { version = "*", features = ["codec", "io"] }
 bitvec = { workspace = true }
+postcard = { workspace = true, features = ["use-std"] }
 itertools = "*"
 futures = "*"
 tokio-stream = "*"
+rand = { workspace = true }

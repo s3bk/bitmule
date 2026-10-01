@@ -24,5 +24,34 @@ pub mod state;
 pub mod ws;
 pub mod relay2;
 
+use rand::Rng;
 pub use room::{Role, Room};
+use serde::{Deserialize, Serialize};
 pub use state::AppState;
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct Difficulty(u8);
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+struct Magic(u32);
+impl Magic {
+    pub fn new(n: u32) -> Option<Self> {
+        if n < (1<<28) {
+            Some(Magic(n))
+        } else {
+            None
+        }
+    }
+    pub fn random(rng: &mut impl Rng) -> Self {
+        Magic(rng.r#gen::<u32>() & (1 << 28 - 1))
+    }
+}
+fn encode_difficulty_and_magic(diffficulty: Difficulty, magic1: Magic, magic2: Magic) -> u64 {
+    (diffficulty.0 as u64) << 56 | (magic1.0 as u64) << 28 | magic2.0 as u64
+}
+fn decode_difficulty_and_magic(n: u64) -> (Difficulty, Magic, Magic) {
+    (
+        Difficulty((n >> 56) as u8),
+        Magic(((n >> 28) & (1<<28 - 1)) as u32),
+        Magic((n & (1<<28 - 1)) as u32)
+    )
+}

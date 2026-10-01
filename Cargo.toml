@@ -42,8 +42,10 @@ bytes = "1"
 blake3 = "1"
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-hkdf = "0.12"
-sha2 = "0.10"
+hkdf = "0.13"
+sha2 = "0.11"
+digest = "0.11"
+hmac = "0.13"
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tokio-tungstenite = "0.30"

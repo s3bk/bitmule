@@ -27,10 +27,10 @@ pub mod multipeer;
 pub mod container;
 pub mod session;
 use bitmule_crypto::{BulkKey, CommitmentHasher};
-pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
 pub use multipeer::ServeMode;
 pub mod send_loop;
-pub mod recv_loop;
+pub mod recv_loop;pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
+
 pub mod websocket;
 
 /// Return value from [`recv_file`] — the on-disk path plus the wire's

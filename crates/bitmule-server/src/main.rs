@@ -14,7 +14,7 @@ use axum::{
 };
 use bitmule_server::{relay2, state::AppState, ws::{ws_create_session, ws_join_session}};
 use clap::Parser;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info};
 
@@ -43,11 +43,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let state = AppState::new();
+    let state = Arc::new(AppState::new());
 
     let mut app = Router::new()
-        .route("/ws/join/:session", get(ws_join_session))
-        .route("/ws/create/:session/:nounce", get(ws_create_session))
+        .route("/ws/join", get(ws_join_session))
+        .route("/ws/create", get(ws_create_session))
         .route("/session/:sess/:receiver_id", post(relay2::post).get(relay2::get))
         .with_state(state);
 

@@ -129,7 +129,7 @@ impl Ephemeral {
             .0
             .as_ref()
             .ok_or_else(|| JsError::new("Ephemeral already consumed"))?;
-        Ok(inner.public_bytes().to_vec())
+        Ok(inner.public_keypublic_key().to_vec())
     }
 
     /// Derive the shared secret with the peer's public bytes. Consumes

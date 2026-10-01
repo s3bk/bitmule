@@ -31,13 +31,38 @@ use hmac::digest::KeyInit as HmacKeyInit;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use x25519_dalek::{EphemeralSecret, SharedSecret};
 use zeroize::Zeroize;
 
 /// 32-byte URL-shared secret. Session id is SHA256(A), publicly visible.
 /// A itself is only ever known to the two endpoints.
 #[derive(Clone)]
 pub struct ShareKey(pub [u8; 32]);
+
+#[derive(Serialize, Deserialize, Copy, Clone)]
+pub struct PublicKey(pub [u8; 32]);
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct SessionMac(pub [u8; 32]);
+
+
+impl PartialEq for SessionMac {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(&self.0, &other.0)
+    }
+}
+impl Eq for SessionMac {}
+
+impl From<x25519_dalek::PublicKey> for PublicKey {
+    fn from(value: x25519_dalek::PublicKey) -> Self {
+        PublicKey(value.to_bytes())
+    }
+}
+impl Into<x25519_dalek::PublicKey> for PublicKey {
+    fn into(self) -> x25519_dalek::PublicKey {
+        x25519_dalek::PublicKey::from(self.0)
+    }
+}
 
 impl ShareKey {
     pub fn random() -> Self {
@@ -89,6 +114,13 @@ impl ShareKey {
 
     /// Public session identifier the server sees. `SHA256(A)` — one-way,
     /// so leaking session_id doesn't leak A.
+    pub fn session_id(&self) ->  [u8; 32] {
+        let hash = Sha256::digest(self.0);
+        hash.into()
+    }
+
+    /// Public session identifier the server sees. `SHA256(A)` — one-way,
+    /// so leaking session_id doesn't leak A.
     pub fn session_id_hex(&self) -> String {
         let hash = Sha256::digest(self.0);
         hash.iter().map(|b| format!("{b:02x}")).collect()
@@ -97,11 +129,11 @@ impl ShareKey {
     /// HMAC-SHA256(A, ephemeral_pub) — authenticates the ephemeral public
     /// during the KEX exchange so a passive listener without A cannot
     /// substitute their own key.
-    pub fn mac_ephemeral_pub(&self, pub_bytes: &[u8; 32]) -> [u8; 32] {
+    pub fn mac_ephemeral_pub(&self, pub_bytes: &PublicKey) -> SessionMac {
         let mut mac = <Hmac<Sha256> as HmacKeyInit>::new_from_slice(&self.0)
             .expect("HMAC-SHA256 accepts any key length");
-        mac.update(pub_bytes);
-        mac.finalize().into_bytes().into()
+        mac.update(&pub_bytes.0);
+        SessionMac(mac.finalize().into_bytes().into())
     }
 }
 
@@ -212,11 +244,11 @@ pub struct Ephemeral {
 impl Ephemeral {
     pub fn generate() -> Self {
         let secret = EphemeralSecret::random_from_rng(OsRng);
-        let public = PublicKey::from(&secret);
+        let public = x25519_dalek::PublicKey::from(&secret).into();
         Self { secret, public }
     }
 
-    pub fn public_bytes(&self) -> [u8; 32] { *self.public.as_bytes() }
+    pub fn public_keypublic_key(&self) -> PublicKey { self.public }
 
     /// Derive the session shared secret S = X25519(our_priv, peer_pub).
     /// S is the RAW 32-byte X25519 output — non-uniform, don't use as a
@@ -235,11 +267,11 @@ impl Ephemeral {
     ///   generic form of the small-subgroup catch, in case the
     ///   pre-check missed a variant). x25519-dalek returns zeros
     ///   silently in that case rather than erroring; we treat as fatal.
-    pub fn derive_shared_secret(self, peer_pub: &[u8; 32]) -> Result<SessionKey> {
-        if is_low_order_x25519(peer_pub) {
+    pub fn derive_shared_secret(self, peer_pub: &PublicKey) -> Result<SessionKey> {
+        if is_low_order_x25519(&peer_pub.0) {
             bail!("peer ephemeral pub is a known low-order / small-subgroup point");
         }
-        let peer = PublicKey::from(*peer_pub);
+        let peer: x25519_dalek::PublicKey = x25519_dalek::PublicKey::from(peer_pub.0);
         let raw: SharedSecret = self.secret.diffie_hellman(&peer);
         let raw_bytes = raw.as_bytes();
         if raw_bytes.iter().all(|b| *b == 0) {
@@ -553,8 +585,8 @@ mod tests {
     fn ephemeral_kex_derives_matching_keys() {
         let alice = Ephemeral::generate();
         let bob = Ephemeral::generate();
-        let alice_pub = alice.public_bytes();
-        let bob_pub = bob.public_bytes();
+        let alice_pub = alice.public_keypublic_key();
+        let bob_pub = bob.public_keypublic_key();
         let alice_s = alice.derive_shared_secret(&bob_pub).unwrap();
         let bob_s = bob.derive_shared_secret(&alice_pub).unwrap();
         assert_eq!(alice_s.0, bob_s.0);
@@ -564,7 +596,7 @@ mod tests {
     fn mac_binds_ephemeral_to_share_key() {
         let a1 = ShareKey::random();
         let a2 = ShareKey::random();
-        let eph = Ephemeral::generate().public_bytes();
+        let eph = Ephemeral::generate().public_keypublic_key();
         assert_ne!(a1.mac_ephemeral_pub(&eph), a2.mac_ephemeral_pub(&eph));
     }
 

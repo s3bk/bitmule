@@ -30,3 +30,11 @@ aes-gcm = "0.10"
 zeroize = "1"
 postcard = { version = "1", features = ["use-std"] }
 bitmule-crypto = { path = "../bitmule-crypto" }
+argon2 = "*"
+
+[dev-dependencies]
+criterion = "*"
+
+[[bench]]
+name = "leading_zeros"
+harness = false
