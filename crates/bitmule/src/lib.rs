@@ -483,7 +483,7 @@ impl StreamSendBuilder {
         let server = self.client.parse_server(&self.client.server)?;
         // the data is not known up front, so there is nothing for a peer
         // connection to ask for: it goes over the relay
-        let options = Options { webrtc: false, relay: true };
+        let options = Options { webrtc: false, relay: true, udp: false };
         let progress = Mutex::new(self.progress);
         let on_event: v2::OnSendEvent = Arc::new(move |event| {
             if let SendEvent::Progress { bytes, total, .. } = event {

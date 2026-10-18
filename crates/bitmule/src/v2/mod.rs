@@ -124,27 +124,42 @@ mod tests {
 pub struct Options {
     pub webrtc: bool,
     pub relay: bool,
+    /// Raw fountain symbols over UDP, straight between native peers. Tried
+    /// first when both sides allow it; the other transports take over if no
+    /// path is found.
+    pub udp: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { webrtc: true, relay: true }
+        Options { webrtc: true, relay: true, udp: false }
     }
 }
 
 impl Options {
     pub fn from_mode(mode: TransportMode) -> Self {
         match mode {
-            TransportMode::Auto => Options { webrtc: true, relay: true },
-            TransportMode::Webrtc => Options { webrtc: true, relay: false },
-            TransportMode::Relay => Options { webrtc: false, relay: true },
+            TransportMode::Auto => Options { webrtc: true, relay: true, udp: false },
+            TransportMode::Webrtc => Options { webrtc: true, relay: false, udp: false },
+            TransportMode::Relay => Options { webrtc: false, relay: true, udp: false },
         }
+    }
+
+    /// These options with UDP on. `only`: nothing else (no fallback).
+    pub fn with_udp(mut self, only: bool) -> Self {
+        self.udp = true;
+        if only {
+            self.relay = false;
+            self.webrtc = false;
+        }
+        self
     }
 
     fn caps(self) -> PeerCaps {
         let mut caps = PeerCaps::empty();
         caps.set(PeerCaps::RELAY, self.relay);
         caps.set(PeerCaps::WEBRTC, self.webrtc);
+        caps.set(PeerCaps::UDP, self.udp);
         caps
     }
 }
@@ -154,6 +169,7 @@ impl Options {
 pub enum Transport {
     Relay,
     WebRtc,
+    Udp,
 }
 
 /// When the first and the last piece (data channel) or symbol (relay) of a
@@ -211,9 +227,12 @@ pub struct Report {
     /// that starts on the relay and moves to the data channel has both.
     pub relay_bytes: u64,
     pub data_channel_bytes: u64,
-    /// First to last relay symbol / data channel piece received.
+    /// Bytes that came over UDP (the whole transfer when `transport` is `Udp`).
+    pub udp_bytes: u64,
+    /// First to last relay symbol / data channel piece / UDP symbol received.
     pub relay_time: Span,
     pub data_channel_time: Span,
+    pub udp_time: Span,
 }
 
 /// What a sender learns about its receivers. `receiver` is a short id, the

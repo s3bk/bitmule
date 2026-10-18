@@ -11,7 +11,7 @@ use bitmule_client_common::fountain::BLOCK_PLAIN;
 use bitmule_server::{AppState, router};
 use tokio::{io::AsyncWriteExt, sync::oneshot};
 
-const RELAY: Options = Options { webrtc: false, relay: true };
+const RELAY: Options = Options { webrtc: false, relay: true, udp: false };
 
 async fn start_server() -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -170,7 +170,7 @@ async fn the_sender_hears_about_the_receiver() {
 #[tokio::test]
 async fn a_stream_needs_the_relay() {
     let server = start_server().await;
-    let webrtc_only = Options { webrtc: true, relay: false };
+    let webrtc_only = Options { webrtc: true, relay: false, udp: false };
     let result = run_send_stream(&server, StreamInfo::file("x"), StreamSource::one_shot(std::io::Cursor::new(payload(10))), webrtc_only, |_| {}, no_events()).await;
     let error = result.unwrap_err().to_string();
     assert!(error.contains("relay"), "{error}");

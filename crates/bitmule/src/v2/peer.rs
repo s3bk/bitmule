@@ -113,23 +113,29 @@ async fn run(
     }
 }
 
-/// A peer channel split in two by kind: WebRTC signaling goes one way,
-/// everything else the other. Both share the way out.
+/// A peer channel split in three by kind: WebRTC signaling goes one way,
+/// the UDP path-finding (`UdpHello`) another, everything else the third. All
+/// share the way out.
 pub struct Demuxed {
     pub app: PeerLink,
     pub signaling: PeerLink,
+    pub udp: PeerLink,
 }
 
 pub fn demux(link: PeerLink) -> Demuxed {
     let PeerLink { tx, mut rx } = link;
     let (app_tx, app_rx) = mpsc::channel(QUEUE);
     let (signaling_tx, signaling_rx) = mpsc::channel(QUEUE);
+    let (udp_tx, udp_rx) = mpsc::channel(QUEUE);
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             match message {
                 Peer2Peer::SdpOffer(_) | Peer2Peer::SdpAnswer(_) | Peer2Peer::IceCandidate(_) => {
                     // nobody may be listening for signaling; never let that stall the rest
                     let _ = signaling_tx.try_send(message);
+                }
+                Peer2Peer::UdpHello(_) => {
+                    let _ = udp_tx.try_send(message);
                 }
                 message => {
                     if app_tx.send(message).await.is_err() {
@@ -141,6 +147,7 @@ pub fn demux(link: PeerLink) -> Demuxed {
     });
     Demuxed {
         app: PeerLink { tx: tx.clone(), rx: app_rx },
-        signaling: PeerLink { tx, rx: signaling_rx },
+        signaling: PeerLink { tx: tx.clone(), rx: signaling_rx },
+        udp: PeerLink { tx, rx: udp_rx },
     }
 }

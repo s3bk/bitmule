@@ -20,6 +20,18 @@ static STUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// `--unsafe`: servers without TLS are allowed.
 static ALLOW_INSECURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 0: no UDP, 1: UDP first (the other transports behind it), 2: UDP only.
+static UDP_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The transports `mode` asks for, with UDP added if `--udp` or `--udp-only` was given.
+fn options_for(mode: TransportMode) -> v2::Options {
+    let options = v2::Options::from_mode(mode);
+    match UDP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => options,
+        1 => options.with_udp(false),
+        _ => options.with_udp(true),
+    }
+}
 
 fn parse_server(url: &str) -> Result<v2::Server> {
     let allow = ALLOW_INSECURE.load(std::sync::atomic::Ordering::Relaxed);
@@ -54,6 +66,16 @@ struct Cli {
     /// path sees who talks to whom, and can drop or delay messages.
     #[arg(long = "unsafe", global = true)]
     allow_insecure: bool,
+
+    /// Try a direct UDP path first (raw fountain symbols between the two
+    /// peers, native clients only); the other transports take over when no
+    /// path is found. Both sides have to ask for it.
+    #[arg(long, global = true)]
+    udp: bool,
+
+    /// Like --udp, with nothing to fall back on.
+    #[arg(long, global = true, conflicts_with = "udp")]
+    udp_only: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -168,6 +190,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     ALLOW_INSECURE.store(cli.allow_insecure, std::sync::atomic::Ordering::Relaxed);
+    UDP_MODE.store(if cli.udp_only { 2 } else { u8::from(cli.udp) }, std::sync::atomic::Ordering::Relaxed);
     if let Some(stun) = &cli.stun {
         let _ = STUN.set(stun.clone());
     }
@@ -439,11 +462,11 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
         let request = ShareKey::from_hex(&frag).map_err(|e| anyhow!("{to:?} is not a request link: {e}"))?;
         let server = parse_server(&extract_server_from_url(&to).unwrap_or_else(|| server.to_string()))?;
         println!("sending to the receiver that made {to}");
-        v2::run_send_to(&server, &request, manifest, transfer, v2::Options::from_mode(mode), |_| {}).await?;
+        v2::run_send_to(&server, &request, manifest, transfer, options_for(mode), |_| {}).await?;
         return Ok(());
     }
     let server = parse_server(server)?;
-    v2::run_send_events(&server, manifest, transfer, v2::Options::from_mode(mode), |link| print_link(&server, link), send_events()).await?;
+    v2::run_send_events(&server, manifest, transfer, options_for(mode), |link| print_link(&server, link), send_events()).await?;
     Ok(())
 }
 
@@ -452,7 +475,7 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
 /// follow the data, so the link has no signature.
 async fn cmd_send_stdin(server: &str, name: String, mode: TransportMode) -> Result<()> {
     let server = parse_server(server)?;
-    let mut options = v2::Options::from_mode(mode);
+    let mut options = options_for(mode);
     options.relay = true; // the only transport a stream has
     v2::run_send_stream(
         &server,
@@ -514,7 +537,7 @@ async fn cmd_recv(
     on_conflict: bitmule::OnConflict,
     keep_failed: bool,
 ) -> Result<()> {
-    let options = v2::Options::from_mode(mode);
+    let options = options_for(mode);
     let (link, server) = match session_arg {
         Some(raw) => {
             let frag = extract_link_fragment(&raw)
@@ -570,7 +593,10 @@ async fn cmd_recv(
         }
         Err(e) => return Err(e),
     };
-    println!("done, over {:?} ({} bytes via relay, {} via data channel)", report.transport, report.relay_bytes, report.data_channel_bytes);
+    println!("done, over {:?} ({} bytes via relay, {} via data channel, {} via udp)", report.transport, report.relay_bytes, report.data_channel_bytes, report.udp_bytes);
+    if let Some(line) = report.udp_time.describe(report.udp_bytes) {
+        println!("udp:          {line}");
+    }
     if let Some(line) = report.relay_time.describe(report.relay_bytes) {
         println!("relay:        {line}");
     }

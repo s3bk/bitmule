@@ -10,6 +10,7 @@ use std::{future::Future, pin::Pin, sync::{Arc, Mutex}};
 use anyhow::{Result, bail, ensure};
 use bitmule_client_common::{blockio::{RangeData, read_blocks, read_ranges}, fountain, transfer::Transfer};
 use bitmule_client_native::crypto::{BulkKey, CommitmentHasher};
+use bitmule_client_native::udp::{self, BytesAssembler, UdpConfig};
 use bitmule_core::{
     ReceiverId, SessionId, Token,
     protocol::websocket::{Peer2Peer, PeerCaps, TransferManifest, TransferType},
@@ -93,14 +94,19 @@ struct Webrtc {
 }
 
 /// Serve one receiver until it says it is done.
-pub async fn serve_peer(ctx: Arc<Context>, id: ReceiverId, peer_caps: PeerCaps, app: PeerLink, signaling: PeerLink) -> Result<()> {
+pub async fn serve_peer(ctx: Arc<Context>, id: ReceiverId, peer_caps: PeerCaps, app: PeerLink, signaling: PeerLink, udp: PeerLink) -> Result<()> {
     let PeerLink { tx, mut rx } = app;
     let receiver = id.as_hex().chars().take(8).collect::<String>();
     (ctx.events)(SendEvent::Connected { receiver: receiver.clone() });
     let size = ctx.manifest.transfer_size;
     let mut signaling = Some(signaling);
+    let mut udp = Some(udp);
     let mut webrtc: Option<Webrtc> = None;
     let relay_offered = ctx.options.relay && peer_caps.contains(PeerCaps::RELAY);
+    let udp_offered = ctx.options.udp && peer_caps.contains(PeerCaps::UDP);
+    // UDP goes first; relay and WebRTC are started when it does not work out
+    let mut udp_task: Option<AbortOnDrop<Result<()>>> = None;
+    let mut fallback_due = false;
 
     tx.send(Peer2Peer::Manifest(ctx.manifest.clone())).await?;
     loop {
@@ -109,22 +115,12 @@ pub async fn serve_peer(ctx: Arc<Context>, id: ReceiverId, peer_caps: PeerCaps, 
                 let Some(message) = message else { bail!("receiver went away") };
                 match message {
                     Peer2Peer::Get { start, end } if start == 0 && end == size && size > 0 => {
-                        if relay_offered {
-                            tx.send(Peer2Peer::JoinRelay).await?;
-                            let relay = ctx.clone();
-                            ctx.relay.start_once(async move {
-                                if let Err(e) = relay_upload(&relay).await {
-                                    warn!("relay upload: {e}");
-                                }
-                            });
-                        }
-                        if ctx.options.webrtc && peer_caps.contains(PeerCaps::WEBRTC) {
-                            if let Some(signaling) = signaling.take() {
-                                let channel = rtc::spawn(rtc::Role::Offerer, ctx.server.stun_addr().await, signaling.tx, signaling.rx).await?;
-                                let (requests, ranges) = mpsc::channel(8);
-                                tokio::spawn(serve_ranges(ctx.transfer.path().to_path_buf(), size, ranges, channel.send.clone()));
-                                webrtc = Some(Webrtc { channel, requests });
+                        match udp.take() {
+                            Some(link) if udp_offered => {
+                                let ctx = ctx.clone();
+                                udp_task = Some(AbortOnDrop(tokio::spawn(async move { udp_upload(&ctx, link).await })));
                             }
+                            _ => fallback_due = true,
                         }
                     }
                     Peer2Peer::Get { start, end } => {
@@ -142,10 +138,27 @@ pub async fn serve_peer(ctx: Arc<Context>, id: ReceiverId, peer_caps: PeerCaps, 
                         (ctx.events)(SendEvent::Done { receiver });
                         return Ok(());
                     }
+                    // an early UDP hello that arrived on the app side: not ours to handle
+                    Peer2Peer::UdpHello(_) => {}
                     Peer2Peer::Progress(bytes) => {
                         (ctx.events)(SendEvent::Progress { receiver: receiver.clone(), bytes: bytes.min(size), total: size });
                     }
                     _ => bail!("unexpected message from receiver"),
+                }
+            }
+            result = async { (&mut udp_task.as_mut().unwrap().0).await }, if udp_task.is_some() => {
+                udp_task = None;
+                match result {
+                    // the receiver has every block; it says so itself in a moment
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("udp: {e:#}");
+                        fallback_due = true;
+                    }
+                    Err(e) => {
+                        warn!("udp worker: {e}");
+                        fallback_due = true;
+                    }
                 }
             }
             event = async { webrtc.as_mut().unwrap().channel.events.recv().await }, if webrtc.is_some() => {
@@ -166,6 +179,98 @@ pub async fn serve_peer(ctx: Arc<Context>, id: ReceiverId, peer_caps: PeerCaps, 
                     }
                 }
             }
+        }
+
+        if fallback_due {
+            fallback_due = false;
+            if relay_offered {
+                tx.send(Peer2Peer::JoinRelay).await?;
+                let relay = ctx.clone();
+                ctx.relay.start_once(async move {
+                    if let Err(e) = relay_upload(&relay).await {
+                        warn!("relay upload: {e}");
+                    }
+                });
+            }
+            if ctx.options.webrtc && peer_caps.contains(PeerCaps::WEBRTC) {
+                if let Some(signaling) = signaling.take() {
+                    let channel = rtc::spawn(rtc::Role::Offerer, ctx.server.stun_addr().await, signaling.tx, signaling.rx).await?;
+                    let (requests, ranges) = mpsc::channel(8);
+                    tokio::spawn(serve_ranges(ctx.transfer.path().to_path_buf(), size, ranges, channel.send.clone()));
+                    webrtc = Some(Webrtc { channel, requests });
+                }
+            }
+            ensure!(relay_offered || webrtc.is_some() || udp_task.is_some(), "no transport in common with the receiver");
+        }
+    }
+}
+
+/// A task that is aborted when this goes away.
+pub(super) struct AbortOnDrop<T>(pub(super) JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Send the fountain coded transfer to one receiver over UDP, pass after
+/// pass, until the receiver has reported every block. Fails if no path is
+/// found or the link dies; then the other transports take over.
+///
+/// The same pipeline as `relay_upload` (a reader, a few encoders), but the
+/// symbols go to the UDP worker, which paces them to the receiver's reports,
+/// and a block the receiver has finished is not coded again.
+async fn udp_upload(ctx: &Context, link: PeerLink) -> Result<()> {
+    let size = ctx.manifest.transfer_size;
+    let total = fountain::num_blocks(size);
+    let PeerLink { tx: signal_tx, rx: signal_rx } = link;
+    let stun = ctx.server.stun_addr().await;
+    let udp = udp::connect(
+        bitmule_client_native::Role::Sender, ctx.manifest.bulk_key.clone(), stun, signal_tx, signal_rx,
+        UdpConfig::default(), BytesAssembler::new(),
+    ).await?;
+    info!("udp path found, datagrams carry {} bytes of symbol", udp.fragment);
+
+    let mut stats = SendStats::new("udp");
+    let encoder = Arc::new(fountain::Encoder::new());
+    let mut blocks = read_blocks(ctx.transfer.path().to_path_buf(), size, encoder.block_pool());
+    let parallel = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
+    let promised = Arc::new(ctx.manifest.block_hashes.clone());
+    let mut encoding = FuturesOrdered::new();
+    let mut reading = true;
+    loop {
+        if udp.done.all(total) {
+            return Ok(());
+        }
+        while reading && encoding.len() < parallel {
+            match blocks.recv().await {
+                Some(block) => {
+                    let block = block?;
+                    let (encoder, key, promised, done) = (encoder.clone(), ctx.manifest.bulk_key.clone(), promised.clone(), udp.done.clone());
+                    encoding.push_back(tokio::task::spawn_blocking(move || -> Result<Vec<Bytes>> {
+                        // the receiver has this one
+                        if done.contains(block.block_nr) {
+                            return Ok(Vec::new());
+                        }
+                        let encoded = encoder.encode_block(&key, block.block_nr, block.buf, block.len)?;
+                        if let Some(&promised) = promised.get(block.block_nr as usize) {
+                            ensure!(encoded.hash() == promised, "block {} is not what the manifest promised: the data changed", block.block_nr);
+                        }
+                        Ok(encoded.frames(block.pass))
+                    }));
+                }
+                None => reading = false,
+            }
+        }
+        let Some(frames) = encoding.next().await else { return Ok(()) };
+        for frame in frames?? {
+            let payload = fountain::frame_payload(&frame);
+            let len = payload.len() as u64;
+            if udp.payloads_out.send(payload).await.is_err() {
+                bail!("the udp worker stopped");
+            }
+            stats.sent(len);
         }
     }
 }

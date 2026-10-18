@@ -104,15 +104,15 @@ async fn send_job(
                         let (to_peer, peer_from_server) = mpsc::channel(64);
                         peers.insert(id, to_peer);
                         let link = peer::spawn(wire.clone(), id, pub_key, peer_from_server);
-                        let peer::Demuxed { app, signaling } = peer::demux(link);
+                        let peer::Demuxed { app, signaling, udp } = peer::demux(link);
                         match &job {
                             Job::Known(ctx) => {
                                 let ctx = ctx.clone();
-                                workers.spawn(async move { (id, send::serve_peer(ctx, id, caps, app, signaling).await) });
+                                workers.spawn(async move { (id, send::serve_peer(ctx, id, caps, app, signaling, udp).await) });
                             }
                             Job::Stream(ctx) => {
                                 // no data channel here: the signaling side is not used
-                                drop(signaling);
+                                drop((signaling, udp));
                                 let ctx = ctx.clone();
                                 workers.spawn(async move { (id, send::serve_stream_peer(ctx, id, caps, app).await) });
                             }
@@ -158,10 +158,10 @@ pub async fn receive(server: &Server, link: &ShareLink, open: recv::OpenOutput, 
 
     // the only peer is the sender, so everything the server says goes to its worker
     let wire = Arc::new(peer::Wire { identity, session_id, to_server });
-    let peer::Demuxed { app, signaling } = peer::demux(peer::spawn(wire, sender_id, sender_pub, from_server));
+    let peer::Demuxed { app, signaling, udp } = peer::demux(peer::spawn(wire, sender_id, sender_pub, from_server));
 
     let ctx = recv::Context::new(server.clone(), session_id, our_id, relay_token, link.clone(), open, progress, options);
-    let report = recv::receive(ctx, sender_caps, app, signaling).await;
+    let report = recv::receive(ctx, sender_caps, app, signaling, udp).await;
 
     // The last thing we say (that we are done) is still on its way through
     // the workers: the peer worker seals it, the websocket worker writes it.

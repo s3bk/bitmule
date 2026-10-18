@@ -93,7 +93,7 @@ in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData
   registered/locked slabs, `UdpConfig.fragment`, `Assembler` trait); WebRTC socket pool on io_uring with a slab-backed
   `bitmule_buf::Pool`; relay check to sudfa (100 Mbit link, so 10 MiB/s is the link, hash matched); `--nic` pinning verified by
   interface counters.
-- Next: wire UDP into the `bitmule` crate (steps 2-6 under "Next steps"), then cleanup (TEMP-INSTR, decide on the str0m fork),
+- Next: UDP is wired in (see "UDP in the bitmule crate" below); then cleanup (TEMP-INSTR, decide on the str0m fork),
   redeploy the server (protocol changed: `UdpHello`, `PeerCaps::UDP`), docs.
 - Not possible from this session: anything needing root (no passwordless sudo; the `mcp__agent-invite__sudo_exec` tool was not
   connected). `scripts/nic-loop.sh` (wifi -> router -> cable loop on one machine with ipvlan/macvlan namespaces) was written but the
@@ -446,3 +446,16 @@ app link       -> transfer worker (v2/send.rs per receiver; v2/recv.rs)
   (asked per socket before the pool's receive tasks start); `bitmule-server/src/stun.rs` the responder.
 - User preferences stated so far: everything async; no blocking of the decode path by spill I/O;
   per-block hash kept; io_uring for native Linux; demo-style buffer pools; keep components isolated.
+
+## UDP in the bitmule crate (2026-10-18)
+- `Options.udp` (default off), `Options::with_udp(only)`, `PeerCaps::UDP`, `Transport::Udp`, `Report.udp_bytes/udp_time`.
+  `Peer2Peer::UdpHello` goes to a third demux output. CLI: `--udp` (UDP first, relay/WebRTC behind it) and `--udp-only`.
+- Sender (`udp_upload`): same read/encode pipeline as the relay upload, skips blocks the receiver reported done, stops
+  when all are. If UDP errors or no path is found, the relay/WebRTC startup runs as the fallback. Receiver (`udp_download`)
+  shares `spawn_decoder` with the relay path; the decoder reports finished blocks back to the UDP link.
+- Tests in `tests/v2_transfer.rs`: `over_udp`, `a_small_file_over_udp`, `an_empty_file_with_udp_on`,
+  `udp_with_the_relay_behind_it`, `udp_only_on_one_side_uses_the_relay`. All suites pass in release (debug builds are ~8x slower).
+- Fixed: the receiver's first progress report waited 250 ms, so fast loopback transfers never reported to the sender
+  (broke two `client_api` tests since the audit commit).
+- Not done: tests with injected loss through the `bitmule` crate, the fountain `Assembler` writing straight into `Symbol`s,
+  RaptorQ loss adaptation, wasm rebuild.

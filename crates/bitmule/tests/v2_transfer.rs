@@ -11,8 +11,9 @@ use bitmule_client_common::{
 use bitmule_server::{AppState, router};
 use tokio::sync::oneshot;
 
-const RELAY: Options = Options { webrtc: false, relay: true };
-const WEBRTC: Options = Options { webrtc: true, relay: false };
+const RELAY: Options = Options { webrtc: false, relay: true, udp: false };
+const WEBRTC: Options = Options { webrtc: true, relay: false, udp: false };
+const UDP: Options = Options { webrtc: false, relay: false, udp: true };
 
 async fn start_server() -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -64,6 +65,7 @@ async fn roundtrip(len: usize, options: Options) -> Transport {
         Transport::Relay => assert_eq!(report.relay_bytes, len as u64),
         // what the relay delivered before the hand-over is not sent again
         Transport::WebRtc => assert_eq!(report.relay_bytes + report.data_channel_bytes, len as u64),
+        Transport::Udp => assert_eq!((report.udp_bytes, report.relay_bytes, report.data_channel_bytes), (len as u64, 0, 0)),
     }
     report.transport
 }
@@ -93,6 +95,43 @@ async fn empty_file() {
 #[tokio::test(flavor = "multi_thread")]
 async fn over_webrtc() {
     assert_eq!(roundtrip(BLOCK_PLAIN + 12345, WEBRTC).await, Transport::WebRtc);
+}
+
+/// The symbols go straight to the receiver over UDP (on loopback here).
+#[tokio::test(flavor = "multi_thread")]
+async fn over_udp() {
+    assert_eq!(roundtrip(BLOCK_PLAIN * 2 + 12345, UDP).await, Transport::Udp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_file_over_udp() {
+    assert_eq!(roundtrip(1000, UDP).await, Transport::Udp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_file_with_udp_on() {
+    roundtrip(0, UDP).await;
+}
+
+/// UDP first, the relay as the way back; here UDP works.
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_with_the_relay_behind_it() {
+    let both = Options { webrtc: false, relay: true, udp: true };
+    assert_eq!(roundtrip(BLOCK_PLAIN + 99, both).await, Transport::Udp);
+}
+
+/// One side cannot do UDP: the transfer goes over the relay.
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_only_on_one_side_uses_the_relay() {
+    let server = start_server().await;
+    let data = payload(BLOCK_PLAIN + 1);
+    let (link, sender) = start_sender(&server, &data, Options { webrtc: false, relay: true, udp: true }).await;
+
+    let (out, file) = output();
+    let report = run_recv(&server, &link, file, RELAY).await.unwrap();
+    assert_eq!(report.transport, Transport::Relay);
+    sender.await.unwrap().unwrap();
+    assert_eq!(std::fs::read(out.path()).unwrap(), data);
 }
 
 /// Both transports on: whichever delivers, the file is right.

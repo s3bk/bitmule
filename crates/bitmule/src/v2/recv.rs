@@ -21,6 +21,7 @@ use bitmule_client_common::{
 use bitmule_client_native::{
     crypto::{BulkKey, CommitmentHasher, ShareLink},
     rtc::{self, ChannelEvent},
+    udp::{self, BytesAssembler, UdpConfig},
 };
 use bitmule_core::{
     ReceiverId, SessionId, Token,
@@ -31,7 +32,10 @@ use futures_util::StreamExt;
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle};
 use tracing::warn;
 
-use super::{Options, Report, Server, Span, Transport, VerifyFailed, dcproto, peer::PeerLink};
+use super::{Options, Report, Server, Span, Transport, VerifyFailed, dcproto, peer::PeerLink, send::AbortOnDrop};
+
+/// No symbol over UDP for this long: the path did not work out, or died.
+const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Symbols queued for the decoder thread.
 const DECODE_QUEUE: usize = 4096;
@@ -138,7 +142,7 @@ fn bump_for(progress: Option<Progress>, size: u64, sender: mpsc::Sender<Peer2Pee
         // the sender shows this to its user; a full queue just skips one report
         let now = started.elapsed().as_millis() as u64 + 1;
         let last = last_report.load(Relaxed);
-        if now - last >= REPORT_EVERY.as_millis() as u64
+        if (last == 0 || now - last >= REPORT_EVERY.as_millis() as u64)
             && last_report.compare_exchange(last, now, Relaxed, Relaxed).is_ok()
         {
             let _ = sender.try_send(Peer2Peer::Progress(total));
@@ -213,7 +217,7 @@ impl DcRequests {
     }
 }
 
-pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, signaling: PeerLink) -> Result<Report> {
+pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, signaling: PeerLink, udp: PeerLink) -> Result<Report> {
     let PeerLink { tx, mut rx } = app;
 
     let manifest = loop {
@@ -233,7 +237,9 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
 
     let use_relay = ctx.options.relay && sender_caps.contains(PeerCaps::RELAY);
     let use_webrtc = ctx.options.webrtc && sender_caps.contains(PeerCaps::WEBRTC);
-    ensure!(use_relay || use_webrtc, "sender and receiver have no transport in common");
+    let udp_possible = ctx.options.udp && sender_caps.contains(PeerCaps::UDP);
+    let use_udp = udp_possible && size > 0;
+    ensure!(use_relay || use_webrtc || udp_possible, "sender and receiver have no transport in common");
 
     tx.send(Peer2Peer::Get { start: 0, end: size }).await?;
 
@@ -244,7 +250,14 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
     let mut data_channel_time = Span::default();
     let mut dc_bytes = 0u64;
     let mut relay_bytes = size;
+    let mut udp_bytes = 0u64;
+    let mut udp_time = Span::default();
     if size > 0 {
+        // UDP is tried first; if it fails the sender starts the other transports (`JoinRelay`, an offer)
+        let mut udp_task = use_udp.then(|| {
+            let (manifest, out, bump, server) = (manifest.clone(), out.clone(), bump.clone(), ctx.server.clone());
+            AbortOnDrop(tokio::spawn(async move { udp_download(server.stun_addr().await, udp, manifest, out, bump).await }))
+        });
         // the offer arrives on the signaling channel whenever the sender is ready
         let mut channel = if use_webrtc {
             Some(rtc::spawn(rtc::Role::Answerer, ctx.server.stun_addr().await, signaling.tx, signaling.rx).await?)
@@ -264,11 +277,31 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
         loop {
             tokio::select! {
                 message = rx.recv() => match message {
-                    Some(Peer2Peer::JoinRelay) if use_relay => relay_offered = true,
+                    // the sender gave up on UDP (or never used it): the relay is how it goes on
+                    Some(Peer2Peer::JoinRelay) if use_relay => {
+                        udp_task = None;
+                        relay_offered = true;
+                    }
                     Some(Peer2Peer::JoinRelay) | Some(Peer2Peer::Progress(_)) => {}
                     Some(_) => bail!("unexpected message during transfer"),
                     None => bail!("sender went away"),
                 },
+                result = async { (&mut udp_task.as_mut().unwrap().0).await }, if udp_task.is_some() => {
+                    udp_task = None;
+                    match result? {
+                        Ok(RelayEnd::Complete(span)) => {
+                            udp_time = span;
+                            udp_bytes = size;
+                            relay_bytes = 0;
+                            transport = Transport::Udp;
+                            break;
+                        }
+                        Ok(RelayEnd::Stopped(..)) => bail!("the udp download was stopped"),
+                        // the sender notices as well and starts the other transports
+                        Err(e) if use_relay || use_webrtc => warn!("udp download: {e:#}"),
+                        Err(e) => return Err(e),
+                    }
+                }
                 result = async { (&mut relay.as_mut().unwrap().task).await }, if relay.is_some() => {
                     relay = None;
                     match result? {
@@ -372,13 +405,13 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
             return Err(VerifyFailed("data does not match the share link's signature").into());
         }
         tx.send(Peer2Peer::Complete).await?;
-        return Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, relay_time, data_channel_time });
+        return Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, udp_bytes, relay_time, data_channel_time, udp_time });
     }
     if commitment_of(out.clone(), size, manifest.bulk_key.clone()).await? != ctx.link.signature {
         return Err(VerifyFailed("data does not match the share link's signature").into());
     }
     tx.send(Peer2Peer::Complete).await?;
-    Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, relay_time, data_channel_time })
+    Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, udp_bytes, relay_time, data_channel_time, udp_time })
 }
 
 /// A streaming transfer (the sender's first message was `JoinRelay`, not
@@ -442,7 +475,7 @@ async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sende
         return Err(VerifyFailed("data does not match the share link's signature").into());
     }
     tx.send(Peer2Peer::Complete).await?;
-    Ok(Report { manifest, transport: Transport::Relay, relay_bytes: size, data_channel_bytes: 0, relay_time, data_channel_time: Span::default() })
+    Ok(Report { manifest, transport: Transport::Relay, relay_bytes: size, data_channel_bytes: 0, udp_bytes: 0, relay_time, data_channel_time: Span::default(), udp_time: Span::default() })
 }
 
 /// The relay download of a streaming transfer: until the manifest arrives
@@ -502,33 +535,16 @@ async fn commitment_of(file: Arc<std::fs::File>, size: u64, key: BulkKey) -> Res
     }).await??)
 }
 
-/// Download and decode the fountain coded stream at `url` into `out`.
-///
-/// Blocks are written where they belong in the order they complete. Decoding
-/// runs on a thread of its own, the writer (io_uring on Linux) on another;
-/// blocks still short of symbols when memory runs out are spilled into their
-/// gap in `out`. Dropping the future stops it all; `stop` ends it gracefully:
-/// the frames already taken are decoded, the blocks written, and the blocks
-/// that are in `out` are reported.
-async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, stop: oneshot::Receiver<()>, bump: Bump) -> Result<RelayEnd> {
-    let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
-    decode_download(Box::pin(response.bytes_stream()), None, manifest, out, stop, bump).await
-}
-
-type ByteStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
-
-/// `relay_download` on a stream that is already open. `prefix`, with its length,
-/// is the start of the stream as it was kept: decoded first.
-async fn decode_download(
-    mut stream: ByteStream,
-    prefix: Option<(std::fs::File, u64)>,
-    manifest: TransferManifest,
+/// The decoder thread: payloads in, blocks written to `out`. `block_done` is
+/// told of every block once it is queued for writing. The thread ends when the
+/// sender half is dropped (after it has decoded what was queued) or when
+/// every block is in; its result is the blocks that are.
+fn spawn_decoder(
+    manifest: &TransferManifest,
     out: Arc<std::fs::File>,
-    stop: oneshot::Receiver<()>,
     bump: Bump,
-) -> Result<RelayEnd> {
-    let mut splitter = fountain::FrameSplitter::default();
-
+    block_done: Option<mpsc::UnboundedSender<u32>>,
+) -> Result<(mpsc::Sender<Bytes>, JoinHandle<Result<Vec<u32>>>)> {
     let (tx, mut frames) = mpsc::channel::<Bytes>(DECODE_QUEUE);
     let (key, size) = (manifest.bulk_key.clone(), manifest.transfer_size);
     let block_hashes = manifest.block_hashes.clone();
@@ -539,7 +555,7 @@ async fn decode_download(
         );
     }
     let runtime = tokio::runtime::Handle::current();
-    let mut decode = tokio::task::spawn_blocking(move || -> Result<Vec<u32>> {
+    let decode = tokio::task::spawn_blocking(move || -> Result<Vec<u32>> {
         use tokio::sync::mpsc::error::TryRecvError;
 
         let symbols = fountain::symbol_pool();
@@ -578,7 +594,11 @@ async fn decode_download(
                 };
                 if let Some(block) = block {
                     bump(block.data().len() as u64);
+                    let block_nr = block.block_nr;
                     writer.write(block)?;
+                    if let Some(done) = &block_done {
+                        let _ = done.send(block_nr);
+                    }
                 }
             }
             Ok(())
@@ -588,6 +608,38 @@ async fn decode_download(
         written?;
         Ok(decoder.done_blocks())
     });
+
+    Ok((tx, decode))
+}
+
+/// Download and decode the fountain coded stream at `url` into `out`.
+///
+/// Blocks are written where they belong in the order they complete. Decoding
+/// runs on a thread of its own, the writer (io_uring on Linux) on another;
+/// blocks still short of symbols when memory runs out are spilled into their
+/// gap in `out`. Dropping the future stops it all; `stop` ends it gracefully:
+/// the frames already taken are decoded, the blocks written, and the blocks
+/// that are in `out` are reported.
+async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, stop: oneshot::Receiver<()>, bump: Bump) -> Result<RelayEnd> {
+    let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
+    decode_download(Box::pin(response.bytes_stream()), None, manifest, out, stop, bump).await
+}
+
+type ByteStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+/// `relay_download` on a stream that is already open. `prefix`, with its length,
+/// is the start of the stream as it was kept: decoded first.
+async fn decode_download(
+    mut stream: ByteStream,
+    prefix: Option<(std::fs::File, u64)>,
+    manifest: TransferManifest,
+    out: Arc<std::fs::File>,
+    stop: oneshot::Receiver<()>,
+    bump: Bump,
+) -> Result<RelayEnd> {
+    let mut splitter = fountain::FrameSplitter::default();
+    let (tx, mut decode) = spawn_decoder(&manifest, out, bump, None)?;
+    let size = manifest.transfer_size;
 
     let mut tx = Some(tx);
     let mut stop = Some(stop);
@@ -654,6 +706,50 @@ async fn decode_download(
                 } else {
                     bail!("relay stream ended before the transfer was complete")
                 };
+            }
+        }
+    }
+}
+
+/// Receive the transfer over UDP: find a path to the sender, decode the
+/// symbols as they come and write the blocks, telling the sender which blocks
+/// are in so that it stops coding them. Fails if no path is found, or when no
+/// symbol arrives for `UDP_IDLE`.
+async fn udp_download(
+    stun: Option<std::net::SocketAddr>,
+    link: PeerLink,
+    manifest: TransferManifest,
+    out: Arc<std::fs::File>,
+    bump: Bump,
+) -> Result<RelayEnd> {
+    let PeerLink { tx: signal_tx, rx: signal_rx } = link;
+    let mut udp = udp::connect(
+        bitmule_client_native::Role::Receiver, manifest.bulk_key.clone(), stun, signal_tx, signal_rx,
+        UdpConfig::default(), BytesAssembler::new(),
+    ).await?;
+    let size = manifest.transfer_size;
+    let (tx, mut decode) = spawn_decoder(&manifest, out, bump, Some(udp.block_done.clone()))?;
+    let mut tx = Some(tx);
+    let mut span = Span::default();
+    loop {
+        tokio::select! {
+            payload = tokio::time::timeout(UDP_IDLE, udp.payloads_in.recv()), if tx.is_some() => match payload {
+                Ok(Some(payload)) => {
+                    span.mark();
+                    // a full queue holds the reader back; the datagrams then queue up in the socket
+                    if tx.as_ref().unwrap().send(payload).await.is_err() {
+                        tx = None; // the decoder is done, or has failed: its result says which
+                    }
+                }
+                Ok(None) => bail!("the udp link closed"),
+                Err(_) => bail!("no symbol over udp for {} s", UDP_IDLE.as_secs()),
+            },
+            result = &mut decode => {
+                let done = result??;
+                ensure!(done.len() == fountain::num_blocks(size) as usize, "the udp transfer ended before it was complete");
+                // the sender learns of the last blocks from the worker; give it the time to send them
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                return Ok(RelayEnd::Complete(span));
             }
         }
     }
