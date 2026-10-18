@@ -45,7 +45,7 @@
 //! sent again: `DoneBlocks`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -587,11 +587,18 @@ struct RateControl {
     slow_start: bool,
     /// Has the receiver reported yet? It is listening then; data sent before would be lost.
     ready: bool,
+    /// The loss of the last reports: the lower quartile is what the path loses
+    /// whatever the rate (radio, a policer), which is no reason to slow down
+    /// since the fountain code covers it. Only loss above that counts.
+    recent: VecDeque<f64>,
 }
+
+/// How many reports (50 ms each) the baseline loss looks back over.
+const LOSS_HISTORY: usize = 100;
 
 impl RateControl {
     fn new(cfg: &UdpConfig) -> Self {
-        RateControl { rate: cfg.start_rate as f64, max: cfg.max_rate as f64, last: None, slow_start: true, ready: false }
+        RateControl { rate: cfg.start_rate as f64, max: cfg.max_rate as f64, last: None, slow_start: true, ready: false, recent: VecDeque::new() }
     }
 
     /// Take in the data of a `FEEDBACK` packet.
@@ -608,7 +615,16 @@ impl RateControl {
         let expected = seen.wrapping_sub(last_seen);
         if expected >= 20 {
             let got = received.wrapping_sub(last_received).min(expected);
-            let loss = 1.0 - got as f64 / expected as f64;
+            let raw = 1.0 - got as f64 / expected as f64;
+            if self.recent.len() == LOSS_HISTORY {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(raw);
+            let mut sorted: Vec<f64> = self.recent.iter().cloned().collect();
+            sorted.sort_by(f64::total_cmp);
+            // a quartile, not the minimum: a single lucky report must not set the baseline
+            let floor = if sorted.len() < 10 { raw } else { sorted[sorted.len() / 4] };
+            let loss = (raw - floor).max(0.0);
             if self.slow_start && loss < 0.02 {
                 self.rate = (self.rate * 2.0).min(self.max);
             } else {
@@ -1093,6 +1109,35 @@ mod tests {
         assert_eq!(adapt(10e6, 0.05, 100e6), 10e6);
         assert!((adapt(10e6, 0.2, 100e6) - 7e6).abs() < 1.0);
         assert_eq!(adapt(MIN_RATE, 0.5, 100e6), MIN_RATE);
+    }
+
+    /// A feedback packet for the counters, with no blocks done.
+    fn feedback_packet(seen: u32, received: u32) -> Vec<u8> {
+        let mut data = vec![0u8; 4 + FEEDBACK_WINDOW / 8];
+        data.extend_from_slice(&seen.to_le_bytes());
+        data.extend_from_slice(&received.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn a_steady_loss_is_not_taken_for_congestion() {
+        let done = DoneBlocks::default();
+        let mut rate = RateControl::new(&UdpConfig::default());
+        let start = rate.rate;
+        let (mut seen, mut received) = (0u32, 0u32);
+        for _ in 0..200 {
+            seen += 1000;
+            received += 600; // 40% lost, whatever the rate
+            rate.feedback(&feedback_packet(seen, received), &done);
+        }
+        assert!(rate.rate >= start, "{} fell below {start}", rate.rate);
+        // a rise in loss on top of it does slow the sender
+        for _ in 0..20 {
+            seen += 1000;
+            received += 300;
+            rate.feedback(&feedback_packet(seen, received), &done);
+        }
+        assert!(rate.rate < start, "{}", rate.rate);
     }
 
     #[test]

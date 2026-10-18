@@ -459,3 +459,15 @@ app link       -> transfer worker (v2/send.rs per receiver; v2/recv.rs)
   (broke two `client_api` tests since the audit commit).
 - Not done: tests with injected loss through the `bitmule` crate, the fountain `Assembler` writing straight into `Symbol`s,
   RaptorQ loss adaptation, wasm rebuild.
+
+## UDP under loss (2026-10-18)
+
+- Local check, `--udp-only`, 100 MB, `BITMULE_UDP_DROP` on the receiver (new test aid, `recv.rs`): 0% 3.1 s, 5% 3.3 s,
+  20% 3.8 s, 40% 4.0 s, 60% 4.9 s, hash matched each time. Before: 20% never finished (rate fell to the 1 MiB/s floor).
+- Rate control (`RateControl` in `udp.rs`): loss counts only above the lower quartile of the last 100 reports (5 s), so a path
+  that always loses some (radio, policer) is not slowed, as the fountain code covers it. A rise on top of it still slows the sender.
+- Heap corruption found on the way (about 1 run in 15, sender or receiver aborted at the end of the MTU phase,
+  "tcache_thread_shutdown(): unaligned tcache chunk"): `tokio-uring` 0.5.0 `Driver::drop` replaced the `Lifecycle::Ignored(data)`
+  of reads already dropped with `Ignored(())`, freeing the buffer, msghdr and address the kernel was still to write.
+  Fixed in `vendor/tokio-uring` (patched in the workspace); 60/60 clean runs afterwards, 0/60 failed with io_uring off before.
+- Not run: sudfa. The relay on artisan was not redeployed (ssh to it was refused in this session).

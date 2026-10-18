@@ -725,7 +725,11 @@ async fn udp_download(
     let PeerLink { tx: signal_tx, rx: signal_rx } = link;
     let mut udp = udp::connect(
         bitmule_client_native::Role::Receiver, manifest.bulk_key.clone(), stun, signal_tx, signal_rx,
-        UdpConfig::default(), BytesAssembler::new(),
+        UdpConfig {
+            // Test aid: BITMULE_UDP_DROP=0.05 drops 5% of incoming data datagrams.
+            drop: std::env::var("BITMULE_UDP_DROP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            ..UdpConfig::default()
+        }, BytesAssembler::new(),
     ).await?;
     let size = manifest.transfer_size;
     let (tx, mut decode) = spawn_decoder(&manifest, out, bump, Some(udp.block_done.clone()))?;

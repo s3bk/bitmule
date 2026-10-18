@@ -90,3 +90,4 @@ lto = "thin"
 [patch.crates-io]
 str0m = { path = "vendor/str0m" }
 sctp-proto = { path = "vendor/sctp-proto" }
+tokio-uring = { path = "vendor/tokio-uring" }
