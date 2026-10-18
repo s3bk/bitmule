@@ -25,7 +25,7 @@ rand = { workspace = true }
 tracing = { workspace = true }
 futures-util = "0.3"
 xxhash-rust = { version = "*", features = ["xxh3"] }
-bitflags = { version = "*", features = ["serde"] }
+bitflags = { version = "2", features = ["serde"] }
 aes-gcm = "0.10"
 zeroize = "1"
 postcard = { version = "1", features = ["use-std"] }
