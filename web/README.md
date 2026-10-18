@@ -38,10 +38,39 @@ cargo install wasm-pack   # once
 rustup target add wasm32-unknown-unknown
 
 cd crates/bitmule-client-wasm
-wasm-pack build --target web --out-dir ../../web/wasm/pkg
+wasm-pack build --release --target web --out-dir ../../web/wasm/pkg
 ```
 
 Refresh the SPA. Status row should read `wasm: v<version>`.
+
+## How it works (v2)
+
+The protocol runs in Rust compiled to wasm (`crates/bitmule-client-wasm`, the
+same code as the CLI: postcard messages, sealed envelopes, key exchange,
+fountain codes, proof of work). It runs in a dedicated web worker so the page
+stays responsive; the page only does the UI and WebRTC.
+
+- `v2-worker.js` — one job per worker (send / receive / request): the signaling
+  websocket, relay upload and download, reading the file, assembling the
+  received file in OPFS (memory if there is none).
+- `v2.js` — starts a job, owns the `RTCPeerConnection`s, passes data channel
+  messages to and from the worker.
+- `main.js` — UI only.
+
+Limits: the transfer carries no file name (a receiver saves `bitmule-download`
+or `bitmule-files.zip`); several files go as a store-mode zip; no UDP.
+
+## Tests
+
+```
+pip install selenium
+cargo build --release -p bitmule -p bitmule-server
+python3 web/test/browser_test.py [name-filter]
+```
+
+Drives Chrome (headless, a matching chrome/chromedriver pair from
+selenium-manager's cache, or `BITMULE_CHROME` / `BITMULE_CHROMEDRIVER`) against
+the CLI and itself through a local server. Every wait is 10 s.
 
 ## Layout
 
