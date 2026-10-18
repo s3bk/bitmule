@@ -88,6 +88,6 @@ lto = "thin"
 # local forks: str0m (data channel send buffer 1 MiB, not 128 KiB: vendor/str0m/src/sctp/mod.rs) and
 # sctp-proto (Fx hashing in the payload queue, SACK delay settable: vendor/sctp-proto)
 [patch.crates-io]
-str0m = { path = "vendor/str0m" }
-sctp-proto = { path = "vendor/sctp-proto" }
-tokio-uring = { path = "vendor/tokio-uring" }
+str0m = { git = "https://github.com/s3bk/str0m", branch = "bitmule-vendored" }
+sctp-proto = { git = "https://github.com/s3bk/sctp-proto", branch = "bitmule" }
+tokio-uring = { git = "https://github.com/s3bk/tokio-uring", branch = "bitmule" }
