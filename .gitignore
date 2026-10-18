@@ -2,3 +2,4 @@ target/
 web/wasm/
 /Cargo.lock
 dist/
+perf.data*
