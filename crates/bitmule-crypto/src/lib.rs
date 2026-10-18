@@ -137,6 +137,64 @@ impl ShareKey {
     }
 }
 
+/// Which side of a session an identity key belongs to. Part of what the
+/// identity MAC covers, so one side's MAC cannot be presented as the other's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IdentityRole {
+    /// Created the session.
+    Owner = 1,
+    Joiner = 2,
+}
+
+/// What the server stores of a join proof: `SHA256("bitmule-v2 join check" || proof)`.
+/// Cannot be turned back into the proof, nor into `A`.
+pub fn join_check_of(proof: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bitmule-v2 join check");
+    hasher.update(proof);
+    hasher.finalize().into()
+}
+
+/// Constant-time comparison of a presented join proof with the stored check.
+pub fn join_proof_matches(proof: &[u8; 32], check: &[u8; 32]) -> bool {
+    constant_time_eq(&join_check_of(proof), check)
+}
+
+impl ShareKey {
+    /// `HMAC-SHA256(A, "bitmule-v2 identity" || role || session_id || id || pub)`.
+    /// Binds an identity key to the share key, to the session, to the peer
+    /// id the server knows it by and to its side, so a MAC (which the server
+    /// hands to every joiner) cannot be replayed as another peer, or as the
+    /// other side.
+    pub fn mac_identity(&self, role: IdentityRole, session_id: &[u8; 32], id: &[u8; 32], pub_bytes: &PublicKey) -> SessionMac {
+        let mut mac = <Hmac<Sha256> as HmacKeyInit>::new_from_slice(&self.0)
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(b"bitmule-v2 identity");
+        mac.update(&[role as u8]);
+        mac.update(session_id);
+        mac.update(id);
+        mac.update(&pub_bytes.0);
+        SessionMac(mac.finalize().into_bytes().into())
+    }
+
+    /// What a joiner presents to the server to be let into the session:
+    /// `HMAC-SHA256(A, "bitmule-v2 join proof")`. The session's creator gave
+    /// the server `join_check_of(proof)`. Somebody who only knows the
+    /// session id (the server's other users, its logs) cannot produce it.
+    /// The server sees it once somebody joins, but cannot get `A` from it.
+    pub fn join_proof(&self) -> [u8; 32] {
+        let mut mac = <Hmac<Sha256> as HmacKeyInit>::new_from_slice(&self.0)
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(b"bitmule-v2 join proof");
+        mac.finalize().into_bytes().into()
+    }
+
+    /// `join_check_of(join_proof())`: what the creator registers.
+    pub fn join_check(&self) -> [u8; 32] {
+        join_check_of(&self.join_proof())
+    }
+}
+
 impl Drop for ShareKey {
     fn drop(&mut self) { self.0.zeroize(); }
 }
@@ -600,6 +658,28 @@ mod tests {
         let alice_s = alice.derive_shared_secret(&bob_pub).unwrap();
         let bob_s = bob.derive_shared_secret(&alice_pub).unwrap();
         assert_eq!(alice_s.0, bob_s.0);
+    }
+
+    #[test]
+    fn identity_mac_binds_role_session_and_id() {
+        let a = ShareKey::random();
+        let key = Ephemeral::generate().public_keypublic_key();
+        let (sid, id) = ([1u8; 32], [2u8; 32]);
+        let base = a.mac_identity(IdentityRole::Owner, &sid, &id, &key);
+        assert_eq!(base, a.mac_identity(IdentityRole::Owner, &sid, &id, &key));
+        assert_ne!(base, a.mac_identity(IdentityRole::Joiner, &sid, &id, &key));
+        assert_ne!(base, a.mac_identity(IdentityRole::Owner, &[9u8; 32], &id, &key));
+        assert_ne!(base, a.mac_identity(IdentityRole::Owner, &sid, &[9u8; 32], &key));
+    }
+
+    #[test]
+    fn join_proof_matches_only_its_check() {
+        let a = ShareKey::random();
+        let b = ShareKey::random();
+        assert!(join_proof_matches(&a.join_proof(), &a.join_check()));
+        assert!(!join_proof_matches(&b.join_proof(), &a.join_check()));
+        // the check alone is not a proof
+        assert!(!join_proof_matches(&a.join_check(), &a.join_check()));
     }
 
     #[test]

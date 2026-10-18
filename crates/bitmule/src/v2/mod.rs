@@ -66,6 +66,23 @@ impl Server {
         found.filter(|a| a.is_ipv4()).next()
     }
 
+    /// Like [`Server::parse`], but a server without TLS (`http://`) is an
+    /// error unless `allow_insecure`: the transfer stays encrypted end to
+    /// end either way, but over plain `ws`/`http` anybody on the path sees
+    /// who talks to whom and can drop or delay anything.
+    pub fn parse_checked(s: &str, allow_insecure: bool) -> anyhow::Result<Self> {
+        let s = s.trim();
+        let Some((scheme, rest)) = s.split_once("://") else {
+            return Ok(Server::parse(s)); // a bare host: TLS
+        };
+        match scheme.to_ascii_lowercase().as_str() {
+            "https" => Ok(Server::parse(&format!("https://{rest}"))),
+            "http" if allow_insecure => Ok(Server::parse(&format!("http://{rest}"))),
+            "http" => anyhow::bail!("{s} is not https: the connection to the server would be unencrypted (--unsafe allows it)"),
+            other => anyhow::bail!("{s}: the server's scheme must be https, not {other}"),
+        }
+    }
+
     pub fn http(&self, path: &str) -> String {
         format!("{}://{}{path}", if self.tls { "https" } else { "http" }, self.host)
     }
@@ -82,6 +99,23 @@ impl Server {
     /// The URL to hand to a receiver.
     pub fn share_url(&self, link: &ShareLink) -> String {
         format!("{}/#{}", self.http(""), link.to_b64_url())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Server;
+
+    #[test]
+    fn plain_http_needs_permission() {
+        assert!(Server::parse_checked("https://bitmule.example", false).unwrap().tls);
+        assert!(Server::parse_checked("bitmule.example:8443", false).unwrap().tls);
+        assert!(Server::parse_checked("HTTPS://bitmule.example", false).unwrap().tls);
+        assert!(Server::parse_checked("http://127.0.0.1:8443", false).is_err());
+        assert!(Server::parse_checked("HTTP://127.0.0.1:8443", false).is_err());
+        assert!(Server::parse_checked("ws://127.0.0.1:8443", true).is_err());
+        let plain = Server::parse_checked("HTTP://127.0.0.1:8443", true).unwrap();
+        assert!(!plain.tls && plain.host == "127.0.0.1:8443");
     }
 }
 
@@ -156,6 +190,19 @@ impl Span {
         Some(format!("{mib:.1} MiB in {time:.2} s ({:.1} MiB/s)", mib / time.max(1e-9)))
     }
 }
+
+/// The received data does not match its checksum (the share link's signature,
+/// or the one a streaming sender sent after the data). The file that was
+/// written is not what was sent.
+#[derive(Debug)]
+pub struct VerifyFailed(pub &'static str);
+
+impl std::fmt::Display for VerifyFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for VerifyFailed {}
 
 pub struct Report {
     pub manifest: TransferManifest,

@@ -18,14 +18,18 @@ mod identity;
 /// `--stun`, when given.
 static STUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-fn parse_server(url: &str) -> v2::Server {
-    let mut server = v2::Server::parse(url);
+/// `--unsafe`: servers without TLS are allowed.
+static ALLOW_INSECURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn parse_server(url: &str) -> Result<v2::Server> {
+    let allow = ALLOW_INSECURE.load(std::sync::atomic::Ordering::Relaxed);
+    let mut server = v2::Server::parse_checked(url, allow)?;
     match STUN.get().map(String::as_str) {
         Some("none") => server.stun = None,
         Some(stun) => server.stun = Some(stun.to_string()),
         None => {}
     }
-    server
+    Ok(server)
 }
 
 #[derive(Parser)]
@@ -44,6 +48,12 @@ struct Cli {
     /// on the signaling server's host.
     #[arg(long, value_name = "HOST:PORT", global = true)]
     stun: Option<String>,
+
+    /// Allow a server without TLS (http://). The transfer stays end-to-end
+    /// encrypted, but the connection to the server does not: anybody on the
+    /// path sees who talks to whom, and can drop or delay messages.
+    #[arg(long = "unsafe", global = true)]
+    allow_insecure: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -103,6 +113,13 @@ enum Command {
         /// Force server relay only (skip WebRTC).
         #[arg(long)]
         relay: bool,
+        /// What to do when the file to write exists already.
+        #[arg(long, value_enum, default_value_t = bitmule::OnConflict::Ask)]
+        on_conflict: bitmule::OnConflict,
+        /// Keep the file when it does not match its checksum. By default
+        /// it is deleted: it is not what was sent.
+        #[arg(long)]
+        keep_failed: bool,
     },
     /// Manage local identities (keypairs). Each identity is a
     /// (name, Ed25519 sign key, X25519 KEX key) triple stored under
@@ -150,6 +167,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    ALLOW_INSECURE.store(cli.allow_insecure, std::sync::atomic::Ordering::Relaxed);
     if let Some(stun) = &cli.stun {
         let _ = STUN.set(stun.clone());
     }
@@ -166,7 +184,7 @@ async fn main() -> Result<()> {
             }
             cmd_send(&cli.server, paths, resolve_mode(webrtc, relay), multi, to).await
         }
-        Command::Recv { session, out, webrtc, relay } => {
+        Command::Recv { session, out, webrtc, relay, on_conflict, keep_failed } => {
             // Infer the server from the share URL when possible so the
             // receiver doesn't need `--server` to match the sender's
             // published origin. Falls back to `--server` (default
@@ -176,7 +194,7 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .and_then(extract_server_from_url);
             let server = inferred.as_deref().unwrap_or(&cli.server);
-            cmd_recv(server, session, out, resolve_mode(webrtc, relay)).await
+            cmd_recv(server, session, out, resolve_mode(webrtc, relay), on_conflict, keep_failed).await
         }
         Command::Identity { action } => match action {
             IdentityAction::Add { name, contact_base } => identity_add(name, contact_base).await,
@@ -419,12 +437,12 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
     if let Some(to) = to {
         let frag = extract_link_fragment(&to).ok_or_else(|| anyhow!("couldn't extract the request key from {to:?}"))?;
         let request = ShareKey::from_hex(&frag).map_err(|e| anyhow!("{to:?} is not a request link: {e}"))?;
-        let server = parse_server(&extract_server_from_url(&to).unwrap_or_else(|| server.to_string()));
+        let server = parse_server(&extract_server_from_url(&to).unwrap_or_else(|| server.to_string()))?;
         println!("sending to the receiver that made {to}");
         v2::run_send_to(&server, &request, manifest, transfer, v2::Options::from_mode(mode), |_| {}).await?;
         return Ok(());
     }
-    let server = parse_server(server);
+    let server = parse_server(server)?;
     v2::run_send_events(&server, manifest, transfer, v2::Options::from_mode(mode), |link| print_link(&server, link), send_events()).await?;
     Ok(())
 }
@@ -433,7 +451,7 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
 /// sender is still reading it (`tar c dir | bitmule send -`). The size and the checksum
 /// follow the data, so the link has no signature.
 async fn cmd_send_stdin(server: &str, name: String, mode: TransportMode) -> Result<()> {
-    let server = parse_server(server);
+    let server = parse_server(server)?;
     let mut options = v2::Options::from_mode(mode);
     options.relay = true; // the only transport a stream has
     v2::run_send_stream(
@@ -493,6 +511,8 @@ async fn cmd_recv(
     session_arg: Option<String>,
     out: PathBuf,
     mode: TransportMode,
+    on_conflict: bitmule::OnConflict,
+    keep_failed: bool,
 ) -> Result<()> {
     let options = v2::Options::from_mode(mode);
     let (link, server) = match session_arg {
@@ -501,11 +521,11 @@ async fn cmd_recv(
                 .ok_or_else(|| anyhow!("couldn't extract share fragment from {raw:?}"))?;
             let link = ShareLink::from_b64_url(&frag)
                 .map_err(|e| anyhow!("share fragment {frag:?} is not a share link: {e}"))?;
-            (link, parse_server(&extract_server_from_url(&raw).unwrap_or_else(|| server.to_string())))
+            (link, parse_server(&extract_server_from_url(&raw).unwrap_or_else(|| server.to_string()))?)
         }
         None => {
             // receiver-initiated: hand out a link, the sender answers with its share link
-            let server = parse_server(server);
+            let server = parse_server(server)?;
             let link = v2::run_request(&server, options, |key| {
                 let url = server.request_url(key);
                 println!("send:    {url}   (bitmule send --to URL FILE)");
@@ -519,16 +539,37 @@ async fn cmd_recv(
     };
 
     // `out` is the file to write, or a directory to put the sender's file in
-    let open = move |manifest: &bitmule_core::protocol::websocket::TransferManifest| {
-        let dest = if out.is_dir() {
-            out.join(manifest.file_name().unwrap_or_else(|| "bitmule-download".to_string()))
-        } else {
-            out
-        };
-        println!("receiving into {}", dest.display());
-        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&dest)
+    let landed: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> = Default::default();
+    let open = {
+        let landed = landed.clone();
+        move |manifest: &bitmule_core::protocol::websocket::TransferManifest| {
+            let dest = if out.is_dir() {
+                out.join(manifest.file_name().unwrap_or_else(|| "bitmule-download".to_string()))
+            } else {
+                out
+            };
+            let (path, file) = bitmule::output::open_new(&dest, on_conflict, bitmule::output::ask_on_terminal)?;
+            println!("receiving into {}", path.display());
+            *landed.lock().unwrap() = Some(path);
+            Ok(file)
+        }
     };
-    let report = v2::run_recv_with(&server, &link, open, options).await?;
+    let report = match v2::run_recv_with(&server, &link, open, options).await {
+        Ok(report) => report,
+        Err(e) if e.is::<v2::VerifyFailed>() => {
+            let path = landed.lock().unwrap().take();
+            match path {
+                Some(path) if keep_failed => eprintln!("kept {}, which is not what was sent (--keep-failed)", path.display()),
+                Some(path) => {
+                    let _ = std::fs::remove_file(&path);
+                    eprintln!("deleted {}, which is not what was sent (--keep-failed keeps it)", path.display());
+                }
+                None => {}
+            }
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     println!("done, over {:?} ({} bytes via relay, {} via data channel)", report.transport, report.relay_bytes, report.data_channel_bytes);
     if let Some(line) = report.relay_time.describe(report.relay_bytes) {
         println!("relay:        {line}");

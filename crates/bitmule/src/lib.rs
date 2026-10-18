@@ -109,6 +109,9 @@ use v2::{Options, SendEvent, Server, StreamInfo};
 pub use native::TransportMode;
 pub use v2::{Reader as StreamReader, StreamSource};
 pub mod v2;
+pub mod output;
+pub mod unzip;
+pub use output::OnConflict;
 
 // -----------------------------------------------------------------------
 // Errors
@@ -122,6 +125,8 @@ pub enum Error {
     BadShareUrl(String),
     NotAFileOrDir(PathBuf),
     Transport(anyhow::Error),
+    /// A server without TLS, and [`Client::allow_insecure`] is off.
+    InsecureServer(anyhow::Error),
     Io(std::io::Error),
 }
 
@@ -132,6 +137,7 @@ impl fmt::Display for Error {
             Error::BadShareUrl(s) => write!(f, "invalid share url: {s}"),
             Error::NotAFileOrDir(p) => write!(f, "{} is not a file or directory", p.display()),
             Error::Transport(e) => write!(f, "transport: {e}"),
+            Error::InsecureServer(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "io: {e}"),
         }
     }
@@ -140,7 +146,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Transport(e) => Some(e.as_ref()),
+            Error::Transport(e) | Error::InsecureServer(e) => Some(e.as_ref()),
             Error::Io(e) => Some(e),
             _ => None,
         }
@@ -166,17 +172,33 @@ impl From<std::io::Error> for Error {
 #[derive(Clone)]
 pub struct Client {
     server: Arc<String>,
+    allow_insecure: bool,
 }
 
 impl Client {
     pub fn new(server: impl Into<String>) -> Self {
         Self {
             server: Arc::new(server.into()),
+            allow_insecure: false,
         }
     }
 
     pub fn builder() -> ClientBuilder {
-        ClientBuilder { server: None }
+        ClientBuilder { server: None, allow_insecure: false }
+    }
+
+    /// Allow servers without TLS (`http://`), the one in `new` and the ones
+    /// in share URLs. Off by default: the data stays end-to-end encrypted
+    /// either way, but the connection to the server would not be, and a share
+    /// URL can name any server.
+    pub fn allow_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
+    }
+
+    /// `url` as a server, if its scheme is acceptable.
+    fn parse_server(&self, url: &str) -> Result<Server> {
+        Server::parse_checked(url, self.allow_insecure).map_err(Error::InsecureServer)
     }
 
     pub fn server(&self) -> &str {
@@ -219,12 +241,15 @@ impl Client {
             dest: PathBuf::from("."),
             mode: TransportMode::Auto,
             progress: None,
+            on_conflict: OnConflict::default(),
+            keep_failed: false,
         }
     }
 }
 
 pub struct ClientBuilder {
     server: Option<String>,
+    allow_insecure: bool,
 }
 
 impl ClientBuilder {
@@ -233,11 +258,18 @@ impl ClientBuilder {
         self
     }
 
+    /// See [`Client::allow_insecure`].
+    pub fn allow_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client::new(
             self.server
                 .unwrap_or_else(|| "https://bitmule.qdat.net".to_string()),
         )
+        .allow_insecure(self.allow_insecure)
     }
 }
 
@@ -367,7 +399,7 @@ impl SendBuilder {
         let display_name = manifest.file_name().unwrap_or_default();
         let total_bytes = manifest.transfer_size;
 
-        let server = Server::parse(&self.client.server);
+        let server = self.client.parse_server(&self.client.server)?;
         let options = Options::from_mode(self.mode);
         let progress = Mutex::new(self.progress);
         let on_event: v2::OnSendEvent = Arc::new(move |event| {
@@ -448,7 +480,7 @@ impl StreamSendBuilder {
     /// Open the session and start uploading as soon as a receiver joins.
     /// The returned handle's `total_bytes` is the hint, or 0.
     pub async fn start(self) -> Result<SendHandle> {
-        let server = Server::parse(&self.client.server);
+        let server = self.client.parse_server(&self.client.server)?;
         // the data is not known up front, so there is nothing for a peer
         // connection to ask for: it goes over the relay
         let options = Options { webrtc: false, relay: true };
@@ -557,9 +589,26 @@ pub struct RecvBuilder {
     dest: PathBuf,
     mode: TransportMode,
     progress: Option<Box<dyn FnMut(u64, u64, &str) + Send>>,
+    on_conflict: OnConflict,
+    keep_failed: bool,
 }
 
 impl RecvBuilder {
+    /// What to do when a file of that name is in `dest` already. Defaults to
+    /// [`OnConflict::Rename`]. [`OnConflict::Ask`] is for programs with a
+    /// terminal; here it fails the receive, like `Reject`.
+    pub fn on_conflict(mut self, policy: OnConflict) -> Self {
+        self.on_conflict = policy;
+        self
+    }
+
+    /// Keep the file when the data does not match its checksum. By default it
+    /// is deleted: it is not what was sent.
+    pub fn keep_failed(mut self, keep: bool) -> Self {
+        self.keep_failed = keep;
+        self
+    }
+
     /// Override the destination directory. Defaults to the current
     /// working directory.
     pub fn dest(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -594,7 +643,7 @@ impl RecvBuilder {
         // the receiver doesn't need to match `.server()` at
         // construction) — but fall back to the client's own if the
         // URL is fragment-only.
-        let server = Server::parse(&extract_server_from_url(&self.share_url).unwrap_or_else(|| (*self.client.server).clone()));
+        let server = self.client.parse_server(&extract_server_from_url(&self.share_url).unwrap_or_else(|| (*self.client.server).clone()))?;
         let options = Options::from_mode(self.mode);
         let dest = self.dest.clone();
         std::fs::create_dir_all(&dest)?;
@@ -604,10 +653,14 @@ impl RecvBuilder {
         let open = {
             let chosen = chosen.clone();
             let dest = dest.clone();
+            let policy = self.on_conflict;
             move |manifest: &bitmule_core::protocol::websocket::TransferManifest| {
                 let name = manifest.file_name().unwrap_or_else(|| "bitmule-download".to_string());
-                let path = free_name(&dest, &name);
-                let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+                let refuse_to_ask = |path: &Path| Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} exists already", path.display()),
+                ));
+                let (path, file) = output::open_new(&dest.join(name), policy, refuse_to_ask)?;
                 *chosen.lock().unwrap() = Some(path);
                 Ok(file)
             }
@@ -622,9 +675,18 @@ impl RecvBuilder {
                 }
             }
         };
-        let report = v2::run_recv_progress(&server, &link, open, progress, options)
-            .await
-            .map_err(Error::Transport)?;
+        let report = match v2::run_recv_progress(&server, &link, open, progress, options).await {
+            Ok(report) => report,
+            Err(e) => {
+                // the file is not what was sent
+                if e.is::<v2::VerifyFailed>() && !self.keep_failed {
+                    if let Some(path) = chosen.lock().unwrap().take() {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                return Err(Error::Transport(e));
+            }
+        };
         let path = chosen
             .lock()
             .unwrap()
@@ -636,7 +698,8 @@ impl RecvBuilder {
         if matches!(report.manifest.transfer_typ, TransferType::MultiFileZip { .. }) {
             let zip_path = path.clone();
             let into = dest.clone();
-            match tokio::task::spawn_blocking(move || unpack_zip(&zip_path, &into)).await {
+            let limit = unzip::unpack_limit(&report.manifest);
+            match tokio::task::spawn_blocking(move || unzip::unpack_zip(&zip_path, &into, limit)).await {
                 Ok(Ok(dir)) => {
                     // the zip served its purpose
                     let _ = tokio::fs::remove_file(&path).await;
@@ -656,43 +719,6 @@ impl RecvBuilder {
 
         Ok(RecvOutcome { files, dest })
     }
-}
-
-/// A file name in `dir` that is not taken yet: `name`, `name (1)`, …
-fn free_name(dir: &Path, name: &str) -> PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
-        _ => (name, String::new()),
-    };
-    (1..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).unwrap()
-}
-
-/// Unpack `zip_path` (stored, deflated or zstd entries) into a new directory
-/// in `into`, named after the zip. Returns that directory.
-fn unpack_zip(zip_path: &Path, into: &Path) -> anyhow::Result<PathBuf> {
-    let stem = zip_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".into());
-    let dir = free_name(into, &stem);
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
-    std::fs::create_dir_all(&dir)?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        // `enclosed_name` refuses paths that would leave `dir`
-        let Some(relative) = entry.enclosed_name() else { continue };
-        let target = dir.join(relative);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target)?;
-            continue;
-        }
-        if let Some(up) = target.parent() {
-            std::fs::create_dir_all(up)?;
-        }
-        std::io::copy(&mut entry, &mut std::fs::File::create(&target)?)?;
-    }
-    Ok(dir)
 }
 
 /// Extract the URL fragment from a share URL, or accept a bare

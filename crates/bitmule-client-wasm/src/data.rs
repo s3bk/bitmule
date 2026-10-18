@@ -75,13 +75,15 @@ impl Outgoing {
     pub fn manifest(&self) -> TransferManifest {
         let typ = match self.kind {
             Kind::Single => TransferType::SingleFile { compression: None },
-            Kind::Zip => TransferType::MultiFileZip { outer_compression: None },
+            Kind::Zip => TransferType::MultiFileZip { outer_compression: None, unpacked_size: None },
         };
         TransferManifest {
             transfer_typ: typ,
             block_size: fountain::BLOCK_PLAIN as u32,
             transfer_size: self.size,
             bulk_key: self.key.clone(),
+            // the blocks are coded one by one as they are uploaded: no hashes up front
+            block_hashes: Vec::new(),
             name: self.name.clone(),
         }
     }
@@ -146,12 +148,19 @@ pub struct Incoming {
 impl Incoming {
     pub fn new(manifest: &TransferManifest) -> Result<Self> {
         ensure!(manifest.block_size as usize == fountain::BLOCK_PLAIN, "sender uses an unsupported block size");
-        let decoder = fountain::Decoder::new(
+        let mut decoder = fountain::Decoder::new(
             manifest.bulk_key.clone(),
             manifest.transfer_size,
             Box::new(fountain::MemSpill::default()),
             fountain::symbol_pool(),
         );
+        if !manifest.block_hashes.is_empty() {
+            ensure!(
+                manifest.block_hashes.len() == fountain::num_blocks(manifest.transfer_size) as usize,
+                "the manifest lists {} block hashes for {} blocks", manifest.block_hashes.len(), fountain::num_blocks(manifest.transfer_size)
+            );
+            decoder = decoder.with_block_hashes(manifest.block_hashes.clone());
+        }
         Ok(Incoming { splitter: Default::default(), decoder, dropped_symbols: 0 })
     }
 

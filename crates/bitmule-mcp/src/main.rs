@@ -1,7 +1,8 @@
 //! `bitmule-mcp`: the MCP server on stdin/stdout, one JSON message per line.
 //!
 //! Environment: `BITMULE_SERVER` (relay, default https://bitmule.qdat.net) and
-//! `BITMULE_DOWNLOADS` (where received files go, default the working directory).
+//! `BITMULE_DOWNLOADS` (where received files go, default the working directory),
+//! `BITMULE_ALLOW_INSECURE=1` (accept relays without TLS, http://).
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 async fn main() -> anyhow::Result<()> {
     let relay = std::env::var("BITMULE_SERVER").unwrap_or_else(|_| "https://bitmule.qdat.net".into());
     let downloads = std::env::var_os("BITMULE_DOWNLOADS").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
-    let server = Server::new(relay, downloads);
+    let server = Server::new(relay, downloads).allow_insecure(std::env::var_os("BITMULE_ALLOW_INSECURE").is_some_and(|v| v == "1"));
 
     // answers go out whole and one at a time, however many calls are in flight
     let stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));

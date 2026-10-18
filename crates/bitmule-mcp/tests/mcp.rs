@@ -30,7 +30,7 @@ fn ok(result: &Value) -> Value {
 
 #[tokio::test]
 async fn initialize_and_list_tools() {
-    let server = Server::new("http://127.0.0.1:1", ".");
+    let server = Server::new("http://127.0.0.1:1", ".").allow_insecure(true);
     let answer = server.handle(request(7, "initialize", json!({ "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": { "name": "t", "version": "0" } }))).await.unwrap();
     assert_eq!(answer["id"], 7);
     assert_eq!(answer["result"]["protocolVersion"], "2025-03-26");
@@ -54,7 +54,7 @@ async fn initialize_and_list_tools() {
 
 #[tokio::test]
 async fn notifications_get_no_answer_and_unknown_methods_an_error() {
-    let server = Server::new("http://127.0.0.1:1", ".");
+    let server = Server::new("http://127.0.0.1:1", ".").allow_insecure(true);
     assert!(server.handle(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await.is_none());
     assert_eq!(server.handle(request(1, "ping", json!({}))).await.unwrap()["result"], json!({}));
     let answer = server.handle(request(2, "no/such/method", json!({}))).await.unwrap();
@@ -70,7 +70,7 @@ async fn send_then_receive_through_the_tools() {
     let data: Vec<u8> = (0..2_500_000u32).map(|i| i.wrapping_mul(2654435761) as u8).collect();
     std::fs::write(src.path().join("report.bin"), &data).unwrap();
 
-    let sender = Server::new(&relay, ".");
+    let sender = Server::new(&relay, ".").allow_insecure(true);
     let sent = ok(&call(&sender, "bitmule_send", json!({ "paths": [src.path().join("report.bin")], "mode": "relay" })).await);
     let url = sent["share_url"].as_str().unwrap().to_string();
     let id = sent["transfer_id"].as_str().unwrap().to_string();
@@ -79,7 +79,7 @@ async fn send_then_receive_through_the_tools() {
     assert!(url.starts_with(&relay), "{url}");
 
     // another agent, its own server and download directory
-    let receiver = Server::new(&relay, downloads.path());
+    let receiver = Server::new(&relay, downloads.path()).allow_insecure(true);
     let got = ok(&call(&receiver, "bitmule_receive", json!({ "url": url, "mode": "relay" })).await);
     let files = got["files"].as_array().unwrap();
     assert_eq!(files.len(), 1);
@@ -111,9 +111,9 @@ async fn a_folder_goes_as_a_bundle_to_a_chosen_directory() {
     std::fs::write(src.path().join("notes/a.txt"), b"a").unwrap();
     std::fs::write(src.path().join("notes/old/b.txt"), b"b").unwrap();
 
-    let sender = Server::new(&relay, ".");
+    let sender = Server::new(&relay, ".").allow_insecure(true);
     let sent = ok(&call(&sender, "bitmule_send", json!({ "paths": [src.path().join("notes")], "name": "memos", "mode": "relay" })).await);
-    let receiver = Server::new(&relay, ".");
+    let receiver = Server::new(&relay, ".").allow_insecure(true);
     let got = ok(&call(&receiver, "bitmule_receive", json!({ "url": sent["share_url"], "dest": dest.path(), "mode": "relay" })).await);
     let mut paths: Vec<String> = got["files"]
         .as_array()
@@ -129,7 +129,7 @@ async fn a_folder_goes_as_a_bundle_to_a_chosen_directory() {
 #[tokio::test]
 async fn failures_are_tool_errors_not_protocol_errors() {
     let relay = relay().await;
-    let server = Server::new(&relay, ".");
+    let server = Server::new(&relay, ".").allow_insecure(true);
     for (tool, arguments) in [
         ("bitmule_send", json!({})),
         ("bitmule_send", json!({ "paths": [] })),

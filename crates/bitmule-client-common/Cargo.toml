@@ -15,7 +15,7 @@ futures-lite = "2"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 crossbeam-queue = "0.3"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = { workspace = true }
 raptorq = { git = "https://github.com/s3bk/raptorq" }
 uuid = { workspace = true }
 

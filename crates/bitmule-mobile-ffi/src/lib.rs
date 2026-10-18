@@ -174,19 +174,6 @@ pub async fn recv_file(
     run_on_tokio(recv_file_inner(url, out_dir, on_progress)).await
 }
 
-/// A file name in `dir` that is not taken yet: `name`, `name (1)`, …
-fn free_name(dir: &Path, name: &str) -> PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
-        _ => (name, String::new()),
-    };
-    (1..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).unwrap()
-}
-
 async fn recv_file_inner(
     url: String,
     out_dir: String,
@@ -195,7 +182,8 @@ async fn recv_file_inner(
     let parsed = parse_share_url(url)?;
     let link = ShareLink::from_b64_url(&parsed.fragment)
         .map_err(|e| BitmuleError::InvalidFragment { reason: format!("{e:#}") })?;
-    let server = Server::parse(&parsed.server);
+    // a share link can name any server: not one without TLS
+    let server = Server::parse_checked(&parsed.server, false).map_err(|e| BitmuleError::InvalidUrl { reason: format!("{e:#}") })?;
     let out_dir_path = PathBuf::from(&out_dir);
     std::fs::create_dir_all(&out_dir_path).map_err(|e| BitmuleError::Io { reason: format!("create {out_dir}: {e}") })?;
 
@@ -206,8 +194,8 @@ async fn recv_file_inner(
         let chosen = chosen.clone();
         move |manifest: &bitmule_core::protocol::websocket::TransferManifest| {
             let name = manifest.file_name().unwrap_or_else(|| "bitmule-download".to_string());
-            let path = free_name(&out_dir_path, &name);
-            let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+            // a taken name is kept; the new file gets `name (1)`, …
+            let (path, file) = bitmule::output::open_new(&out_dir_path.join(name), bitmule::OnConflict::Rename, |_| unreachable!())?;
             *chosen.lock().unwrap() = Some(path);
             Ok(file)
         }
@@ -219,9 +207,19 @@ async fn recv_file_inner(
             on_progress.on_progress(received, total, name);
         }
     };
-    let report = v2::run_recv_progress(&server, &link, open, progress, Options::default())
-        .await
-        .map_err(BitmuleError::from)?;
+    let report = match v2::run_recv_progress(&server, &link, open, progress, Options::default()).await {
+        Ok(report) => report,
+        Err(e) => {
+            // the file is not what was sent
+            if e.is::<v2::VerifyFailed>() {
+                if let Some(path) = chosen.lock().unwrap().take() {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(BitmuleError::Verify { reason: format!("{e:#}") });
+            }
+            return Err(BitmuleError::from(e));
+        }
+    };
     let path = chosen.lock().unwrap().clone().ok_or_else(|| BitmuleError::Unknown { reason: "no file was written".into() })?;
 
     // Several files arrive as one zip: unpack it here and hand the caller the
@@ -229,7 +227,8 @@ async fn recv_file_inner(
     // the shell can still show / share the bytes.
     if matches!(report.manifest.transfer_typ, TransferType::MultiFileZip { .. }) {
         let zip_path = path.clone();
-        let unpacked = tokio::task::spawn_blocking(move || unpack_zip(&zip_path)).await;
+        let limit = bitmule::unzip::unpack_limit(&report.manifest);
+        let unpacked = tokio::task::spawn_blocking(move || unpack_zip(&zip_path, limit)).await;
         if let Ok(Ok((dir, entries))) = unpacked {
             let _ = std::fs::remove_file(&path);
             let stem = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".to_string());
@@ -247,30 +246,13 @@ async fn recv_file_inner(
     Ok(RecvOutcome { path: path.to_string_lossy().into_owned(), size, name, is_bundle: false })
 }
 
-/// Unpack `zip_path` (stored, deflated or zstd entries) into a new directory
-/// next to it. Returns the directory and the number of files.
-fn unpack_zip(zip_path: &Path) -> anyhow::Result<(PathBuf, usize)> {
+/// Unpack `zip_path` (stored, deflated or zstd entries, holding at most
+/// `limit` bytes) into a new directory next to it. Returns the directory and
+/// the number of files.
+fn unpack_zip(zip_path: &Path, limit: u64) -> anyhow::Result<(PathBuf, usize)> {
     let parent = zip_path.parent().ok_or_else(|| anyhow::anyhow!("zip has no directory"))?;
-    let stem = zip_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".into());
-    let dir = free_name(parent, &stem);
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
-    std::fs::create_dir_all(&dir)?;
-    let mut files = 0;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        // `enclosed_name` refuses paths that would leave `dir`
-        let Some(relative) = entry.enclosed_name() else { continue };
-        let target = dir.join(relative);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target)?;
-            continue;
-        }
-        if let Some(up) = target.parent() {
-            std::fs::create_dir_all(up)?;
-        }
-        std::io::copy(&mut entry, &mut std::fs::File::create(&target)?)?;
-        files += 1;
-    }
+    let dir = bitmule::unzip::unpack_zip(zip_path, parent, limit)?;
+    let files = walkdir::WalkDir::new(&dir).into_iter().flatten().filter(|e| e.file_type().is_file()).count();
     Ok((dir, files))
 }
 
@@ -325,7 +307,7 @@ async fn send_file_inner(
     let file_name = manifest.file_name().unwrap_or_default();
     let file_size = manifest.transfer_size;
 
-    let server = Server::parse(&server);
+    let server = Server::parse_checked(&server, false).map_err(|e| BitmuleError::InvalidUrl { reason: format!("{e:#}") })?;
     let minted: Arc<Mutex<Option<(String, String)>>> = Arc::default();
     let listener_state = minted.clone();
     let server_for_url = server.clone();

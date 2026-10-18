@@ -41,8 +41,12 @@ fn create_msg(id: ReceiverId, key: u8) -> ClientToServer {
         capabilities: PeerCaps::RELAY,
         pub_key: PublicKey([key; 32]),
         mac: SessionMac([0; 32]),
+        join_check: bitmule_core::crypto::join_check_of(&PROOF),
     }
 }
+
+/// The proof the test sessions are joined with.
+const PROOF: [u8; 32] = [5; 32];
 
 fn join_msg(id: ReceiverId, key: u8) -> ClientToServer {
     ClientToServer::JoinSession {
@@ -50,6 +54,7 @@ fn join_msg(id: ReceiverId, key: u8) -> ClientToServer {
         capabilities: PeerCaps::RELAY,
         pub_key: PublicKey([key; 32]),
         mac: SessionMac([0; 32]),
+        join_proof: PROOF,
     }
 }
 
@@ -104,6 +109,12 @@ async fn create_join_reconnect() {
     assert_eq!(sender_pub_key.0, [1; 32]);
     assert!(matches!(recv(&mut owner).await, Some(ServerToClient::PeerJoined { id, .. }) if id == r1));
 
+    // somebody who knows the session id but not the share key is not let in
+    let mut stranger = connect_join(&addr, &sid).await;
+    let ClientToServer::JoinSession { id, capabilities, pub_key, mac, .. } = join_msg(ReceiverId::random(), 4) else { panic!() };
+    send(&mut stranger, ClientToServer::JoinSession { id, capabilities, pub_key, mac, join_proof: [6; 32] }).await;
+    assert!(is_text(&recv(&mut stranger).await));
+
     // taking over the owner's id or an existing receiver's id is refused
     for id in [owner_id, r1] {
         let mut bad = connect_join(&addr, &sid).await;
@@ -142,6 +153,12 @@ async fn create_join_reconnect() {
     let mut ghost = connect_create(&addr, &SessionId::random(), Some(reconnect_token)).await;
     send(&mut ghost, create_msg(owner_id, 1)).await;
     assert!(is_text(&recv(&mut ghost).await));
+
+    // reconnect with a different join check is refused
+    let mut evil = connect_create(&addr, &sid, Some(reconnect_token)).await;
+    let ClientToServer::CreateSession { id, capabilities, pub_key, mac, .. } = create_msg(owner_id, 1) else { panic!() };
+    send(&mut evil, ClientToServer::CreateSession { id, capabilities, pub_key, mac, join_check: [0; 32] }).await;
+    assert!(is_text(&recv(&mut evil).await));
 
     // reconnect with a different identity key is refused
     let mut evil = connect_create(&addr, &sid, Some(reconnect_token)).await;

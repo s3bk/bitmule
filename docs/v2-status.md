@@ -1,4 +1,33 @@
-# v2 status (updated 2026-10-18 night, to reload a session)
+# v2 status (updated 2026-10-18, security audit fixes)
+
+## Security audit fixes (2026-10-18, committed)
+Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update all clients (including the wasm bundle).**
+- Handshake: join proof (`CreateSession.join_check`, `JoinSession.join_proof`; the server refuses joins without it before
+  sending the owner's key or a relay token); identity MAC binds role + session + id; envelope AAD binds direction
+  (reflection does not open); own-key replay refused (`bitmule-crypto`, `bitmule-core/inner.rs`, `v2/session.rs`, wasm `session.rs`).
+- Block hashes: truncated BLAKE3 per 2 MiB block in `TransferManifest.block_hashes`. The CLI sender records hashes on pass 0
+  and aborts the upload (`UploadFailed`) if a later pass differs; relay upload and receivers check against the manifest.
+  Capped at 1M blocks (then omitted). The web sender sends none.
+- Receive policy: `--on-conflict ask|overwrite|reject|rename` (`output.rs`; library default rename, CLI default ask),
+  zip unpack checked against `unpacked_size` (`unzip.rs`, fallback limit transfer*10+1 GiB), files failing the final check
+  are deleted unless `--keep-failed` (`v2::VerifyFailed`). Overwrite truncates before verification.
+- `--unsafe` is needed for non-https servers (`Server::parse_checked`, `Client::allow_insecure`; MCP via env
+  `BITMULE_ALLOW_INSECURE=1`).
+- Server sends CSP and other security headers (`security_headers`, test `tests/web_headers.rs`); `web/bitmule.html` is exempt.
+  `web/README.md` no longer suggests an inline script.
+- Dependencies unified (reqwest 0.12, url 2, tower 0.5, tower-http 0.6, thiserror 2, raptorq git fork). Remaining duplicates are
+  transitive (RustCrypto 0.10 generation, tungstenite 0.24 via axum 0.7, zstd 0.13 via zip, rand 0.8/0.9/0.10).
+- Docs: `docs/crypto.md` rewritten for v2 with the trust model (old text kept as `docs/crypto-v1.md`), over-claims removed from
+  `docs/user-features.md` and `README.md`.
+- Fixed the `v2_transfer` abort (it failed in about half the runs, also on the previous commit): `vendor/str0m`
+  `Rtc::do_poll_output` called itself once per queued SCTP packet, so a busy data channel overflowed the 2 MiB tokio worker stack
+  (lldb: hundreds of `do_poll_output` frames at `lib.rs:1734`). Now a loop (`repoll` flag). 0 failures in 14 runs. Not the buffer
+  pools: `bitmule-buf` and `fountain::Pool` already allocate with `Box::new_zeroed`. Worth sending upstream to str0m.
+- Not done / open: wasm bundle needs a rebuild (`wasm-pack`) and `web/test/browser_test.py` was not run; the web sender gives no
+  block hashes; no SAS / revocation of the link; `bitmule-server-signal-ws` does not compile (stale v1 crate, untouched);
+  axum 0.8 and rand 0.9 migrations would remove more duplicates.
+
+## Earlier status (2026-10-18 night)
 
 ## Where things are right now (short)
 - Everything below from this evening is UNCOMMITTED (about 30 modified files plus the new `bitmule-buf` crate, `udp.rs`,

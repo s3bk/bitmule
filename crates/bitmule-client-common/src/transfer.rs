@@ -60,9 +60,9 @@ impl TransferBuilder {
             self.files[0].name.as_ref().and_then(|n| n.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "bitmule-download".to_string())
         };
         let (transfer_typ, transfer_size, commitment, storage) = if use_zip {
-            let (zip_size, zip_commit, zip_file) = zip_and_commit(&self.files, &bulk_key).await?;
+            let (zip_size, zip_commit, unpacked_size, zip_file) = zip_and_commit(&self.files, &bulk_key).await?;
             (
-                TransferType::MultiFileZip { outer_compression: None },
+                TransferType::MultiFileZip { outer_compression: None, unpacked_size },
                 zip_size,
                 zip_commit,
                 zip_file
@@ -79,11 +79,24 @@ impl TransferBuilder {
             )
         };
 
+        // the hashes of what is actually staged for sending
+        #[cfg(not(target_arch = "wasm32"))]
+        let block_hashes = {
+            let path = storage.tmp_file.path().to_path_buf();
+            let key = bulk_key.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u64>>> {
+                crate::fountain::block_hashes(&std::fs::File::open(path)?, transfer_size, &key)
+            }).await.map_err(|e| Error::from(anyhow!("hashing the blocks: {e}")))??.unwrap_or_default()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let block_hashes = Vec::new();
+
         let manifest = TransferManifest {
             transfer_typ,
             block_size: crate::fountain::BLOCK_PLAIN as u32,
             transfer_size,
             bulk_key: bulk_key.clone(),
+            block_hashes,
             name: Some(name),
         };
         let transfer = Transfer {
@@ -252,7 +265,7 @@ struct PreparedFile {
 async fn zip_and_commit(
     files: &[FileEntry],
     bulk_key: &BulkKey,
-) -> Result<(u64, [u8; 32], PreparedFile), Error> {
+) -> Result<(u64, [u8; 32], Option<u64>, PreparedFile), Error> {
     #[cfg(target_arch = "wasm32")]
     {
         zip_and_commit_wasm_impl(files, bulk_key).await
@@ -267,7 +280,7 @@ async fn zip_and_commit(
 async fn zip_and_commit_native_impl(
     files: &[FileEntry],
     bulk_key: &BulkKey,
-) -> Result<(u64, [u8; 32], PreparedFile), Error> {
+) -> Result<(u64, [u8; 32], Option<u64>, PreparedFile), Error> {
     use async_zip::base::write::ZipFileWriter;
     use async_zip::{Compression, ZipEntryBuilder};
     use futures_lite::io::AsyncWriteExt as _;
@@ -281,6 +294,8 @@ async fn zip_and_commit_native_impl(
     let tmp = NamedTempFile::new()
         .map_err(|e| Error::from(anyhow!("zip_and_commit: NamedTempFile::new: {e}")))?;
     let write_path = tmp.path().to_path_buf();
+    // what the files add up to, for the receiver to hold the zip to
+    let mut unpacked = 0u64;
 
     // Write phase: open a tokio File, wrap in tokio_util's compat so
     // async_zip's futures_lite AsyncWrite bound is satisfied.
@@ -304,11 +319,13 @@ async fn zip_and_commit_native_impl(
                     loop {
                         let n = src.read(&mut buf).await?;
                         if n == 0 { break; }
+                        unpacked += n as u64;
                         stream.write_all(&buf[..n]).await?;
                     }
                     stream.close().await?;
                 }
                 Storage::Bytes(b) => {
+                    unpacked += b.len() as u64;
                     zip_writer.write_entry_whole(builder, b).await?;
                 }
             }
@@ -322,7 +339,7 @@ async fn zip_and_commit_native_impl(
     let mut reader = read_file.compat();
     let (zip_size, commit) = commit_reader(&mut reader, bulk_key).await?;
 
-    Ok((zip_size, commit, PreparedFile { tmp_file: tmp }))
+    Ok((zip_size, commit, Some(unpacked), PreparedFile { tmp_file: tmp }))
 }
 
 /// Wasm-side impl, kept close to the original scaffold. Uses OPFS via
@@ -332,7 +349,7 @@ async fn zip_and_commit_native_impl(
 async fn zip_and_commit_wasm_impl(
     files: &[FileEntry],
     bulk_key: &BulkKey,
-) -> Result<(u64, [u8; 32], PreparedFile), Error> {
+) -> Result<(u64, [u8; 32], Option<u64>, PreparedFile), Error> {
     use async_zip::base::write::ZipFileWriter;
     use async_zip::{Compression, ZipEntryBuilder};
     use futures_lite::io::AsyncWriteExt as _;
@@ -394,7 +411,7 @@ async fn zip_and_commit_wasm_impl(
         commit_reader(&mut reader, bulk_key).await?
     }; // reader dropped here so `tmp` is no longer borrowed
     let file = PreparedFile { handle: tmp };
-    Ok((zip_size, commit, file))
+    Ok((zip_size, commit, None, file))
 }
 
 // ─── Wasm impls ───────────────────────────────────────────────────────────

@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Result, bail, ensure};
 use bitmule_client_common::transfer::Transfer;
 use bitmule_client_native::{
-    crypto::{ShareKey, ShareLink},
+    crypto::{IdentityRole, ShareKey, ShareLink},
     websocket::connect_ws,
 };
 use bitmule_core::{
@@ -97,7 +97,7 @@ async fn send_job(
                 let Some(message) = message else { bail!("connection to the server closed") };
                 match message {
                     ServerToClient::PeerJoined { id, pub_key, mac, caps } => {
-                        if share_key.mac_ephemeral_pub(&pub_key) != mac {
+                        if !peer_checks_out(&share_key, IdentityRole::Joiner, &session_id, &id, &pub_key, &mac, &wire.identity.public_key()) {
                             warn!("Bad MAC from {id:?}");
                             continue;
                         }
@@ -140,6 +140,8 @@ async fn send_job(
                 peers.remove(&id);
                 match result {
                     Ok(()) => completed += 1,
+                    // what the receivers wait for is not coming: no use going on
+                    Err(e) if e.is::<send::UploadFailed>() => return Err(e),
                     Err(e) => warn!("receiver {id:?}: {e}"),
                 }
                 if peers.is_empty() && completed > 0 {
@@ -166,6 +168,21 @@ pub async fn receive(server: &Server, link: &ShareLink, open: recv::OpenOutput, 
     // Both stop once nothing can send any more, so wait for that.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ws_worker).await;
     report
+}
+
+/// Is `mac` the one a holder of the share key makes for this identity key, id
+/// and side, and is the key somebody else's (not a copy of our own, which
+/// would make us talk to ourselves)?
+fn peer_checks_out(
+    share_key: &ShareKey,
+    role: IdentityRole,
+    session_id: &SessionId,
+    id: &ReceiverId,
+    pub_key: &bitmule_core::crypto::PublicKey,
+    mac: &bitmule_core::crypto::SessionMac,
+    ours: &bitmule_core::crypto::PublicKey,
+) -> bool {
+    pub_key.0 != ours.0 && share_key.mac_identity(role, &session_id.0, &id.0, pub_key) == *mac
 }
 
 /// A session we created and own.
@@ -197,7 +214,8 @@ async fn create(server: &Server, share_key: &ShareKey, options: Options) -> Resu
         id: our_id,
         capabilities: options.caps(),
         pub_key: identity.public_key(),
-        mac: share_key.mac_ephemeral_pub(&identity.public_key()),
+        mac: share_key.mac_identity(IdentityRole::Owner, &session_id.0, &our_id.0, &identity.public_key()),
+        join_check: share_key.join_check(),
     }).await?;
 
     let (reconnect_token, relay_token) = match from_server.recv().await {
@@ -233,12 +251,16 @@ async fn join(server: &Server, share_key: &ShareKey, options: Options) -> Result
         id: our_id,
         capabilities: options.caps(),
         pub_key: identity.public_key(),
-        mac: share_key.mac_ephemeral_pub(&identity.public_key()),
+        mac: share_key.mac_identity(IdentityRole::Joiner, &session_id.0, &our_id.0, &identity.public_key()),
+        join_proof: share_key.join_proof(),
     }).await?;
 
     let (sender_id, sender_pub, sender_caps, relay_token) = match from_server.recv().await {
         Some(ServerToClient::SessionJoined { sender_id, sender_pub_key, sender_mac, sender_caps, relay_token }) => {
-            ensure!(share_key.mac_ephemeral_pub(&sender_pub_key) == sender_mac, "sender does not know the share key");
+            ensure!(
+                peer_checks_out(share_key, IdentityRole::Owner, &session_id, &sender_id, &sender_pub_key, &sender_mac, &identity.public_key()),
+                "sender does not know the share key"
+            );
             (sender_id, sender_pub_key, sender_caps, relay_token)
         }
         Some(ServerToClient::Text(reason)) => bail!("server refused join: {reason}"),
@@ -266,7 +288,7 @@ pub async fn request(server: &Server, options: Options, on_request: impl FnOnce(
                 let Some(message) = message else { bail!("connection to the server closed") };
                 match message {
                     ServerToClient::PeerJoined { id, pub_key, mac, .. } => {
-                        if share_key.mac_ephemeral_pub(&pub_key) != mac {
+                        if !peer_checks_out(&share_key, IdentityRole::Joiner, &session_id, &id, &pub_key, &mac, &wire.identity.public_key()) {
                             warn!("Bad MAC from {id:?}");
                             continue;
                         }

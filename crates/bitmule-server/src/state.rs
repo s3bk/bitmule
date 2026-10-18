@@ -8,9 +8,11 @@ use tokio::sync::Mutex;
 pub struct SessionState {
     multicast: MulticastSession,
     room: Mutex<Room>,
+    /// What a joiner's proof has to hash to (`bitmule_core::crypto::join_check_of`).
+    join_check: [u8; 32],
 }
 impl SessionState {
-    pub fn new(owner: ReceiverId, peer: PeerEntry) -> Self {
+    pub fn new(owner: ReceiverId, peer: PeerEntry, join_check: [u8; 32]) -> Self {
         let mut room = Room {
             owner,
             receivers: Default::default()
@@ -18,8 +20,14 @@ impl SessionState {
         room.receivers.insert(owner, peer);
         SessionState {
             multicast: MulticastSession::default(),
-            room: Mutex::new(room)
+            room: Mutex::new(room),
+            join_check,
         }
+    }
+
+    /// Does `proof` let somebody into this session?
+    pub fn allows_join(&self, proof: &[u8; 32]) -> bool {
+        bitmule_core::crypto::join_proof_matches(proof, &self.join_check)
     }
     pub fn multicast(&self) -> &MulticastSession {
         &self.multicast
@@ -51,7 +59,7 @@ impl SessionState {
     /// and the same id and identity key. The old connection's sink is
     /// dropped, which closes it. Returns the entry (tokens unchanged) and
     /// the receivers currently in the room.
-    pub async fn reconnect_owner(&self, id: ReceiverId, token: Token, new: PeerEntry) -> Result<(PeerEntry, Vec<(ReceiverId, PeerEntry)>), CreateError> {
+    pub async fn reconnect_owner(&self, id: ReceiverId, token: Token, new: PeerEntry, join_check: [u8; 32]) -> Result<(PeerEntry, Vec<(ReceiverId, PeerEntry)>), CreateError> {
         let mut room = self.room.lock().await;
         if id != room.owner {
             return Err(CreateError::BadToken);
@@ -60,7 +68,7 @@ impl SessionState {
         if old.reconnect_token != token {
             return Err(CreateError::BadToken);
         }
-        if old.pub_key.0 != new.pub_key.0 {
+        if old.pub_key.0 != new.pub_key.0 || join_check != self.join_check {
             return Err(CreateError::IdentityChanged);
         }
         let entry = PeerEntry { reconnect_token: old.reconnect_token, relay_token: old.relay_token, ..new };
@@ -163,11 +171,11 @@ impl AppState {
 
     /// Create the room for a session. If a live room exists, this is an
     /// owner reconnect and needs the reconnect token.
-    pub async fn create_session(&self, id: SessionId, owner: ReceiverId, peer: PeerEntry, token: Option<Token>) -> Result<Created, CreateError> {
+    pub async fn create_session(&self, id: SessionId, owner: ReceiverId, peer: PeerEntry, join_check: [u8; 32], token: Option<Token>) -> Result<Created, CreateError> {
         let mut map = self.rooms.lock().await;
         if let Some(session) = map.get(&id).and_then(Weak::upgrade) {
             let token = token.ok_or(CreateError::BadToken)?;
-            let (entry, peers) = session.reconnect_owner(owner, token, peer).await?;
+            let (entry, peers) = session.reconnect_owner(owner, token, peer, join_check).await?;
             return Ok(Created { session, entry, peers });
         }
         if token.is_some() {
@@ -175,7 +183,7 @@ impl AppState {
             return Err(CreateError::NoSession);
         }
         let entry = peer.clone();
-        let session = Arc::new(SessionState::new(owner, peer));
+        let session = Arc::new(SessionState::new(owner, peer, join_check));
         map.insert(id, Arc::downgrade(&session));
         Ok(Created { session, entry, peers: vec![] })
     }

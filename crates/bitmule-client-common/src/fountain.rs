@@ -20,10 +20,14 @@
 //! Frame (this is also what the relay carries):
 //! `len: u16 LE | type | block_nr: u32 LE | block hash: u64 LE | payload id (4) | symbol`.
 //!
-//! The block hash is xxh3 of the block as coded (the ciphertext). Every frame
-//! of a block carries it, as in `raptor-demo`: a receiver checks a decoded
-//! block against it before decrypting, so a corrupt symbol or a decoder
-//! problem is caught at the block, with the cause in the error.
+//! The block hash is the first 8 bytes of the BLAKE3 hash of the block as
+//! coded (the ciphertext). Every frame of a block carries it, as in
+//! `raptor-demo`: a receiver checks a decoded block against it before
+//! decrypting, so a corrupt symbol or a decoder problem is caught at the
+//! block, with the cause in the error. The sender also lists the hashes of
+//! all blocks in the manifest (`Decoder::with_block_hashes`): then a frame
+//! that announces anything else is refused, so whoever carries the frames
+//! cannot make the receiver misjudge a block by being first with a false hash.
 
 use std::{collections::{HashMap, HashSet}, ops::{Deref, DerefMut}, sync::Arc};
 
@@ -69,7 +73,35 @@ pub struct SymbolPacket {
 }
 
 fn block_hash(coded_block: &[u8]) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(coded_block)
+    let hash = blake3::hash(coded_block);
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+}
+
+/// The most block hashes a manifest carries: 8 bytes each, which with a
+/// 2 MiB block is 8 MiB of manifest for a 2 TiB transfer. A larger transfer
+/// goes without (the server's message limit is what bounds this).
+pub const MAX_MANIFEST_HASHES: usize = 1 << 20;
+
+/// The hashes of all blocks of the transfer in `file` (`size` bytes) as they
+/// are sent under `key`, for the manifest. `None` if the transfer has more
+/// blocks than a manifest carries.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn block_hashes(file: &std::fs::File, size: u64, key: &BulkKey) -> Result<Option<Vec<u64>>> {
+    let blocks = num_blocks(size) as usize;
+    if blocks > MAX_MANIFEST_HASHES {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; BLOCK_SIZE];
+    let mut hashes = Vec::with_capacity(blocks);
+    for block_nr in 0..blocks as u32 {
+        let (start, len) = block_span(size, block_nr);
+        read_exact_at(file, &mut buf[..len], start)?;
+        buf[len..BLOCK_PLAIN].fill(0);
+        let (data, tag) = buf.split_at_mut(BLOCK_PLAIN);
+        tag.copy_from_slice(&key.encrypt_chunk_in_place(block_nr as u64, data)?);
+        hashes.push(block_hash(&buf));
+    }
+    Ok(Some(hashes))
 }
 pub const FRAME_SIZE: usize = RELAY_HEADER + PAYLOAD_SIZE;
 
@@ -243,6 +275,11 @@ fn finish_frame(mut frame: FrameBuf, block_nr: u32, hash: u64, id: PayloadId) ->
 }
 
 impl EncodedBlock {
+    /// The hash of the block as coded, which every frame of it announces.
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+
     /// The relay frames of `pass`. Passes never repeat a symbol.
     pub fn frames(self, pass: u32) -> Vec<Bytes> {
         self.frames_with(pass, FIRST_PASS_REPAIR, LATER_PASS_REPAIR)
@@ -442,6 +479,8 @@ pub struct Decoder {
     loading: HashMap<u32, Vec<(u32, Symbol)>>,
     /// The block hash announced for every block in progress.
     announced: HashMap<u32, u64>,
+    /// The hashes the manifest lists, if it does.
+    expected: Option<Vec<u64>>,
     spill: Box<dyn SpillSink>,
     in_memory: usize,
     tick: u64,
@@ -462,6 +501,7 @@ impl Decoder {
             spilled: HashSet::new(),
             loading: HashMap::new(),
             announced: HashMap::new(),
+            expected: None,
             spill,
             in_memory: PARTIAL_BLOCKS_IN_MEMORY,
             tick: 0,
@@ -469,6 +509,15 @@ impl Decoder {
             blocks: Pool::new(16, 4),
             symbols,
         }
+    }
+
+    /// The hash of every block, from the manifest. Frames that announce a
+    /// different hash for their block are refused. Panics unless there is one
+    /// hash per block of the transfer: check `block_hashes.len()` first.
+    pub fn with_block_hashes(mut self, block_hashes: Vec<u64>) -> Self {
+        assert_eq!(block_hashes.len(), num_blocks(self.transfer_size) as usize, "one hash per block");
+        self.expected = Some(block_hashes);
+        self
     }
 
     pub fn with_blocks_in_memory(mut self, n: usize) -> Self {
@@ -513,6 +562,9 @@ impl Decoder {
             return Ok(None);
         }
         let hash = u64::from_le_bytes(header[4..12].try_into().unwrap());
+        if let Some(expected) = &self.expected {
+            ensure!(hash == expected[block_nr as usize], "block {block_nr}: symbol announces a hash that is not the manifest's");
+        }
         let id = PayloadId::deserialize(header[12..16].try_into().unwrap());
         ensure!(id.source_block_number() == SBN, "unexpected source block number");
         match self.announced.entry(block_nr) {
@@ -749,6 +801,44 @@ mod tests {
             }
         }
         assert_eq!(block.unwrap().data(), &plain[..]);
+    }
+
+    #[test]
+    fn manifest_hashes_match_the_frames_and_refuse_a_false_announcement() {
+        use std::io::Write;
+        let key = BulkKey::random();
+        let size = BLOCK_PLAIN + 1000; // two blocks, the last one short
+        let plain = data(size);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&plain).unwrap();
+
+        let hashes = block_hashes(&file, size as u64, &key).unwrap().unwrap();
+        assert_eq!(hashes.len(), 2);
+        let encoder = Encoder::new();
+        for block_nr in 0..2 {
+            let frames = encode(&encoder, &key, &plain, size, block_nr, 0);
+            let announced = u64::from_le_bytes(frames[0][HASH_OFFSET..ID_OFFSET].try_into().unwrap());
+            assert_eq!(announced, hashes[block_nr as usize]);
+        }
+
+        // a frame in front of the genuine ones announcing another hash is refused
+        let mut decoder = Decoder::new(key.clone(), size as u64, Box::new(MemSpill::default()), symbol_pool())
+            .with_block_hashes(hashes);
+        let mut forged = encode(&encoder, &key, &plain, size, 0, 0).remove(0);
+        let mut raw = forged.to_vec();
+        raw[HASH_OFFSET] ^= 1;
+        forged = Bytes::from(raw);
+        assert!(decoder.push(&forged[RELAY_HEADER..]).is_err());
+        // and the block still decodes from the genuine frames
+        let mut done = 0;
+        for block_nr in 0..2 {
+            for frame in encode(&encoder, &key, &plain, size, block_nr, 0) {
+                if decoder.push(&frame[RELAY_HEADER..]).unwrap().is_some() {
+                    done += 1;
+                }
+            }
+        }
+        assert_eq!(done, 2);
     }
 
     #[test]

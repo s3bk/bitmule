@@ -67,3 +67,39 @@ pub fn router(state: std::sync::Arc<AppState>) -> axum::Router {
         .route("/session/:sess/:receiver_id", post(relay2::post).get(relay2::get))
         .with_state(state)
 }
+
+/// The headers every response carries. The page that handles share links
+/// (`/#<key>`) holds the secret of the transfer, so it gets a policy that
+/// leaves a script no way to run from anywhere but this origin, nor to send
+/// data anywhere but back to it.
+///
+/// `/bitmule.html` (the marketing page: inline script, web fonts) is exempt
+/// from the content policy. It never sees a share link.
+pub fn security_headers(app: axum::Router) -> axum::Router {
+    use axum::{extract::Request, http::{HeaderValue, header}, middleware::{self, Next}, response::Response};
+
+    const CSP: &str = "default-src 'none'; \
+        script-src 'self' 'wasm-unsafe-eval'; \
+        style-src 'self'; \
+        img-src 'self' data: blob:; \
+        font-src 'self'; \
+        connect-src 'self'; \
+        worker-src 'self' blob:; \
+        object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+    async fn add(request: Request, next: Next) -> Response {
+        let app_page = request.uri().path() != "/bitmule.html";
+        let mut response = next.run(request).await;
+        let headers = response.headers_mut();
+        if app_page {
+            headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+        }
+        headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+        headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+        headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        headers.insert("cross-origin-opener-policy", HeaderValue::from_static("same-origin"));
+        headers.insert("permissions-policy", HeaderValue::from_static("camera=(), microphone=(), geolocation=()"));
+        response
+    }
+    app.layer(middleware::from_fn(add))
+}

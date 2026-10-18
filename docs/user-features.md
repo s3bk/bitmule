@@ -15,11 +15,11 @@ Pro services (hosted uploads and hosted inbox) work identically across **all** p
 
 ## Privacy & Security
 
-- **End-to-end encryption, two layers.** Files are compressed, padded, and encrypted before they ever leave your device.
-- **Verified integrity** A shared link is tied to one file. It can't be modified later by anbody.
+- **End-to-end encryption.** Files are encrypted on your device before they leave it. See [crypto.md](crypto.md) for the exact guarantees and limits (in the browser you trust the site that serves the code).
+- **Verified integrity.** A shared link is tied to one file; per-block hashes and a signature detect modification, and failing downloads are deleted by the CLI.
 - **The server never sees your key.** For direct P2P shares, the decryption key is derived from a piece of the link itself that never gets sent to any server — only someone with the full link can decrypt.
 - **Optional password protection.** Add a password for an extra layer on top of the link-based key. Since you're typically sharing with people you already know, if the wrong password is entered, just ask the sender to resend it — downloads start immediately rather than waiting on password verification, so you're not stuck waiting on a large transfer twice.
-- **Automatic metadata stripping.** Identifying metadata (e.g. photo EXIF data) is removed before encryption.
+- **No metadata stripping.** Files are sent as they are, including EXIF data. File sizes are visible to the server.
 - **What we deliberately don't do:** no server-side virus scanning, no link previews/thumbnails, no watermarking, no content-based audit trails. All of these would require us to see inside your files — and we can't, by design.
 
 ---

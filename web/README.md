@@ -17,10 +17,10 @@ Or point any static file host at this directory.
 ## Server address
 
 The SPA defaults to same-origin. Override at runtime by setting
-`window.BITMULE_SERVER` before `main.js` runs, e.g. inject a
-`<script>window.BITMULE_SERVER = "http://localhost:8443"</script>`
-above the `main.js` include when serving the SPA from a different
-host than `bitmule-server`.
+`window.BITMULE_SERVER` before `main.js` runs. Inline scripts are blocked
+by the CSP that `bitmule-server` sends, so do this from a separate
+same-origin script file (not inline) when serving the SPA from a
+different host than `bitmule-server`.
 
 If the SPA is opened via `file://`, it falls back to
 `http://localhost:8443`.

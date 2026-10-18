@@ -3,7 +3,7 @@ use crate::{Error};
 use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
-pub use bitmule_crypto::{PublicKey, SessionMac};
+pub use bitmule_crypto::{IdentityRole, PublicKey, SessionMac, join_check_of, join_proof_matches};
 
 /// Two-layer crypto model:
 /// - K_session: transport encryption. Derived from ECDH between peers via signaling.

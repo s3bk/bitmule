@@ -31,7 +31,7 @@ use futures_util::StreamExt;
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle};
 use tracing::warn;
 
-use super::{Options, Report, Server, Span, Transport, dcproto, peer::PeerLink};
+use super::{Options, Report, Server, Span, Transport, VerifyFailed, dcproto, peer::PeerLink};
 
 /// Symbols queued for the decoder thread.
 const DECODE_QUEUE: usize = 4096;
@@ -320,12 +320,14 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
     if let Some(mem) = &mem { // TEMP-INSTR: the data channel wrote into memory; check it there
         let mut hasher = CommitmentHasher::new();
         hasher.update(mem);
-        ensure!(hasher.finalize(&manifest.bulk_key) == ctx.link.signature, "data does not match the share link's signature");
+        if hasher.finalize(&manifest.bulk_key) != ctx.link.signature {
+            return Err(VerifyFailed("data does not match the share link's signature").into());
+        }
         tx.send(Peer2Peer::Complete).await?;
         return Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, relay_time, data_channel_time });
     }
     if commitment_of(out.clone(), size, manifest.bulk_key.clone()).await? != ctx.link.signature {
-        bail!("data does not match the share link's signature");
+        return Err(VerifyFailed("data does not match the share link's signature").into());
     }
     tx.send(Peer2Peer::Complete).await?;
     Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, relay_time, data_channel_time })
@@ -384,12 +386,13 @@ async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sende
     let (manifest, out) = started.expect("a complete download has its manifest");
     let (size, key) = (manifest.transfer_size, manifest.bulk_key.clone());
     let actual = commitment_of(out, size, key).await?;
-    ensure!(Some(actual) == checksum, "data does not match the sender's checksum");
+    if Some(actual) != checksum {
+        return Err(VerifyFailed("data does not match the sender's checksum").into());
+    }
     // a link that does carry a signature has to agree as well
-    ensure!(
-        ctx.link.signature == [0u8; 32] || actual == ctx.link.signature,
-        "data does not match the share link's signature"
-    );
+    if ctx.link.signature != [0u8; 32] && actual != ctx.link.signature {
+        return Err(VerifyFailed("data does not match the share link's signature").into());
+    }
     tx.send(Peer2Peer::Complete).await?;
     Ok(Report { manifest, transport: Transport::Relay, relay_bytes: size, data_channel_bytes: 0, relay_time, data_channel_time: Span::default() })
 }
@@ -480,6 +483,13 @@ async fn decode_download(
 
     let (tx, mut frames) = mpsc::channel::<Bytes>(DECODE_QUEUE);
     let (key, size) = (manifest.bulk_key.clone(), manifest.transfer_size);
+    let block_hashes = manifest.block_hashes.clone();
+    if !block_hashes.is_empty() {
+        ensure!(
+            block_hashes.len() == fountain::num_blocks(size) as usize,
+            "the manifest lists {} block hashes for {} blocks", block_hashes.len(), fountain::num_blocks(size)
+        );
+    }
     let runtime = tokio::runtime::Handle::current();
     let mut decode = tokio::task::spawn_blocking(move || -> Result<Vec<u32>> {
         use tokio::sync::mpsc::error::TryRecvError;
@@ -490,6 +500,9 @@ async fn decode_download(
         let (loaded_tx, mut loaded) = mpsc::unbounded_channel();
         let spill = FileSpill::spawn(out.clone(), size, symbols.clone(), loaded_tx)?;
         let mut decoder = fountain::Decoder::new(key, size, Box::new(spill), symbols);
+        if !block_hashes.is_empty() {
+            decoder = decoder.with_block_hashes(block_hashes);
+        }
         let writer = BlockWriter::spawn(out);
 
         let decoded = (|| -> Result<()> {

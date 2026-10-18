@@ -110,12 +110,33 @@ impl Core {
     /// First message to the server: `CreateSession` or `JoinSession`.
     pub fn hello(&self) -> Vec<u8> {
         let pub_key = self.identity.public_key();
-        let mac = self.share_key.mac_ephemeral_pub(&pub_key);
         let message = match self.role {
-            Role::Creator => ClientToServer::CreateSession { id: self.our_id, capabilities: self.caps, pub_key, mac },
-            Role::Joiner => ClientToServer::JoinSession { id: self.our_id, capabilities: self.caps, pub_key, mac },
+            Role::Creator => ClientToServer::CreateSession {
+                id: self.our_id,
+                capabilities: self.caps,
+                pub_key,
+                mac: self.identity_mac(bx::IdentityRole::Owner, &self.our_id, &pub_key),
+                join_check: self.share_key.join_check(),
+            },
+            Role::Joiner => ClientToServer::JoinSession {
+                id: self.our_id,
+                capabilities: self.caps,
+                pub_key,
+                mac: self.identity_mac(bx::IdentityRole::Joiner, &self.our_id, &pub_key),
+                join_proof: self.share_key.join_proof(),
+            },
         };
         postcard::to_stdvec(&message).unwrap()
+    }
+
+    fn identity_mac(&self, role: bx::IdentityRole, id: &ReceiverId, pub_key: &PublicKey) -> bitmule_core::crypto::SessionMac {
+        self.share_key.mac_identity(role, &self.session_id.0, &id.0, pub_key)
+    }
+
+    /// Is `pub_key` with `mac` the identity of `id` on side `role`, made by a
+    /// holder of the share key, and not a copy of ours?
+    fn peer_checks_out(&self, role: bx::IdentityRole, id: &ReceiverId, pub_key: &PublicKey, mac: &bitmule_core::crypto::SessionMac) -> bool {
+        pub_key.0 != self.identity.public.to_bytes() && self.identity_mac(role, id, pub_key) == *mac
     }
 
     /// Start the key exchange with a peer whose identity key is known (and
@@ -124,7 +145,8 @@ impl Core {
         let peer_pub = x25519_dalek::PublicKey::from(peer_pub.0);
         let outer = self.identity.outer_key_for(&peer_pub, &self.session_id);
         let ephemeral = EphemeralKeypair::generate();
-        let mut peer = Peer { outer, peer_pub, ephemeral: None, key: None, tx: EnvelopeCounter::default(), rx: EnvelopeCounter::default() };
+        let (tx, rx) = EnvelopeCounter::pair(self.identity.public.as_bytes(), peer_pub.as_bytes());
+        let mut peer = Peer { outer, peer_pub, ephemeral: None, key: None, tx, rx };
 
         let hello = ECDH { ephemeral_pub: ephemeral.public_key() };
         let msg = Envelope::<OuterKeyKind, ECDH>::seal(&hello, &peer.outer, &mut peer.tx, &self.session_id)
@@ -157,14 +179,14 @@ impl Core {
                 events.push(Event::Created { reconnect_token, relay_token })
             }
             ServerToClient::SessionJoined { relay_token, sender_id, sender_pub_key, sender_mac, sender_caps } => {
-                if self.share_key.mac_ephemeral_pub(&sender_pub_key) != sender_mac {
+                if !self.peer_checks_out(bx::IdentityRole::Owner, &sender_id, &sender_pub_key, &sender_mac) {
                     return Err("sender does not know the share key".into());
                 }
                 events.push(Event::Joined { sender: sender_id, sender_caps, relay_token });
                 events.push(Event::Out(self.add_peer(sender_id, sender_pub_key)?));
             }
             ServerToClient::PeerJoined { id, pub_key, mac, caps } => {
-                if self.share_key.mac_ephemeral_pub(&pub_key) != mac {
+                if !self.peer_checks_out(bx::IdentityRole::Joiner, &id, &pub_key, &mac) {
                     // somebody who does not know the key: ignore them
                     return Ok(events);
                 }
@@ -230,7 +252,7 @@ mod tests {
 
         // the server tells the sender about the receiver, and the receiver about the sender
         let hello = postcard::from_bytes::<ClientToServer>(&receiver.hello()).unwrap();
-        let ClientToServer::JoinSession { id, capabilities, pub_key, mac } = hello else { panic!() };
+        let ClientToServer::JoinSession { id, capabilities, pub_key, mac, .. } = hello else { panic!() };
         let sender_hello = postcard::from_bytes::<ClientToServer>(&sender.hello()).unwrap();
         let ClientToServer::CreateSession { pub_key: sender_pub, mac: sender_mac, .. } = sender_hello else { panic!() };
 
@@ -270,9 +292,25 @@ mod tests {
     fn a_peer_without_the_key_is_ignored() {
         let mut sender = Core::create(PeerCaps::RELAY);
         let stranger = Core::join(bx::ShareKey::random(), PeerCaps::RELAY);
-        let ClientToServer::JoinSession { id, capabilities, pub_key, mac } = postcard::from_bytes(&stranger.hello()).unwrap() else { panic!() };
+        let ClientToServer::JoinSession { id, capabilities, pub_key, mac, .. } = postcard::from_bytes(&stranger.hello()).unwrap() else { panic!() };
         let joined = postcard::to_stdvec(&ServerToClient::PeerJoined { id, pub_key, mac, caps: capabilities }).unwrap();
         assert!(sender.on_server(&joined).unwrap().is_empty());
+    }
+
+    /// The server hands every joiner the sender's identity and MAC; presenting
+    /// them as one's own must not get a joiner (or the sender) anywhere.
+    #[test]
+    fn a_copy_of_the_senders_identity_is_refused() {
+        let mut sender = Core::create(PeerCaps::RELAY);
+        let ClientToServer::CreateSession { pub_key, mac, .. } = postcard::from_bytes(&sender.hello()).unwrap() else { panic!() };
+        let joined = postcard::to_stdvec(&ServerToClient::PeerJoined { id: ReceiverId::random(), pub_key, mac, caps: PeerCaps::RELAY }).unwrap();
+        assert!(sender.on_server(&joined).unwrap().is_empty());
+        // and a MAC made for another id does not carry over
+        let mut receiver = Core::join(bx::ShareKey(sender.share_key.0), PeerCaps::RELAY);
+        let ClientToServer::JoinSession { pub_key, mac, .. } = postcard::from_bytes(&receiver.hello()).unwrap() else { panic!() };
+        let joined = postcard::to_stdvec(&ServerToClient::PeerJoined { id: ReceiverId::random(), pub_key, mac, caps: PeerCaps::RELAY }).unwrap();
+        assert!(sender.on_server(&joined).unwrap().is_empty());
+        let _ = &mut receiver;
     }
 
     #[test]

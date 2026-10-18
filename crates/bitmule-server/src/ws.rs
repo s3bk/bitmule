@@ -60,8 +60,15 @@ fn ping_requested(arg: &Option<String>) -> bool {
     arg.as_deref().is_some_and(|v| !matches!(v, "0" | "false"))
 }
 
-/// Largest accepted signaling message.
-const MAX_MESSAGE_SIZE: usize = 256 * 1024;
+/// Largest accepted signaling message. The biggest is a manifest, which
+/// lists 8 bytes per 2 MiB block of the transfer (`MAX_MANIFEST_HASHES`:
+/// 8 MiB for a 2 TiB transfer), sealed in an envelope.
+const MAX_MESSAGE_SIZE: usize = 9 * 1024 * 1024;
+
+/// What a first message (`CreateSession`, `JoinSession`) may weigh: a few
+/// hundred bytes. Anybody can connect, so nobody gets to send more than that
+/// before they are registered.
+const MAX_HELLO_SIZE: usize = 4 * 1024;
 
 #[derive(Serialize)]
 pub struct PowChallenge {
@@ -153,8 +160,11 @@ async fn handle_socket_inner(mut socket: WebSocket, state: Arc<AppState>, sessio
     loop {
         match socket.recv().await {
             None => return Ok(()),
+            Some(Ok(Message::Binary(data))) if data.len() > MAX_HELLO_SIZE => {
+                return reject(&mut socket, "hello message too large").await;
+            }
             Some(Ok(Message::Binary(data))) => match postcard::from_bytes(&data) {
-                Ok(ClientToServer::CreateSession { id, capabilities, pub_key, mac }) if is_owner => {
+                Ok(ClientToServer::CreateSession { id, capabilities, pub_key, mac, join_check }) if is_owner => {
                     let peer = PeerEntry {
                         sink: dispatch_tx,
                         caps: capabilities,
@@ -163,7 +173,7 @@ async fn handle_socket_inner(mut socket: WebSocket, state: Arc<AppState>, sessio
                         reconnect_token: Token::random(),
                         relay_token: Token::random(),
                     };
-                    match state.create_session(session_id, id, peer, owner.flatten()).await {
+                    match state.create_session(session_id, id, peer, join_check, owner.flatten()).await {
                         Ok(created) => {
                             hello.push(ServerToClient::SessionCreated {
                                 reconnect_token: created.entry.reconnect_token,
@@ -180,10 +190,16 @@ async fn handle_socket_inner(mut socket: WebSocket, state: Arc<AppState>, sessio
                         Err(e) => return reject(&mut socket, e).await,
                     }
                 }
-                Ok(ClientToServer::JoinSession { id, capabilities, pub_key, mac }) if !is_owner => {
+                Ok(ClientToServer::JoinSession { id, capabilities, pub_key, mac, join_proof }) if !is_owner => {
                     let Some(s) = state.get_session(session_id).await else {
                         return reject(&mut socket, "No such session").await;
                     };
+                    // Nobody who only knows the session id (it is in URLs and
+                    // logs) gets the owner's identity, a relay token, or a
+                    // place in the room.
+                    if !s.allows_join(&join_proof) {
+                        return reject(&mut socket, "join proof does not match").await;
+                    }
                     let relay_token = Token::random();
                     let peer = PeerEntry {
                         sink: dispatch_tx,

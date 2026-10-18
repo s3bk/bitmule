@@ -96,17 +96,38 @@ impl Drop for OuterKey {
     fn drop(&mut self) { self.0.zeroize(); }
 }
 
+/// Counts the envelopes of one direction of a channel. The direction is part
+/// of every envelope's associated data, so an envelope one side sealed does
+/// not open on that same side if it is sent back to it (a reflection).
 #[derive(Default)]
 pub struct EnvelopeCounter {
     inner: u32,
+    direction: u8,
 }
 impl EnvelopeCounter {
-    pub const SIZE: usize = 4;
-    fn as_bytes(&self) -> [u8; 4] {
-        self.inner.to_le_bytes()
+    /// session id (32) + direction (1) + counter (4)
+    pub const SIZE: usize = 5;
+
+    /// The counters for what we send and what we receive. The two sides tell
+    /// themselves apart by the order of their identity keys, so each side's
+    /// sending direction is the other's receiving direction.
+    pub fn pair(ours: &[u8; 32], theirs: &[u8; 32]) -> (EnvelopeCounter, EnvelopeCounter) {
+        let first = ours < theirs;
+        (
+            EnvelopeCounter { inner: 0, direction: first as u8 },
+            EnvelopeCounter { inner: 0, direction: !first as u8 },
+        )
     }
-    fn increment(&mut self) {
-        self.inner += 1;
+
+    fn aad_for(&self, n: u32) -> [u8; Self::SIZE] {
+        let mut aad = [0u8; Self::SIZE];
+        aad[0] = self.direction;
+        aad[1..].copy_from_slice(&n.to_le_bytes());
+        aad
+    }
+    fn increment(&mut self) -> Result<(), Error> {
+        self.inner = self.inner.checked_add(1).ok_or(Error::Counter)?;
+        Ok(())
     }
 }
 
@@ -134,9 +155,9 @@ impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
         // Increment BEFORE computing AAD so the AAD matches the counter
         // value we stamp into the envelope; open() reads envelope.counter
         // for its own AAD and needs the same value.
-        counter.increment();
+        counter.increment()?;
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.as_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.aad_for(counter.inner));
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
@@ -163,12 +184,12 @@ impl<T: Serialize + DeserializeOwned> Envelope<OuterKeyKind, T> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key.0));
         let nonce = Nonce::from_slice(&self.nonce);
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &self.counter.to_le_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.aad_for(self.counter));
 
         let plaintext = cipher.decrypt(nonce, Payload { msg: &self.data, aad: &aad })
             .map_err(Error::Crypto)?;
 
-        counter.increment();
+        counter.increment()?;
 
         if counter.inner != self.counter {
             return Err(Error::Counter);
@@ -320,9 +341,9 @@ impl<T: Serialize + DeserializeOwned> Envelope<InnerKeyKind, T> {
         // Increment BEFORE computing AAD so the AAD matches the counter
         // value we stamp into the envelope; open() reads envelope.counter
         // for its own AAD and needs the same value.
-        counter.increment();
+        counter.increment()?;
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.as_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.aad_for(counter.inner));
 
         let ct = cipher.encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
             .map_err(Error::Crypto)?;
@@ -348,12 +369,12 @@ impl<T: Serialize + DeserializeOwned> Envelope<InnerKeyKind, T> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key.0));
         let nonce = Nonce::from_slice(&self.nonce);
 
-        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &self.counter.to_le_bytes());
+        let aad: [u8; SessionId::SIZE + EnvelopeCounter::SIZE] = concat2(session_id.as_bytes(), &counter.aad_for(self.counter));
 
         let plaintext = cipher.decrypt(nonce, Payload { msg: &self.data, aad: &aad })
             .map_err(Error::Crypto)?;
 
-        counter.increment();
+        counter.increment()?;
 
         if counter.inner != self.counter {
             return Err(Error::Counter);
@@ -491,6 +512,7 @@ impl PeerState {
             _ => return Err(StateError::InvalidTransition),
         };
         let peer_ek = PublicKey::from(frame.ephemeral_pub);
+        let (send_counter, recv_counter) = EnvelopeCounter::pair(s.my_ik.public.as_bytes(), s.peer_ik.as_bytes());
         let session_key = derive_session_key(
             &s.my_ik,
             &s.my_ek,
@@ -502,8 +524,8 @@ impl PeerState {
             my_ik: s.my_ik,
             peer_ik: s.peer_ik,
             session_key,
-            send_counter: EnvelopeCounter::default(),
-            recv_counter: EnvelopeCounter::default(),
+            send_counter,
+            recv_counter,
         }))
     }
 }
@@ -588,6 +610,27 @@ mod tests {
             .open(&b_est.session_key, &session_id, &mut b_est.recv_counter)
             .unwrap();
         assert_eq!(recovered, 12345);
+    }
+
+    /// An envelope a peer sealed must not open on that peer if the server
+    /// sends it back (the server can route anything anywhere).
+    #[test]
+    fn a_reflected_envelope_does_not_open() {
+        let session_id = SessionId([3u8; 32]);
+        let ik_a = IdentityKeypair::generate();
+        let ik_b = IdentityKeypair::generate();
+        let (ik_a_pub, ik_b_pub) = (*ik_a.public.as_bytes(), *ik_b.public.as_bytes());
+        let (a, frame_a) = PeerState::new(ik_a).add_peer(ik_b_pub).unwrap();
+        let (b, frame_b) = PeerState::new(ik_b).add_peer(ik_a_pub).unwrap();
+        let (PeerState::Established(mut a), PeerState::Established(mut b)) =
+            (a.recv_x3dh(frame_b, &session_id).unwrap(), b.recv_x3dh(frame_a, &session_id).unwrap())
+            else { panic!() };
+
+        let env = Envelope::<InnerKeyKind, u64>::seal(&7, &a.session_key, &mut a.send_counter, &session_id).unwrap();
+        // reflected to its author
+        assert!(env.open(&a.session_key, &session_id, &mut a.recv_counter).is_err());
+        // delivered to the peer as it should be
+        assert_eq!(env.open(&b.session_key, &session_id, &mut b.recv_counter).unwrap(), 7);
     }
 
     /// Attempting `recv_x3dh` before `add_peer` should reject with

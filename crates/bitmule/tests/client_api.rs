@@ -16,7 +16,7 @@ async fn client() -> Client {
     let addr = listener.local_addr().unwrap();
     let app = router(Arc::new(AppState::new()));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    Client::new(format!("http://{addr}"))
+    Client::new(format!("http://{addr}")).allow_insecure(true)
 }
 
 #[tokio::test]
@@ -192,7 +192,7 @@ async fn bad_input_is_reported_not_panicked() {
 #[tokio::test]
 async fn an_unreachable_server_fails_the_start() {
     // nothing listens on this port
-    let client = Client::new("http://127.0.0.1:9");
+    let client = Client::new("http://127.0.0.1:9").allow_insecure(true);
     let src = tempfile::tempdir().unwrap();
     std::fs::write(src.path().join("x"), b"x").unwrap();
     let result = client.send(src.path().join("x")).mode(TransportMode::Relay).start().await;
@@ -252,4 +252,85 @@ async fn a_restartable_stream_is_opened_again_for_repairs() {
     assert_eq!(outcome.files().next().unwrap().read_all().await.unwrap(), *data);
     handle.wait().await.unwrap();
     assert!(*progress.lock().unwrap() > 0);
+}
+
+// ---- what happens to the file --------------------------------------------
+
+/// `url` with its signature (the second half of the fragment) changed, so
+/// the data cannot match it.
+fn with_wrong_signature(url: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let (base, fragment) = url.split_once('#').unwrap();
+    let mut raw = URL_SAFE_NO_PAD.decode(fragment).unwrap();
+    raw[63] ^= 1;
+    format!("{base}#{}", URL_SAFE_NO_PAD.encode(raw))
+}
+
+async fn sender_of(client: &Client, name: &str, data: &[u8]) -> (bitmule::SendHandle, tempfile::TempDir) {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join(name), data).unwrap();
+    let handle = client.send(src.path().join(name)).mode(TransportMode::Relay).start().await.unwrap();
+    (handle, src)
+}
+
+#[tokio::test]
+async fn a_taken_name_is_renamed_unless_told_otherwise() {
+    let client = client().await;
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("a.txt"), b"mine").unwrap();
+
+    let (handle, _src) = sender_of(&client, "a.txt", b"theirs").await;
+    let outcome = client.recv(handle.share_url()).dest(dest.path()).mode(TransportMode::Relay).start().await.unwrap();
+    assert_eq!(outcome.files().next().unwrap().name(), "a (1).txt");
+    assert_eq!(std::fs::read(dest.path().join("a.txt")).unwrap(), b"mine");
+    assert_eq!(std::fs::read(dest.path().join("a (1).txt")).unwrap(), b"theirs");
+    handle.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn overwrite_replaces_and_reject_refuses() {
+    let client = client().await;
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("a.txt"), b"mine").unwrap();
+
+    let (handle, _src) = sender_of(&client, "a.txt", b"theirs").await;
+    let refused = client.recv(handle.share_url()).dest(dest.path()).on_conflict(bitmule::OnConflict::Reject)
+        .mode(TransportMode::Relay).start().await;
+    assert!(refused.is_err());
+    assert_eq!(std::fs::read(dest.path().join("a.txt")).unwrap(), b"mine");
+    drop(handle);
+
+    let (handle, _src) = sender_of(&client, "a.txt", b"theirs").await;
+    client.recv(handle.share_url()).dest(dest.path()).on_conflict(bitmule::OnConflict::Overwrite)
+        .mode(TransportMode::Relay).start().await.unwrap();
+    assert_eq!(std::fs::read(dest.path().join("a.txt")).unwrap(), b"theirs");
+    handle.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_file_failing_the_check_is_deleted_unless_kept() {
+    let client = client().await;
+    let data = payload(100_000);
+
+    for keep in [false, true] {
+        let dest = tempfile::tempdir().unwrap();
+        let (handle, _src) = sender_of(&client, "a.bin", &data).await;
+        let url = with_wrong_signature(handle.share_url());
+        let result = client.recv(url).dest(dest.path()).keep_failed(keep).mode(TransportMode::Relay).start().await;
+        assert!(result.is_err());
+        assert_eq!(dest.path().join("a.bin").exists(), keep, "keep_failed = {keep}");
+    }
+}
+
+#[tokio::test]
+async fn a_server_without_tls_needs_permission() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("x"), b"x").unwrap();
+    // nothing listens here: the refusal comes before any connection is tried
+    let client = Client::new("http://127.0.0.1:9");
+    let sent = client.send(src.path().join("x")).start().await;
+    assert!(matches!(sent, Err(Error::InsecureServer(_))));
+    // and a share URL cannot talk the client into one either
+    let received = Client::new("https://bitmule.example").recv(format!("http://127.0.0.1:9/#{}", "A".repeat(86))).start().await;
+    assert!(matches!(received, Err(Error::InsecureServer(_))), "{:?}", received.map(|_| ()));
 }

@@ -46,7 +46,7 @@ web/                           # SolidJS browser SPA (calls into bitmule-client-
 - **Peer transport**: WebRTC DataChannel (browser) or equivalent (CLI-side lib TBD)
 - **Fallback transport**: encrypted chunks buffered on the server via `ChunkStore` trait, default impl in `bitmule-server-store-fs`
 - **Chunking**: adaptive size based on total transfer size and detected transport (LAN vs WAN)
-- **Crypto**: two layers. K_session (X25519 → HKDF → XChaCha20-Poly1305) covers all wire traffic. Optional K_content (Argon2id from password) additionally wraps the payload so a compromised relay holding buffered ciphertext still can't decrypt.
+- **Crypto**: see [docs/crypto.md](docs/crypto.md). The link fragment is the only secret; peers authenticate with it, derive a session key via X25519, and the relay only sees AES-GCM ciphertext.
 - **Resume**: RoaringBitmap of received chunks, persisted client-side (IndexedDB + OPFS in browser, disk in CLI) and server-side (`ChunkStore::have`). Reconnection replays the delta.
 
 ## Status

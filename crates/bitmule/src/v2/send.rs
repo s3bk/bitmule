@@ -250,15 +250,21 @@ async fn relay_upload(ctx: &Context) -> Result<()> {
 
     let mut encoding = FuturesOrdered::new();
     let mut reading = true;
+    // what the manifest promised each block would be: the staged copy must not change
+    let promised = Arc::new(ctx.manifest.block_hashes.clone());
     loop {
         // keep the encoders busy, then send what is ready
         while reading && encoding.len() < parallel {
             match blocks.recv().await {
                 Some(block) => {
                     let block = block?;
-                    let (encoder, key) = (encoder.clone(), ctx.manifest.bulk_key.clone());
+                    let (encoder, key, promised) = (encoder.clone(), ctx.manifest.bulk_key.clone(), promised.clone());
                     encoding.push_back(tokio::task::spawn_blocking(move || -> Result<Vec<Bytes>> {
-                        Ok(encoder.encode_block(&key, block.block_nr, block.buf, block.len)?.frames(block.pass))
+                        let encoded = encoder.encode_block(&key, block.block_nr, block.buf, block.len)?;
+                        if let Some(&promised) = promised.get(block.block_nr as usize) {
+                            ensure!(encoded.hash() == promised, "block {} is not what the manifest promised: the data changed", block.block_nr);
+                        }
+                        Ok(encoded.frames(block.pass))
                     }));
                 }
                 None => reading = false,
@@ -273,6 +279,23 @@ async fn relay_upload(ctx: &Context) -> Result<()> {
             }
             stats.sent(len);
         }
+    }
+}
+
+/// Pass 0 notes the hash of block `nr`; later passes must find the same.
+fn record_or_check_hash(hashes: &mut Vec<u64>, pass: u32, nr: u32, hash: u64) -> Result<()> {
+    if pass == 0 {
+        // the blocks of a pass are coded in parallel, so they can finish out of order
+        if hashes.len() <= nr as usize {
+            hashes.resize(nr as usize + 1, 0);
+        }
+        hashes[nr as usize] = hash;
+        return Ok(());
+    }
+    match hashes.get(nr as usize) {
+        Some(&first) if first == hash => Ok(()),
+        Some(_) => bail!("block {nr} changed between pass 0 and pass {pass}: the source did not give the same bytes twice"),
+        None => bail!("block {nr} did not exist on the first pass"),
     }
 }
 
@@ -351,6 +374,8 @@ pub struct StreamContext {
     /// Backs a one-shot source (kept while the transfer runs).
     spool: Option<tempfile::NamedTempFile>,
     finished: watch::Sender<Option<Arc<Finished>>>,
+    /// Set when the upload failed (say, the source changed between passes).
+    failed: watch::Sender<Option<String>>,
     /// The upload to the relay, one for all receivers.
     producer: RelayTask,
 }
@@ -374,6 +399,7 @@ impl StreamContext {
             server, our_id, session_id, relay_token, options, events, info, source, spool,
             key: BulkKey::random(),
             finished: watch::channel(None).0,
+            failed: watch::channel(None).0,
             producer: RelayTask::default(),
         })
     }
@@ -412,6 +438,17 @@ async fn read_full(reader: &mut Reader, buf: &mut [u8]) -> std::io::Result<usize
     Ok(n)
 }
 
+/// The upload of a streaming transfer failed for good; the whole send ends.
+#[derive(Debug)]
+pub struct UploadFailed(pub String);
+
+impl std::fmt::Display for UploadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the upload failed: {}", self.0)
+    }
+}
+impl std::error::Error for UploadFailed {}
+
 /// Serve one receiver of a streaming transfer: tell it to take the data from
 /// the relay at once, and hand it the manifest and checksum when they exist.
 pub async fn serve_stream_peer(ctx: Arc<StreamContext>, id: ReceiverId, peer_caps: PeerCaps, app: PeerLink) -> Result<()> {
@@ -427,11 +464,13 @@ pub async fn serve_stream_peer(ctx: Arc<StreamContext>, id: ReceiverId, peer_cap
     let upload = ctx.clone();
     ctx.producer.start_once(async move {
         if let Err(e) = stream_upload(&upload).await {
-            warn!("streaming upload: {e}");
+            warn!("streaming upload: {e:#}");
+            upload.failed.send_replace(Some(format!("{e:#}")));
         }
     });
 
     let mut finished = ctx.finished.subscribe();
+    let mut failed = ctx.failed.subscribe();
     let mut told = false;
     loop {
         if !told {
@@ -445,6 +484,10 @@ pub async fn serve_stream_peer(ctx: Arc<StreamContext>, id: ReceiverId, peer_cap
         tokio::select! {
             changed = finished.changed(), if !told => {
                 ensure!(changed.is_ok(), "the transfer ended");
+            }
+            _ = failed.changed() => {
+                let why = failed.borrow().clone().unwrap_or_default();
+                return Err(UploadFailed(why).into());
             }
             message = rx.recv() => match message {
                 None => bail!("receiver went away"),
@@ -482,6 +525,12 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
 
     let mut hasher = Some(CommitmentHasher::new());
     let mut size = 0u64;
+    // The hash of every block as coded, noted on the first pass and held to on
+    // the others. A repair symbol of a pass is made from the block read again
+    // and encrypted under the same key and nonce as before: if the source gave
+    // other bytes this time, the two encryptions would give away the XOR of
+    // the two plaintexts (and the authentication key). So any change is fatal.
+    let hashes: Arc<Mutex<Vec<u64>>> = Arc::default();
     for pass in 0u32.. {
         let mut reader = ctx.open(pass).await?;
         let mut encoding = FuturesOrdered::new();
@@ -504,11 +553,14 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
                 let (nr, at) = (block_nr, offset);
                 // the first pass of a one-shot source is what the later passes read back
                 let keep = if pass == 0 { spool.clone() } else { None };
+                let hashes = hashes.clone();
                 encoding.push_back(tokio::task::spawn_blocking(move || -> Result<Vec<Bytes>> {
                     if let Some(file) = keep {
                         fountain::write_all_at(&file, &buf[..len], at)?;
                     }
-                    Ok(encoder.encode_block(&key, nr, buf, len)?.frames(pass))
+                    let encoded = encoder.encode_block(&key, nr, buf, len)?;
+                    record_or_check_hash(&mut hashes.lock().unwrap(), pass, nr, encoded.hash())?;
+                    Ok(encoded.frames(pass))
                 }));
                 block_nr += 1;
                 offset += len as u64;
@@ -526,13 +578,17 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
         if pass == 0 {
             size = offset;
             let checksum = hasher.take().expect("hashed on the first pass").finalize(&ctx.key);
+            let block_hashes = std::mem::take(&mut *hashes.lock().unwrap());
+            // the same list is what later passes are held to
             let manifest = TransferManifest {
                 transfer_typ: ctx.info.typ.clone(),
                 block_size: fountain::BLOCK_PLAIN as u32,
                 transfer_size: size,
                 bulk_key: ctx.key.clone(),
+                block_hashes: if block_hashes.len() <= fountain::MAX_MANIFEST_HASHES { block_hashes.clone() } else { Vec::new() },
                 name: ctx.info.name.clone(),
             };
+            *hashes.lock().unwrap() = block_hashes;
             ctx.finished.send_replace(Some(Arc::new(Finished { manifest, checksum })));
             if size == 0 {
                 return Ok(()); // no blocks, nothing to repair
@@ -542,4 +598,30 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_or_check_hash;
+
+    #[test]
+    fn later_passes_must_find_the_blocks_of_the_first() {
+        let mut hashes = Vec::new();
+        // blocks of the first pass finish in any order
+        for (nr, hash) in [(1u32, 11u64), (0, 10), (2, 12)] {
+            record_or_check_hash(&mut hashes, 0, nr, hash).unwrap();
+        }
+        assert_eq!(hashes, [10, 11, 12]);
+
+        for pass in 1..4 {
+            for (nr, hash) in [(0u32, 10u64), (1, 11), (2, 12)] {
+                record_or_check_hash(&mut hashes, pass, nr, hash).unwrap();
+            }
+        }
+        // a source that gave other bytes this time
+        let err = record_or_check_hash(&mut hashes, 4, 1, 99).unwrap_err().to_string();
+        assert!(err.contains("block 1 changed"), "{err}");
+        // or more of them
+        assert!(record_or_check_hash(&mut hashes, 4, 3, 13).is_err());
+    }
 }

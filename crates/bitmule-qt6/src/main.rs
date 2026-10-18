@@ -437,13 +437,11 @@ impl UploaderApi {
                     on_progress_ui((name, prog));
                 }
             };
-            let result = bitmule::v2::run_recv_progress(
-                &bitmule::v2::Server::parse(&server),
-                &link,
-                open,
-                progress,
-                bitmule::v2::Options::default(),
-            ).await;
+            // a share link can name any server: not one without TLS
+            let result = match bitmule::v2::Server::parse_checked(&server, false) {
+                Ok(server) => bitmule::v2::run_recv_progress(&server, &link, open, progress, bitmule::v2::Options::default()).await,
+                Err(e) => Err(e),
+            };
             match result {
                 Ok(report) => {
                     // run_recv_progress returned Ok: the data was checked
@@ -455,7 +453,8 @@ impl UploaderApi {
                     let unpacked = if is_zip {
                         let zip_path = staged_path.clone();
                         let into = out_dir.clone();
-                        Some(tokio::task::spawn_blocking(move || unpack_zip(&zip_path, &into)).await)
+                        let limit = bitmule::unzip::unpack_limit(&report.manifest);
+                        Some(tokio::task::spawn_blocking(move || unpack_zip(&zip_path, &into, limit)).await)
                     } else { None };
                     match unpacked {
                         Some(Ok(Ok((final_dir, entries)))) => {
@@ -627,29 +626,17 @@ fn parse_fragment(fragment: &str) -> Option<bitmule_client_native::crypto::Share
     bitmule_client_native::crypto::ShareLink::from_b64_url(fragment).ok()
 }
 
-/// Unpack `zip_path` (stored, deflated or zstd entries) into a new directory
-/// in `into`, named after the zip. Returns the directory and the number of files.
-fn unpack_zip(zip_path: &Path, into: &Path) -> anyhow::Result<(PathBuf, usize)> {
-    let stem = zip_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".into());
-    let dir = unique_dest_path(into, &stem);
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
-    std::fs::create_dir_all(&dir)?;
-    let mut files = 0;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        // `enclosed_name` refuses paths that would leave `dir`
-        let Some(relative) = entry.enclosed_name() else { continue };
-        let target = dir.join(relative);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target)?;
-            continue;
-        }
-        if let Some(up) = target.parent() {
-            std::fs::create_dir_all(up)?;
-        }
-        std::io::copy(&mut entry, &mut std::fs::File::create(&target)?)?;
-        files += 1;
+/// Unpack `zip_path` (stored, deflated or zstd entries, holding at most
+/// `limit` bytes) into a new directory in `into`. Returns the directory and
+/// the number of files.
+fn unpack_zip(zip_path: &Path, into: &Path, limit: u64) -> anyhow::Result<(PathBuf, usize)> {
+    fn count_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir).into_iter().flatten().flatten()
+            .map(|e| if e.path().is_dir() { count_files(&e.path()) } else { 1 })
+            .sum()
     }
+    let dir = bitmule::unzip::unpack_zip(zip_path, into, limit)?;
+    let files = count_files(&dir);
     Ok((dir, files))
 }
 

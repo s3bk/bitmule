@@ -270,7 +270,7 @@ mod tests {
             mac: SessionMac([0; 32]),
             reconnect_token: Token::random(),
             relay_token: Token::random(),
-        }))
+        }, [0; 32]))
     }
 
     #[tokio::test]

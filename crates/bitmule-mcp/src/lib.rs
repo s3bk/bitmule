@@ -33,6 +33,9 @@ struct Inner {
     server: String,
     /// Where `bitmule_receive` puts files unless a call names a directory.
     downloads: PathBuf,
+    /// Servers without TLS are refused unless this is set (by whoever runs
+    /// the MCP server, not by the agent that calls it).
+    allow_insecure: bool,
     sends: Mutex<HashMap<String, SendState>>,
 }
 
@@ -47,7 +50,14 @@ struct SendState {
 
 impl Server {
     pub fn new(server: impl Into<String>, downloads: impl Into<PathBuf>) -> Self {
-        Server { inner: Arc::new(Inner { server: server.into(), downloads: downloads.into(), sends: Mutex::default() }) }
+        Server { inner: Arc::new(Inner { server: server.into(), downloads: downloads.into(), allow_insecure: false, sends: Mutex::default() }) }
+    }
+
+    /// Allow relays without TLS (`http://`). Off by default; the agent's
+    /// `server` argument cannot turn it on.
+    pub fn allow_insecure(self, allow: bool) -> Self {
+        let inner = &*self.inner;
+        Server { inner: Arc::new(Inner { server: inner.server.clone(), downloads: inner.downloads.clone(), allow_insecure: allow, sends: Mutex::default() }) }
     }
 
     /// Answer one JSON-RPC message. Notifications (no `id`) get no answer.
@@ -100,7 +110,7 @@ impl Server {
     }
 
     fn client(&self, args: &Value) -> Client {
-        Client::new(args.get("server").and_then(Value::as_str).unwrap_or(&self.inner.server))
+        Client::new(args.get("server").and_then(Value::as_str).unwrap_or(&self.inner.server)).allow_insecure(self.inner.allow_insecure)
     }
 
     async fn send(&self, args: &Value) -> Result<Value, String> {

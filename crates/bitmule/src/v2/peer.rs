@@ -61,9 +61,13 @@ async fn run(
     incoming: mpsc::Sender<Peer2Peer>,
 ) -> Result<()> {
     let peer_pub = x25519_dalek::PublicKey::from(peer_pub.0);
+    // the server could hand us our own identity key as the peer's
+    if peer_pub.as_bytes() == wire.identity.public.as_bytes() {
+        bail!("the peer's identity key is ours");
+    }
     let outer = wire.identity.outer_key_for(&peer_pub, &wire.session_id);
     let ephemeral = EphemeralKeypair::generate();
-    let (mut tx_counter, mut rx_counter) = (EnvelopeCounter::default(), EnvelopeCounter::default());
+    let (mut tx_counter, mut rx_counter) = EnvelopeCounter::pair(wire.identity.public.as_bytes(), peer_pub.as_bytes());
 
     // Both sides send their ephemeral key at once and read the other's.
     let hello = ECDH { ephemeral_pub: ephemeral.public_key() };

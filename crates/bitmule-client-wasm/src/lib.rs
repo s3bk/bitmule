@@ -558,6 +558,7 @@ fn message_from_js(message: &JsValue) -> Result<Peer2Peer, JsError> {
             block_size: 0,
             transfer_size: 0,
             bulk_key: bx::BulkKey::random(),
+            block_hashes: Vec::new(),
             name: None,
         }),
         "Get" => Peer2Peer::Get { start: number_field(message, "start")?, end: number_field(message, "end")? },

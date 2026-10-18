@@ -920,6 +920,11 @@ pub struct Rtc {
     peer_bytes_tx: u64,
     change_counter: usize,
     last_timeout_reason: Reason,
+
+    /// Set by `do_poll_output_once` to ask `do_poll_output` to run it again.
+    /// Looping instead of recursing keeps the stack flat however many SCTP
+    /// packets are queued.
+    repoll: bool,
     crypto_provider: Arc<crate::crypto::CryptoProvider>,
     fingerprint_verification: bool,
     close_dtls_started: bool,
@@ -1285,6 +1290,7 @@ impl Rtc {
             peer_bytes_tx: 0,
             change_counter: 0,
             last_timeout_reason: Reason::NotHappening,
+            repoll: false,
             crypto_provider,
             fingerprint_verification: config.fingerprint_verification,
             close_dtls_started: false,
@@ -1575,6 +1581,16 @@ impl Rtc {
     }
 
     fn do_poll_output(&mut self) -> Result<Output, RtcError> {
+        loop {
+            self.repoll = false;
+            let output = self.do_poll_output_once();
+            if !self.repoll {
+                return output;
+            }
+        }
+    }
+
+    fn do_poll_output_once(&mut self) -> Result<Output, RtcError> {
         if self.state == RtcState::Closed {
             self.last_timeout_reason = Reason::NotHappening;
             return Ok(Output::Timeout(not_happening()));
@@ -1716,7 +1732,8 @@ impl Rtc {
                                 if !packets.is_empty() {
                                     self.sctp.push_back_transmit(packets);
                                 }
-                                return self.do_poll_output();
+                                self.repoll = true;
+                                return Ok(Output::Timeout(not_happening()));
                             } else {
                                 return Err(e.into());
                             }
@@ -1731,7 +1748,8 @@ impl Rtc {
 
                         // Run again since this would feed the DTLS subsystem
                         // to produce a packet now.
-                        return self.do_poll_output();
+                        self.repoll = true;
+                                return Ok(Output::Timeout(not_happening()));
                     }
                 }
                 SctpEvent::Open { id, label } => {

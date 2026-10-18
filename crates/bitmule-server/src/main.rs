@@ -88,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
         info!(web_dir = %dir.display(), "serving static SPA from web-dir");
     }
 
+    let app = bitmule_server::security_headers(app);
+
     info!(bind = %args.bind, "bitmule-server up");
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     axum::serve(listener, app).await?;

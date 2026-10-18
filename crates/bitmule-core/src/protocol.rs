@@ -224,13 +224,20 @@ use serde::{Deserialize, Serialize};
             id: ReceiverId,
             capabilities: PeerCaps,
             pub_key: PublicKey,
+            /// `ShareKey::mac_identity(Owner, session, id, pub_key)`
             mac: SessionMac,
+            /// `ShareKey::join_check()`: lets the server tell who may join
+            /// without knowing the share key.
+            join_check: [u8; 32],
         },
         JoinSession {
             id: ReceiverId,
             capabilities: PeerCaps,
             pub_key: PublicKey,
+            /// `ShareKey::mac_identity(Joiner, session, id, pub_key)`
             mac: SessionMac,
+            /// `ShareKey::join_proof()`: only holders of the share key have it.
+            join_proof: [u8; 32],
         },
         SendTo1 {
             dest_id: ReceiverId,
@@ -379,6 +386,10 @@ use serde::{Deserialize, Serialize};
         pub block_size: u32,
         pub transfer_size: u64,
         pub bulk_key: BulkKey,
+        /// The hash of every block as it is coded (the first 8 bytes of the
+        /// BLAKE3 hash of the ciphertext block), or empty if the sender gives
+        /// none. Lets the receiver refuse frames that announce another hash.
+        pub block_hashes: Vec<u64>,
         /// What the sender calls the file (or the zip). Use [`TransferManifest::file_name`]
         /// to save it: this is whatever the peer sent.
         pub name: Option<String>,
@@ -434,6 +445,9 @@ use serde::{Deserialize, Serialize};
         },
         MultiFileZip {
             outer_compression: Option<Compression>,
+            /// Total size of the files in the zip, once unpacked. A receiver
+            /// refuses to unpack a zip that holds more.
+            unpacked_size: Option<u64>,
         },
     }
     pub struct FileMeta {
