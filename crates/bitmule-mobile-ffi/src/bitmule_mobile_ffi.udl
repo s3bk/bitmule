@@ -33,6 +33,11 @@ namespace bitmule_mobile_ffi {
   // decodes with BitmapFactory (Android) / UIImage (iOS).
   [Throws=BitmuleError]
   bytes qr_png_bytes(string text, u32 pixel_scale);
+
+  // The text of the first QR code found in a camera frame, if any. `gray` is
+  // the 8-bit luma plane (CameraX's Y plane), `row_stride` its bytes per row
+  // (>= width). Codes may sit anywhere in the frame, at any rotation.
+  string? decode_qr(bytes gray, u32 width, u32 height, u32 row_stride);
 };
 
 // A share URL parsed into its component parts. Mirrors the fragment

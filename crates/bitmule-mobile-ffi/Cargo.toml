@@ -23,8 +23,10 @@ crate-type = ["cdylib", "staticlib", "lib"]
 name = "bitmule_mobile_ffi"
 
 [dependencies]
+bitmule = { path = "../bitmule" }
+bitmule-client-common = { path = "../bitmule-client-common" }
 bitmule-client-native = { path = "../bitmule-client-native" }
-bitmule-crypto = { path = "../bitmule-crypto" }
+bitmule-core = { path = "../bitmule-core" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "io-util", "fs"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -33,11 +35,9 @@ uniffi = { version = "0.32", features = ["tokio"] }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 walkdir = { workspace = true }
-# WS client for the side-channel signal emit (request_relay / webrtc_ready)
-# — same feature set bitmule-client-native uses so Android trust roots
-# work identically.
-tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
-futures-util = "0.3"
+# unpacks received bundles (stored, deflate and zstd entries)
+zip = { workspace = true, features = ["deflate", "zstd"] }
+quircs = "0.10.3"
 
 [build-dependencies]
 uniffi = { version = "0.32", features = ["build"] }

@@ -15,15 +15,15 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::fmt::Debug;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 
-use bitmule_client_native::{recv_file as native_recv, send_file_multi, send_file_relay, TransportMode};
-use bitmule_client_native::multipeer::ServeMode;
-use bitmule_crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
+use bitmule::v2::{self, Options, Server};
+use bitmule_client_common::transfer::{Storage, TransferBuilder};
+use bitmule_client_native::crypto::ShareLink;
+use bitmule_core::protocol::websocket::TransferType;
 
 uniffi::include_scaffolding!("bitmule_mobile_ffi");
 
@@ -62,51 +62,6 @@ where
     }
 }
 
-/// Best-effort one-shot: open a fresh WS to `server/ws/<session_hex>`,
-/// send `text_frame`, close. Used for RequestRelay signal emit on
-/// receiver-side fallback + WebrtcReady timing beacon on DC-open.
-/// Any error is logged and swallowed — the caller's primary flow
-/// must not fail because a side-channel signal didn't land.
-///
-/// 5s cap on the whole open+send+close cycle so a stuck server
-/// can't wedge the caller. Cheap; each call is a fresh TCP+TLS+WS
-/// upgrade so don't spam this in a tight loop.
-async fn _emit_side_channel_frame(server_url: &str, session_hex: &str, text_frame: &str) {
-    use futures_util::SinkExt;
-    let ws_base = if let Some(rest) = server_url.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = server_url.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        server_url.to_string()
-    };
-    let url = format!(
-        "{}/ws/{}",
-        ws_base.trim_end_matches('/'),
-        session_hex,
-    );
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        async {
-            let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
-            ws.send(tokio_tungstenite::tungstenite::Message::Text(text_frame.to_string().into())).await?;
-            let _ = ws.close(None).await;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        },
-    ).await;
-    match result {
-        Ok(Ok(())) => {
-            tracing::debug!("side-channel WS frame sent: {text_frame}");
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("side-channel WS frame ({text_frame}) failed: {e}");
-        }
-        Err(_) => {
-            tracing::warn!("side-channel WS frame ({text_frame}) timed out");
-        }
-    }
-}
-
 pub fn ffi_version() -> String {
     // Semver of the FFI SURFACE (not the crate as a whole). Bump on
     // any UDL change so the shell can fail fast on binary/binding
@@ -114,7 +69,11 @@ pub fn ffi_version() -> String {
     // 0.3.0 (F4): send_file takes `sequence<string>` file_paths + auto
     // bundles; RecvOutcome gains `is_bundle` and auto-unpacks
     // container="zip-store" transfers into a directory before return.
-    "0.3.0".to_string()
+    // 0.4.0: runs on the v2 protocol (same interface; `multi` is ignored,
+    // a send ends once the receivers that connected have finished; the
+    // received file is named by the sender).
+    // 0.5.0: adds decode_qr for the camera scanner.
+    "0.5.0".to_string()
 }
 
 #[derive(Debug, Error)]
@@ -211,9 +170,21 @@ pub async fn recv_file(
     on_progress: Arc<dyn ProgressListener>,
 ) -> Result<RecvOutcome, BitmuleError> {
     // Enter the FFI tokio runtime for the whole body so every tokio
-    // primitive downstream (native_recv, container::unpack_zip_store,
-    // str0m internals) has a live reactor.
+    // primitive downstream (the v2 workers, str0m internals) has a live reactor.
     run_on_tokio(recv_file_inner(url, out_dir, on_progress)).await
+}
+
+/// A file name in `dir` that is not taken yet: `name`, `name (1)`, …
+fn free_name(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    (1..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).unwrap()
 }
 
 async fn recv_file_inner(
@@ -224,126 +195,83 @@ async fn recv_file_inner(
     let parsed = parse_share_url(url)?;
     let link = ShareLink::from_b64_url(&parsed.fragment)
         .map_err(|e| BitmuleError::InvalidFragment { reason: format!("{e:#}") })?;
+    let server = Server::parse(&parsed.server);
     let out_dir_path = PathBuf::from(&out_dir);
+    std::fs::create_dir_all(&out_dir_path).map_err(|e| BitmuleError::Io { reason: format!("create {out_dir}: {e}") })?;
 
-    // WebRTC-first with relay fallback. WEBRTC_DEADLINE bounds the
-    // WebRTC attempt so a broken NAT / ICE-failure doesn't hang the
-    // caller forever. On any WebRTC-side error OR the deadline firing
-    // without a DC-open, we (1) emit `request_relay` on a side-channel
-    // WS so any listening sender switches to relay immediately (skips
-    // its own timeout window), (2) re-open on the relay transport and
-    // re-run recv with the same share_key + signature.
-    //
-    // 10s deadline (dropped from 15s per Seb 2026-09-05) — real
-    // WebRTC handshakes on healthy networks complete in ~1-3s; 10s is
-    // plenty of headroom without making the fallback UX sluggish.
-    const WEBRTC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-    let session_hex_for_signals = link.share_key.session_id_hex();
-    let server_for_signals = parsed.server.clone();
-    let listener_wr = on_progress.clone();
-    let webrtc_attempt = tokio::time::timeout(
-        WEBRTC_DEADLINE,
-        native_recv(
-            &parsed.server,
-            link.share_key.clone(),
-            Some(link.signature),
-            &out_dir_path,
-            TransportMode::Webrtc,
-            move |received, total, name| {
-                listener_wr.on_progress(received, total, name.to_string());
-            },
-        ),
-    )
-    .await;
-    let outcome = match webrtc_attempt {
-        Ok(Ok(o)) => o,
-        Ok(Err(webrtc_err)) => {
-            tracing::warn!("recv webrtc failed ({webrtc_err:#}); requesting relay switch and falling back");
-            _emit_side_channel_frame(
-                &server_for_signals,
-                &session_hex_for_signals,
-                r#"{"type":"request_relay"}"#,
-            ).await;
-            let listener_relay = on_progress.clone();
-            native_recv(
-                &parsed.server,
-                link.share_key,
-                Some(link.signature),
-                &out_dir_path,
-                TransportMode::Relay,
-                move |received, total, name| {
-                    listener_relay.on_progress(received, total, name.to_string());
-                },
-            )
-            .await
-            .map_err(BitmuleError::from)?
-        }
-        Err(_) => {
-            tracing::warn!("recv webrtc DC did not open within {WEBRTC_DEADLINE:?}; requesting relay switch and falling back");
-            _emit_side_channel_frame(
-                &server_for_signals,
-                &session_hex_for_signals,
-                r#"{"type":"request_relay"}"#,
-            ).await;
-            let listener_relay = on_progress.clone();
-            native_recv(
-                &parsed.server,
-                link.share_key,
-                Some(link.signature),
-                &out_dir_path,
-                TransportMode::Relay,
-                move |received, total, name| {
-                    listener_relay.on_progress(received, total, name.to_string());
-                },
-            )
-            .await
-            .map_err(BitmuleError::from)?
+    // The file is made once the sender's manifest is in, named after what the
+    // sender calls it. Progress reports use that name.
+    let chosen: Arc<Mutex<Option<PathBuf>>> = Arc::default();
+    let open = {
+        let chosen = chosen.clone();
+        move |manifest: &bitmule_core::protocol::websocket::TransferManifest| {
+            let name = manifest.file_name().unwrap_or_else(|| "bitmule-download".to_string());
+            let path = free_name(&out_dir_path, &name);
+            let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+            *chosen.lock().unwrap() = Some(path);
+            Ok(file)
         }
     };
+    let progress = {
+        let chosen = chosen.clone();
+        move |received: u64, total: u64| {
+            let name = chosen.lock().unwrap().as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            on_progress.on_progress(received, total, name);
+        }
+    };
+    let report = v2::run_recv_progress(&server, &link, open, progress, Options::default())
+        .await
+        .map_err(BitmuleError::from)?;
+    let path = chosen.lock().unwrap().clone().ok_or_else(|| BitmuleError::Unknown { reason: "no file was written".into() })?;
 
-    // If the sender flagged `container="zip-store"`, unpack it here
-    // and hand the caller the directory. Extraction failure isn't
-    // fatal — we fall back to returning the raw zip so the shell
-    // can still show / share the bytes.
-    if outcome.container.as_deref() == Some("zip-store") {
-        let unpack_dir = bitmule_client_native::container::unpack_dir_for(&outcome.path);
-        match bitmule_client_native::container::unpack_zip_store(&outcome.path, &unpack_dir).await {
-            Ok(entries) => {
-                let _ = std::fs::remove_file(&outcome.path);
-                let size = dir_size_recursive(&unpack_dir);
-                let stem = unpack_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "bundle".to_string());
-                let name = format!(
-                    "{stem} ({entries} file{})",
-                    if entries == 1 { "" } else { "s" }
-                );
-                return Ok(RecvOutcome {
-                    path: unpack_dir.to_string_lossy().into_owned(),
-                    size,
-                    name,
-                    is_bundle: true,
-                });
-            }
-            Err(_e) => {
-                // fall through to the single-file shape below
-            }
+    // Several files arrive as one zip: unpack it here and hand the caller the
+    // directory. Extraction failure isn't fatal — fall back to the raw zip so
+    // the shell can still show / share the bytes.
+    if matches!(report.manifest.transfer_typ, TransferType::MultiFileZip { .. }) {
+        let zip_path = path.clone();
+        let unpacked = tokio::task::spawn_blocking(move || unpack_zip(&zip_path)).await;
+        if let Ok(Ok((dir, entries))) = unpacked {
+            let _ = std::fs::remove_file(&path);
+            let stem = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".to_string());
+            return Ok(RecvOutcome {
+                size: dir_size_recursive(&dir),
+                name: format!("{stem} ({entries} file{})", if entries == 1 { "" } else { "s" }),
+                path: dir.to_string_lossy().into_owned(),
+                is_bundle: true,
+            });
         }
     }
 
-    let final_path = outcome.path;
-    let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-    let name = final_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Ok(RecvOutcome {
-        path: final_path.to_string_lossy().into_owned(),
-        size,
-        name,
-        is_bundle: false,
-    })
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Ok(RecvOutcome { path: path.to_string_lossy().into_owned(), size, name, is_bundle: false })
+}
+
+/// Unpack `zip_path` (stored, deflated or zstd entries) into a new directory
+/// next to it. Returns the directory and the number of files.
+fn unpack_zip(zip_path: &Path) -> anyhow::Result<(PathBuf, usize)> {
+    let parent = zip_path.parent().ok_or_else(|| anyhow::anyhow!("zip has no directory"))?;
+    let stem = zip_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".into());
+    let dir = free_name(parent, &stem);
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
+    std::fs::create_dir_all(&dir)?;
+    let mut files = 0;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        // `enclosed_name` refuses paths that would leave `dir`
+        let Some(relative) = entry.enclosed_name() else { continue };
+        let target = dir.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(up) = target.parent() {
+            std::fs::create_dir_all(up)?;
+        }
+        std::io::copy(&mut entry, &mut std::fs::File::create(&target)?)?;
+        files += 1;
+    }
+    Ok((dir, files))
 }
 
 /// Sum of regular-file byte lengths under `dir`, best-effort — walk
@@ -372,146 +300,47 @@ pub async fn send_file(
 async fn send_file_inner(
     server: String,
     file_paths: Vec<String>,
-    multi: bool,
+    _multi: bool, // v2 ends a send once the receivers that connected are done
     on_url: Arc<dyn UrlListener>,
 ) -> Result<SendOutcome, BitmuleError> {
     if file_paths.is_empty() {
-        return Err(BitmuleError::Io {
-            reason: "no file paths given".into(),
-        });
+        return Err(BitmuleError::Io { reason: "no file paths given".into() });
     }
-    let paths: Vec<PathBuf> = file_paths.iter().map(PathBuf::from).collect();
-    for p in &paths {
-        let md = tokio::fs::metadata(p).await.map_err(|e| BitmuleError::Io {
-            reason: format!("stat {}: {e}", p.display()),
+    // 1 path = streams as it is; several are zipped on the fly by the builder.
+    let mut builder = TransferBuilder::new();
+    for path in file_paths.iter().map(PathBuf::from) {
+        let md = tokio::fs::metadata(&path).await.map_err(|e| BitmuleError::Io {
+            reason: format!("stat {}: {e}", path.display()),
         })?;
         if !md.is_file() {
             return Err(BitmuleError::Io {
-                reason: format!("{} must be a regular file (dir picking not yet supported on FFI)", p.display()),
+                reason: format!("{} must be a regular file (dir picking not yet supported on FFI)", path.display()),
             });
         }
+        let name = path.file_name().map(PathBuf::from);
+        builder.add_file(Storage::File(path), name);
     }
+    // hashes the data for the link's signature
+    let (manifest, transfer) = builder.commit_async().await.map_err(BitmuleError::from)?;
+    let file_name = manifest.file_name().unwrap_or_default();
+    let file_size = manifest.transfer_size;
 
-    // Bundling decision mirrors the CLI/Qt6: 1 path = stream as-is,
-    // N>=2 = build a store-mode zip on the fly and flag the meta so
-    // the receiver auto-unpacks. Zip guard is held in scope until
-    // send_file_multi returns (single task, no spawn — FFI's send
-    // fn returns to the caller when the transfer completes).
-    let (send_path, _zip_guard, container, file_name) = if paths.len() == 1 {
-        let p = paths[0].clone();
-        let name = p
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file.bin".to_string());
-        (p, None, None, name)
-    } else {
-        let (tmp, disp) = bitmule_client_native::container::build_zip_bundle(&paths)
-            .await
-            .map_err(BitmuleError::from)?;
-        (tmp.path().to_path_buf(), Some(tmp), Some("zip-store".to_string()), disp)
-    };
-    let file_size = tokio::fs::metadata(&send_path).await
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    // Mint share_key + bulk_key up front. Hash the send file (raw
-    // single file OR the just-built bundle) with the bulk_key to
-    // produce the URL signature commitment. Share URL fragment =
-    // base64url(share_key || signature). Mirrors the desktop-CLI
-    // `prepare_and_spawn_send` in crates/bitmule/src/main.rs.
-    let share_key = ShareKey::random();
-    let bulk_key = BulkKey::random();
-    let session_hex = share_key.session_id_hex();
-    let signature = commit_file(&send_path, &bulk_key).await?;
-    let link = ShareLink::new(share_key.clone(), signature);
-    let share_url = format!(
-        "{}/#{}",
-        server.trim_end_matches('/'),
-        link.to_b64_url(),
-    );
-
-    // Fire the URL callback BEFORE spawning the transfer so the shell
-    // can put the URL / QR on screen immediately. Then block on the
-    // transfer's completion.
-    on_url.on_url(share_url.clone(), session_hex.clone(), file_name, file_size);
-
-    let mode = if multi { ServeMode::Multi } else { ServeMode::Complete };
-    let server_trimmed = server.trim_end_matches('/').to_string();
-
-    // WebRTC-first with relay fallback in Complete mode. If WebRTC
-    // never completes (no peer connects, ICE fails, etc.) inside the
-    // deadline, republish the same session via the relay path — the
-    // share_key + bulk_key + signature are already committed on the
-    // URL the receiver holds, so re-sending as relay lands cleanly on
-    // whichever transport the receiver is currently attempting.
-    //
-    // Multi mode = server-keeps-URL-live-indefinitely, no deadline
-    // makes sense; we call send_file_multi directly and any failure
-    // surfaces to the caller. Live-URL sessions that need relay
-    // should be started explicitly by the caller with a --relay-mode
-    // FFI arg (not yet exposed; add when needed).
-    const WEBRTC_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-    if multi {
-        send_file_multi(
-            &server_trimmed,
-            share_key,
-            bulk_key,
-            send_path,
-            container,
-            mode,
-        )
-        .await
-        .map_err(BitmuleError::from)?;
-    } else {
-        let share_key_wr = share_key.clone();
-        let bulk_key_wr = bulk_key.clone();
-        let send_path_wr = send_path.clone();
-        let container_wr = container.clone();
-        let server_wr = server_trimmed.clone();
-        let webrtc_attempt = tokio::time::timeout(
-            WEBRTC_SEND_DEADLINE,
-            send_file_multi(&server_wr, share_key_wr, bulk_key_wr, send_path_wr, container_wr, mode),
-        )
-        .await;
-        match webrtc_attempt {
-            Ok(Ok(())) => { /* WebRTC succeeded */ }
-            Ok(Err(webrtc_err)) => {
-                tracing::warn!("send webrtc failed ({webrtc_err:#}); falling back to relay");
-                send_file_relay(
-                    &server_trimmed,
-                    share_key,
-                    bulk_key,
-                    &send_path,
-                    container.as_deref(),
-                    |_sent, _total| {},
-                )
-                .await
-                .map_err(BitmuleError::from)?;
-            }
-            Err(_) => {
-                tracing::warn!("send webrtc did not complete within {WEBRTC_SEND_DEADLINE:?}; falling back to relay");
-                send_file_relay(
-                    &server_trimmed,
-                    share_key,
-                    bulk_key,
-                    &send_path,
-                    container.as_deref(),
-                    |_sent, _total| {},
-                )
-                .await
-                .map_err(BitmuleError::from)?;
-            }
-        }
-    }
-
-    Ok(SendOutcome {
-        share_url,
-        session_hex,
-        // Complete mode returns after first-peer; Multi runs until
-        // cancel so this value is really "at least 1" — refine when
-        // send_serve exposes a per-peer completion counter.
-        peers_served: 1,
+    let server = Server::parse(&server);
+    let minted: Arc<Mutex<Option<(String, String)>>> = Arc::default();
+    let listener_state = minted.clone();
+    let server_for_url = server.clone();
+    v2::run_send(&server, manifest, transfer, Options::default(), move |link| {
+        // fires before the transfer starts, so the shell can show the URL / QR at once
+        let url = server_for_url.share_url(link);
+        let session_hex = link.share_key.session_id_hex();
+        *listener_state.lock().unwrap() = Some((url.clone(), session_hex.clone()));
+        on_url.on_url(url, session_hex, file_name, file_size);
     })
+    .await
+    .map_err(BitmuleError::from)?;
+
+    let (share_url, session_hex) = minted.lock().unwrap().take().unwrap_or_default();
+    Ok(SendOutcome { share_url, session_hex, peers_served: 1 })
 }
 
 pub fn qr_png_bytes(text: String, pixel_scale: u32) -> Result<Vec<u8>, BitmuleError> {
@@ -530,20 +359,91 @@ pub fn qr_png_bytes(text: String, pixel_scale: u32) -> Result<Vec<u8>, BitmuleEr
     Ok(out)
 }
 
-async fn commit_file(path: &Path, bulk_key: &BulkKey) -> Result<[u8; 32], BitmuleError> {
-    let mut f = tokio::fs::File::open(path).await.map_err(|e| BitmuleError::Io {
-        reason: format!("open {}: {e}", path.display()),
-    })?;
-    let mut hasher = CommitmentHasher::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf).await.map_err(|e| BitmuleError::Io {
-            reason: format!("read {}: {e}", path.display()),
-        })?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+/// Looks for QR codes in one camera frame. Returns the text of the first one
+/// that decodes; frames without a readable code are the normal case while
+/// the user is still aiming, so that is `None`, not an error.
+pub fn decode_qr(gray: Vec<u8>, width: u32, height: u32, row_stride: u32) -> Option<String> {
+    let (w, h, stride) = (width as usize, height as usize, row_stride as usize);
+    if w == 0 || h == 0 || stride < w || gray.len() < stride * (h - 1) + w {
+        return None;
     }
-    Ok(hasher.finalize(bulk_key))
+    // the decoder wants the rows back to back
+    let packed: Vec<u8> = if stride == w {
+        gray
+    } else {
+        gray.chunks(stride).take(h).flat_map(|row| &row[..w]).copied().collect()
+    };
+    // quirc needs a few pixels per module and a sharp edge: a code that is
+    // small or soft in the frame is often found only after enlarging it
+    // (measured on degraded copies of a share-link code: plain 15 of 22, with
+    // these passes 21 of 22). Cheapest pass first.
+    let frame = image::GrayImage::from_raw(width, height, packed)?;
+    if let Some(text) = decode_plain(&frame) {
+        return Some(text);
+    }
+    let up2 = enlarge(&frame, 2);
+    if let Some(text) = decode_plain(&up2) {
+        return Some(text);
+    }
+    let up3 = enlarge(&frame, 3);
+    decode_plain(&up3).or_else(|| decode_plain(&image::imageops::unsharpen(&up3, 4.0, 10)))
+}
+
+fn decode_plain(frame: &image::GrayImage) -> Option<String> {
+    let mut decoder = quircs::Quirc::default();
+    decoder
+        .identify(frame.width() as usize, frame.height() as usize, frame.as_raw())
+        .filter_map(|code| code.ok()?.decode().ok())
+        .find_map(|data| String::from_utf8(data.payload).ok())
+}
+
+fn enlarge(frame: &image::GrayImage, factor: u32) -> image::GrayImage {
+    image::imageops::resize(frame, frame.width() * factor, frame.height() * factor, image::imageops::FilterType::CatmullRom)
+}
+
+#[cfg(test)]
+mod qr_tests {
+    use super::*;
+
+    fn frame(text: &str, scale: u32) -> (Vec<u8>, u32, u32) {
+        let image = qrcode::QrCode::new(text.as_bytes())
+            .unwrap()
+            .render::<image::Luma<u8>>()
+            .module_dimensions(scale, scale)
+            .quiet_zone(true)
+            .build();
+        (image.as_raw().clone(), image.width(), image.height())
+    }
+
+    #[test]
+    fn decodes_a_share_link() {
+        let url = "https://bitmule.qdat.net/#TMUe-v7W5eT6PQATGAtCQ7sV4K8stFmiRg8pBWV_BE21YNHenSlXHRnsx_HVMi6ccZnIubqU4KjsQbM5ThEJnQ";
+        let (gray, w, h) = frame(url, 4);
+        assert_eq!(decode_qr(gray, w, h, w).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn honours_the_row_stride() {
+        let url = "https://bitmule.qdat.net/#abc";
+        let (gray, w, h) = frame(url, 6);
+        // camera rows are often padded
+        let stride = w + 24;
+        let padded: Vec<u8> = gray.chunks(w as usize).flat_map(|row| row.iter().copied().chain([0u8; 24])).collect();
+        assert_eq!(decode_qr(padded, w, h, stride).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn a_small_soft_code_is_found_after_enlarging() {
+        let url = "https://bitmule.qdat.net/#TMUe-v7W5eT6PQATGAtCQ7sV4K8stFmiRg8pBWV_BE21YNHenSlXHRnsx_HVMi6ccZnIubqU4KjsQbM5ThEJnQ";
+        let (gray, w, h) = frame(url, 3);
+        let soft = image::imageops::blur(&image::GrayImage::from_raw(w, h, gray).unwrap(), 1.5);
+        assert_eq!(decode_plain(&soft), None, "the test frame should need the extra passes");
+        assert_eq!(decode_qr(soft.into_raw(), w, h, w).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn a_frame_without_a_code_is_none() {
+        assert_eq!(decode_qr(vec![128; 64 * 64], 64, 64, 64), None);
+        assert_eq!(decode_qr(vec![0; 10], 64, 64, 64), None);
+    }
 }

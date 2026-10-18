@@ -10,20 +10,16 @@ const BITMULE_URL_PREFIX: &str = "https://bitmule.qdat.net/#";
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 
 /// Prepare a bitmule share from `files` and spawn the send task in the
-/// background. Returns the share URL as soon as the commitment hash
-/// finishes — the actual transfer keeps running in a detached tokio task
-/// until the app exits.
+/// background. Returns the share URL as soon as the session exists (the data
+/// is hashed for the link's signature first); the transfer keeps running in
+/// a detached tokio task until the receivers that connected are done.
 ///
-/// F3: single-file inputs stream as-is (container=None). Multiple files
-/// or a single directory get bundled into an on-the-fly store-mode zip
-/// via `bitmule_client_native::container::build_zip_bundle`; the
-/// tempfile guard is moved into the spawn closure so the zip survives
-/// the transfer and unlinks on task exit. Receiver-side unpack is
-/// triggered by the `container="zip-store"` flag on the meta frame.
-async fn share(files: Vec<PathBuf>, multi_send: bool) -> Url {
-    use bitmule_client_native::{send_file_multi, ServeMode};
-    use bitmule_crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
-    use tokio::io::AsyncReadExt;
+/// One file is sent as it is; several files, or a directory, go as a zip the
+/// builder makes. v2 has no "keep the link live for more receivers" mode, so
+/// the old multi-send option no longer does anything.
+async fn share(files: Vec<PathBuf>) -> Url {
+    use bitmule::v2::{self, Options, Server};
+    use bitmule_client_common::transfer::{Storage, TransferBuilder};
 
     const SERVER: &str = "https://bitmule.qdat.net";
     let err_url = |msg: &str| {
@@ -35,66 +31,58 @@ async fn share(files: Vec<PathBuf>, multi_send: bool) -> Url {
         return err_url("no file selected");
     }
 
-    // Bundling decision mirrors the CLI: 1 file → stream as-is; 1 dir
-    // or N>=2 paths → zip-store bundle. `zip_guard` is `Some` iff we
-    // built a tempfile; it must be moved into the spawn closure so the
-    // temp zip is not unlinked mid-transfer.
-    let (send_path, zip_guard, container): (PathBuf, Option<bitmule_client_native::container::ZipBundleGuard>, Option<String>) = if files.len() == 1 {
-        let p = files[0].clone();
-        match tokio::fs::metadata(&p).await {
-            Ok(md) if md.is_file() => (p, None, None),
+    let mut builder = TransferBuilder::new();
+    for path in &files {
+        match tokio::fs::metadata(path).await {
+            Ok(md) if md.is_file() => {
+                builder.add_file(Storage::File(path.clone()), path.file_name().map(PathBuf::from));
+            }
             Ok(md) if md.is_dir() => {
-                match bitmule_client_native::container::build_zip_bundle(&files).await {
-                    Ok((tmp, _disp)) => (tmp.path().to_path_buf(), Some(tmp), Some("zip-store".to_string())),
-                    Err(e) => return err_url(&format!("zip bundle: {e:#}")),
+                // the directory's name stays the first component of every entry
+                let base = path.parent().unwrap_or(Path::new("")).to_path_buf();
+                for entry in walkdir::WalkDir::new(path).sort_by_file_name().into_iter().flatten() {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let name = entry.path().strip_prefix(&base).unwrap_or(entry.path()).to_path_buf();
+                    builder.add_file(Storage::File(entry.path().to_path_buf()), Some(name));
                 }
             }
             Ok(_) => return err_url("not a regular file or directory"),
             Err(e) => return err_url(&format!("stat: {e}")),
         }
-    } else {
-        match bitmule_client_native::container::build_zip_bundle(&files).await {
-            Ok((tmp, _disp)) => (tmp.path().to_path_buf(), Some(tmp), Some("zip-store".to_string())),
-            Err(e) => return err_url(&format!("zip bundle: {e:#}")),
-        }
+    }
+    // a lone directory still goes as a zip, even with a single file inside
+    if files.len() > 1 || files.iter().any(|p| p.is_dir()) {
+        builder.force_multi_file_zip();
+    }
+
+    // hashes the data for the link's signature
+    let (manifest, transfer) = match builder.commit_async().await {
+        Ok(v) => v,
+        Err(e) => return err_url(&format!("prepare: {e:#}")),
     };
 
-    // Stat + commitment: stream-hash the (possibly-just-built) file with
-    // a fresh bulk_key to produce SHA256(data || bulk_key), the URL-
-    // committed signature. When bundling, we hash the zip's bytes.
-    let share_key = ShareKey::random();
-    let bulk_key = BulkKey::random();
-    let signature = {
-        let mut f = match tokio::fs::File::open(&send_path).await {
-            Ok(f) => f,
-            Err(e) => return err_url(&format!("open: {e}")),
-        };
-        let mut hasher = CommitmentHasher::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match f.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => hasher.update(&buf[..n]),
-                Err(e) => return err_url(&format!("read: {e}")),
-            }
-        }
-        hasher.finalize(&bulk_key)
-    };
-
-    let link = ShareLink::new(share_key.clone(), signature);
-    let url_str = format!("{}/#{}", SERVER.trim_end_matches('/'), link.to_b64_url());
-
-    let mode = if multi_send { ServeMode::Multi } else { ServeMode::Complete };
+    let server = Server::parse(SERVER);
+    let (link_tx, link_rx) = tokio::sync::oneshot::channel::<String>();
     tokio::spawn(async move {
-        let _zip_guard = zip_guard; // keep temp zip alive for the transfer
-        if let Err(e) = send_file_multi(
-            SERVER, share_key, bulk_key, send_path, container, mode,
-        ).await {
+        let server_for_url = server.clone();
+        let mut link_tx = Some(link_tx);
+        let result = v2::run_send(&server, manifest, transfer, Options::default(), move |link| {
+            if let Some(tx) = link_tx.take() {
+                let _ = tx.send(server_for_url.share_url(link));
+            }
+        })
+        .await;
+        if let Err(e) = result {
             eprintln!("bitmule send failed: {e:#}");
         }
     });
 
-    Url::parse(&url_str).unwrap_or_else(|_| err_url("URL build"))
+    match link_rx.await {
+        Ok(url) => Url::parse(&url).unwrap_or_else(|_| err_url("URL build")),
+        Err(_) => err_url("couldn't reach the server"),
+    }
 }
 
 /// Minimal percent-encoding for stuffing an error message into a URL
@@ -214,13 +202,12 @@ impl UploaderApi {
         self.is_busy_changed();
 
         let paths = self.paths.borrow().clone();
-        let multi_send = self.opt_multi_send;
         let active_urls = self.active_share_urls.clone();
         let qpointer = QPointer::from(&*self);
 
         // Run async operation
         qmetaobject::future::execute_async(async move {
-            let url = share(paths, multi_send).await;
+            let url = share(paths).await;
             let url_str = url.to_string();
             let qr = qr_data_url_for(&url_str);
             // Register the URL as own-upload so the clipboard watcher
@@ -390,7 +377,7 @@ impl UploaderApi {
                     return;
                 }
             };
-            let (share_key, expected_sig) = match parse_fragment(&fragment) {
+            let link = match parse_fragment(&fragment) {
                 Some(v) => v,
                 None => {
                     update_recv_state(&state, &url, |s| {
@@ -418,14 +405,25 @@ impl UploaderApi {
                 });
                 refresh_from_bg(&qpointer_ui, &state_ui);
             });
-            let last_pct = std::sync::Arc::new(std::sync::Mutex::new(0u8));
-            let result = bitmule_client_native::recv_file(
-                &server,
-                share_key,
-                expected_sig,
-                &stage_dir,
-                bitmule_client_native::TransportMode::Webrtc,
-                move |received, total, name| {
+
+            // The file is made inside the staging dir once the sender's
+            // manifest is in, named after what the sender calls it.
+            let staged: Arc<Mutex<Option<PathBuf>>> = Arc::default();
+            let open = {
+                let staged = staged.clone();
+                let stage_dir = stage_dir.clone();
+                move |manifest: &bitmule_core::protocol::websocket::TransferManifest| {
+                    let name = manifest.file_name().unwrap_or_else(|| "bitmule-download".to_string());
+                    let path = stage_dir.join(name);
+                    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
+                    *staged.lock().unwrap() = Some(path);
+                    Ok(file)
+                }
+            };
+            let last_pct = Arc::new(Mutex::new(0u8));
+            let progress = {
+                let staged = staged.clone();
+                move |received: u64, total: u64| {
                     let pct = if total > 0 {
                         ((received as f64 / total as f64) * 100.0).floor() as u8
                     } else { 0 };
@@ -435,122 +433,75 @@ impl UploaderApi {
                     *lp = pct;
                     drop(lp);
                     let prog = if total > 0 { received as f64 / total as f64 } else { 0.0 };
-                    on_progress_ui((name.to_string(), prog));
-                },
+                    let name = staged.lock().unwrap().as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    on_progress_ui((name, prog));
+                }
+            };
+            let result = bitmule::v2::run_recv_progress(
+                &bitmule::v2::Server::parse(&server),
+                &link,
+                open,
+                progress,
+                bitmule::v2::Options::default(),
             ).await;
             match result {
-                Ok(staged_outcome) => {
-                    let staged_path = staged_outcome.path;
-                    // recv_file returned Ok, which means AEAD verify
-                    // already passed. Promote out of staging. For a
-                    // zip-store container the promote is: pick a fresh
-                    // sibling dir under out_dir, unpack into it, drop
-                    // the staged zip. Single-file (container=None) uses
-                    // the legacy rename flow.
-                    match staged_outcome.container.as_deref() {
-                        Some("zip-store") => {
-                            let stem = staged_path
-                                .file_stem()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "bundle".to_string());
-                            let final_dir = unique_dest_path(&out_dir, &stem);
-                            let unpack_res = bitmule_client_native::container::unpack_zip_store(
-                                &staged_path, &final_dir,
-                            ).await;
-                            match unpack_res {
-                                Ok(entries) => {
-                                    let _ = std::fs::remove_dir_all(&stage_dir);
-                                    update_recv_state(&state, &url, |s| {
-                                        s.status = "complete".into();
-                                        s.progress = 1.0;
-                                        s.name = format!("{} ({} file{})", stem, entries,
-                                            if entries == 1 { "" } else { "s" });
-                                        s.path = Some(final_dir.to_string_lossy().into_owned());
-                                    });
-                                }
-                                Err(e) => {
-                                    // Keep the staged zip on unpack failure
-                                    // so the user can grab the bytes manually.
-                                    let name_s = staged_path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_default();
-                                    let fallback = unique_dest_path(&out_dir, &name_s);
-                                    let _ = std::fs::rename(&staged_path, &fallback);
-                                    let _ = std::fs::remove_dir_all(&stage_dir);
-                                    update_recv_state(&state, &url, |s| {
-                                        s.status = "error".into();
-                                        s.error = Some(format!("unpack zip-store: {e:#} — zip kept at {}", fallback.display()));
-                                        s.path = Some(fallback.to_string_lossy().into_owned());
-                                    });
-                                }
-                            }
+                Ok(report) => {
+                    // run_recv_progress returned Ok: the data was checked
+                    // against the link's signature. Promote it out of staging;
+                    // a zip is unpacked into a fresh directory, and kept
+                    // as the raw zip if that fails.
+                    let staged_path = staged.lock().unwrap().clone().unwrap_or_default();
+                    let is_zip = matches!(report.manifest.transfer_typ, bitmule_core::protocol::websocket::TransferType::MultiFileZip { .. });
+                    let unpacked = if is_zip {
+                        let zip_path = staged_path.clone();
+                        let into = out_dir.clone();
+                        Some(tokio::task::spawn_blocking(move || unpack_zip(&zip_path, &into)).await)
+                    } else { None };
+                    match unpacked {
+                        Some(Ok(Ok((final_dir, entries)))) => {
+                            let stem = final_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".into());
+                            let _ = std::fs::remove_dir_all(&stage_dir);
+                            update_recv_state(&state, &url, |s| {
+                                s.status = "complete".into();
+                                s.progress = 1.0;
+                                s.name = format!("{} ({} file{})", stem, entries,
+                                    if entries == 1 { "" } else { "s" });
+                                s.path = Some(final_dir.to_string_lossy().into_owned());
+                            });
                         }
-                        Some(other) => {
-                            // Unknown container — fall through to single-file
-                            // promote and surface a warning; forward-compat
-                            // with senders on a newer container we don't
-                            // recognize.
-                            eprintln!("bitmule qt6: unknown container {:?}, keeping raw file", other);
-                            let name_s = staged_path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
+                        other => {
+                            let unpack_error = match other {
+                                Some(Ok(Err(e))) => Some(format!("unpack zip: {e:#}")),
+                                Some(Err(e)) => Some(format!("unpack zip: {e}")),
+                                _ => None,
+                            };
+                            let name_s = staged_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                             let final_path = unique_dest_path(&out_dir, &name_s);
-                            match std::fs::rename(&staged_path, &final_path) {
-                                Ok(()) => {
-                                    let _ = std::fs::remove_dir_all(&stage_dir);
-                                    update_recv_state(&state, &url, |s| {
-                                        s.status = "complete".into();
-                                        s.progress = 1.0;
-                                        s.name = final_path.file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default();
-                                        s.path = Some(final_path.to_string_lossy().into_owned());
-                                    });
+                            let moved = std::fs::rename(&staged_path, &final_path);
+                            let _ = std::fs::remove_dir_all(&stage_dir);
+                            update_recv_state(&state, &url, |s| match (moved, unpack_error) {
+                                (Ok(()), None) => {
+                                    s.status = "complete".into();
+                                    s.progress = 1.0;
+                                    s.name = final_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                    s.path = Some(final_path.to_string_lossy().into_owned());
                                 }
-                                Err(e) => {
-                                    let _ = std::fs::remove_dir_all(&stage_dir);
-                                    update_recv_state(&state, &url, |s| {
-                                        s.status = "error".into();
-                                        s.error = Some(format!("promote staged file: {e:#}"));
-                                    });
+                                (Ok(()), Some(msg)) => {
+                                    s.status = "error".into();
+                                    s.error = Some(format!("{msg} — zip kept at {}", final_path.display()));
+                                    s.path = Some(final_path.to_string_lossy().into_owned());
                                 }
-                            }
-                        }
-                        None => {
-                            let name_s = staged_path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let final_path = unique_dest_path(&out_dir, &name_s);
-                            match std::fs::rename(&staged_path, &final_path) {
-                                Ok(()) => {
-                                    let _ = std::fs::remove_dir_all(&stage_dir);
-                                    update_recv_state(&state, &url, |s| {
-                                        s.status = "complete".into();
-                                        s.progress = 1.0;
-                                        s.name = final_path.file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default();
-                                        s.path = Some(final_path.to_string_lossy().into_owned());
-                                    });
+                                (Err(e), _) => {
+                                    s.status = "error".into();
+                                    s.error = Some(format!("promote staged file: {e:#}"));
                                 }
-                                Err(e) => {
-                                    let _ = std::fs::remove_dir_all(&stage_dir);
-                                    update_recv_state(&state, &url, |s| {
-                                        s.status = "error".into();
-                                        s.error = Some(format!("promote staged file: {e:#}"));
-                                    });
-                                }
-                            }
+                            });
                         }
                     }
                 }
                 Err(e) => {
-                    // Verify already deletes on mismatch, but a
-                    // mid-stream AEAD failure leaves partial bytes in
-                    // stage_dir. Clean the whole staging tree either way.
+                    // A failed transfer leaves partial bytes in stage_dir;
+                    // clean the whole staging tree.
                     let _ = std::fs::remove_dir_all(&stage_dir);
                     update_recv_state(&state, &url, |s| {
                         s.status = "error".into();
@@ -672,11 +623,34 @@ fn split_share_url(url: &str) -> Option<(String, String)> {
     Some((server, fragment))
 }
 
-fn parse_fragment(fragment: &str)
-    -> Option<(bitmule_crypto::ShareKey, Option<[u8; 32]>)>
-{
-    let link = bitmule_crypto::ShareLink::from_b64_url(fragment).ok()?;
-    Some((link.share_key, Some(link.signature)))
+fn parse_fragment(fragment: &str) -> Option<bitmule_client_native::crypto::ShareLink> {
+    bitmule_client_native::crypto::ShareLink::from_b64_url(fragment).ok()
+}
+
+/// Unpack `zip_path` (stored, deflated or zstd entries) into a new directory
+/// in `into`, named after the zip. Returns the directory and the number of files.
+fn unpack_zip(zip_path: &Path, into: &Path) -> anyhow::Result<(PathBuf, usize)> {
+    let stem = zip_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bundle".into());
+    let dir = unique_dest_path(into, &stem);
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
+    std::fs::create_dir_all(&dir)?;
+    let mut files = 0;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        // `enclosed_name` refuses paths that would leave `dir`
+        let Some(relative) = entry.enclosed_name() else { continue };
+        let target = dir.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(up) = target.parent() {
+            std::fs::create_dir_all(up)?;
+        }
+        std::io::copy(&mut entry, &mut std::fs::File::create(&target)?)?;
+        files += 1;
+    }
+    Ok((dir, files))
 }
 
 fn update_recv_state<F: FnOnce(&mut RecvTransferState)>(

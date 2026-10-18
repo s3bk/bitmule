@@ -78,7 +78,6 @@ private fun SendPane() {
     var shareUrl by remember { mutableStateOf<String?>(null) }
     var qrBytes by remember { mutableStateOf<ByteArray?>(null) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
-    var multiSend by remember { mutableStateOf(false) }
 
     // Multi-file SAF picker — returns a list of content:// URIs.
     // Each Uri is copied to a private cache file on Dispatchers.IO
@@ -120,11 +119,6 @@ private fun SendPane() {
             )
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(checked = multiSend, onCheckedChange = { multiSend = it })
-            Text("Keep URL live for multiple receivers")
-        }
-
         Button(
             enabled = pickedPaths.isNotEmpty() && status != "sending",
             modifier = Modifier.fillMaxWidth(),
@@ -141,7 +135,7 @@ private fun SendPane() {
                             uniffi.bitmule_mobile_ffi.sendFile(
                                 server = DEFAULT_SERVER,
                                 filePaths = paths,
-                                multi = multiSend,
+                                multi = false, // the v2 protocol ends a send once its receivers are done
                                 onUrl = object : uniffi.bitmule_mobile_ffi.UrlListener {
                                     override fun onUrl(
                                         url: String,
@@ -260,6 +254,14 @@ private fun ReceivePane(
         }
     }
 
+    var scanning by remember { mutableStateOf(false) }
+    if (scanning) {
+        QrScanner(
+            onResult = { urlText = it; scanning = false },
+            onClose = { scanning = false },
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -267,6 +269,11 @@ private fun ReceivePane(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        OutlinedButton(
+            modifier = Modifier.fillMaxWidth(),
+            onClick = { scanning = true },
+        ) { Text("Scan QR") }
+
         OutlinedTextField(
             value = urlText,
             onValueChange = { urlText = it },

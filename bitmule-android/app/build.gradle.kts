@@ -81,6 +81,11 @@ dependencies {
     // JNA 5.14 shipped libjnidispatch.so without 16 KB alignment.
     // 5.15+ builds each ABI with `-Wl,-z,max-page-size=16384` so the
     // Play Store 16 KB check passes.
+    // camera for the QR scanner; the decoding is quircs in the FFI crate
+    implementation("androidx.camera:camera-camera2:1.4.2")
+    implementation("androidx.camera:camera-lifecycle:1.4.2")
+    implementation("androidx.camera:camera-view:1.4.2")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 

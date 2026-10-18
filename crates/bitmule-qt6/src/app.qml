@@ -122,16 +122,6 @@ Window {
                     ColumnLayout {
                         anchors.fill: parent
                         CheckBox {
-                            text: "multi-send by default (keep URL live for more receivers)"
-                            checked: api.opt_multi_send
-                            onCheckedChanged: {
-                                if (api.opt_multi_send !== checked) {
-                                    api.opt_multi_send = checked
-                                    api.save_options()
-                                }
-                            }
-                        }
-                        CheckBox {
                             text: "request UPnP port mapping"
                             checked: api.opt_upnp
                             onCheckedChanged: {
