@@ -168,6 +168,22 @@ pub struct Report {
     pub data_channel_time: Span,
 }
 
+/// What a sender learns about its receivers. `receiver` is a short id, the
+/// same for all events of one receiver.
+#[derive(Clone, Debug)]
+pub enum SendEvent {
+    /// A receiver joined the session.
+    Connected { receiver: String },
+    /// The receiver has this many of `total` bytes (what it reports itself,
+    /// so it counts the relay and the data channel alike).
+    Progress { receiver: String, bytes: u64, total: u64 },
+    /// The receiver has the whole file.
+    Done { receiver: String },
+}
+
+/// Called for every [`SendEvent`], from the sender's worker tasks.
+pub type OnSendEvent = std::sync::Arc<dyn Fn(SendEvent) + Send + Sync>;
+
 /// Send `transfer` to every receiver that joins; returns once the receivers
 /// that connected have all finished. `on_link` is called with the share link
 /// as soon as the session exists.
@@ -178,7 +194,20 @@ pub async fn run_send(
     options: Options,
     on_link: impl FnOnce(&ShareLink),
 ) -> Result<()> {
-    session::send(server, manifest, transfer, options, on_link).await
+    run_send_events(server, manifest, transfer, options, on_link, std::sync::Arc::new(|_| {})).await
+}
+
+/// `run_send`, and `on_event` hears about the receivers: who connected, how
+/// far each one is, who finished.
+pub async fn run_send_events(
+    server: &Server,
+    manifest: TransferManifest,
+    transfer: Transfer,
+    options: Options,
+    on_link: impl FnOnce(&ShareLink),
+    on_event: OnSendEvent,
+) -> Result<()> {
+    session::send(server, manifest, transfer, options, on_link, on_event).await
 }
 
 /// Receiver-initiated transfers: `on_request` gets the key to put in the link

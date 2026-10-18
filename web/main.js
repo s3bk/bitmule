@@ -373,7 +373,7 @@ async function startSendSession(files) {
         const ids = new Set(peers.map((p) => p.id));
         for (const p of peers) {
           session.seen.add(p.id);
-          upsertPeerProgressRow({ receiverId: p.id }, p.state === "direct" ? "sending (direct)" : p.state);
+          upsertPeerProgressRow({ receiverId: p.id, bytesSent: p.bytes, bytesTotal: p.total }, p.bytes > 0 ? null : (p.state === "direct" ? "sending (direct)" : p.state));
         }
         for (const id of session.seen) if (!ids.has(id)) removePeerProgressRow(id);
         session.active = peers.length;

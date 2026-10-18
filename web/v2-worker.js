@@ -259,7 +259,7 @@ class Sender {
   }
 
   publishPeers() {
-    post({ type: "peers", peers: [...this.peers].map(([id, p]) => ({ id, state: p.state, via: p.via })) });
+    post({ type: "peers", peers: [...this.peers].map(([id, p]) => ({ id, state: p.state, via: p.via, bytes: p.bytes || 0, total: this.size })) });
   }
 
   async handle(event) {
@@ -360,6 +360,8 @@ class Sender {
         this.dropPeer(from);
         break;
       case "Progress":
+        peer.bytes = Math.min(message.bytes, this.size);
+        this.publishPeers();
         break;
       default:
         throw new Error(`unexpected message ${message.type} from receiver`);
@@ -633,7 +635,13 @@ class Receiver {
     const now = Date.now();
     if (!force && now - this.lastProgress < 100) return;
     this.lastProgress = now;
-    post({ type: "progress", bytes: Math.min(this.viaRelay + this.viaDc, this.total), total: this.total, via: this.dcActive ? "direct" : "relay" });
+    const bytes = Math.min(this.viaRelay + this.viaDc, this.total);
+    post({ type: "progress", bytes, total: this.total, via: this.dcActive ? "direct" : "relay" });
+    // the sender shows how far we are (every quarter second is plenty)
+    if (!this.complete && (force || now - (this.lastReport || 0) >= 250)) {
+      this.lastReport = now;
+      this.link.sendPeer(this.sender, { type: "Progress", bytes });
+    }
   }
 
   async relayDownload() {

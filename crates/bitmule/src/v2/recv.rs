@@ -87,12 +87,26 @@ enum RelayEnd {
 /// Counts `n` more bytes as received and reports.
 type Bump = Arc<dyn Fn(u64) + Send + Sync>;
 
-fn bump_for(progress: Option<Progress>, size: u64) -> Bump {
-    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+/// How often the sender is told how far we are.
+const REPORT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn bump_for(progress: Option<Progress>, size: u64, sender: mpsc::Sender<Peer2Peer>) -> Bump {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let done = Arc::new(AtomicU64::new(0));
+    let started = std::time::Instant::now();
+    let last_report = Arc::new(AtomicU64::new(0)); // ms since `started`, +1
     Arc::new(move |n| {
-        let total = done.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
+        let total = (done.fetch_add(n, Relaxed) + n).min(size);
         if let Some(progress) = &progress {
-            progress(total.min(size), size);
+            progress(total, size);
+        }
+        // the sender shows this to its user; a full queue just skips one report
+        let now = started.elapsed().as_millis() as u64 + 1;
+        let last = last_report.load(Relaxed);
+        if now - last >= REPORT_EVERY.as_millis() as u64
+            && last_report.compare_exchange(last, now, Relaxed, Relaxed).is_ok()
+        {
+            let _ = sender.try_send(Peer2Peer::Progress(total));
         }
     })
 }
@@ -178,7 +192,7 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
     ensure!(manifest.block_size as usize == fountain::BLOCK_PLAIN, "sender uses an unsupported block size");
     let size = manifest.transfer_size;
     let out = Arc::new((ctx.open.take().expect("the output is opened once"))(&manifest)?);
-    let bump = bump_for(ctx.progress.take(), size);
+    let bump = bump_for(ctx.progress.take(), size, tx.clone());
 
     let use_relay = ctx.options.relay && sender_caps.contains(PeerCaps::RELAY);
     let use_webrtc = ctx.options.webrtc && sender_caps.contains(PeerCaps::WEBRTC);

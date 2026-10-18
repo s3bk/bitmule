@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 use bitmule_client_native::rtc::{self, ChannelEvent, DataChannel};
 
-use super::{Options, Server, Span, dcproto, peer::PeerLink};
+use super::{OnSendEvent, Options, SendEvent, Server, Span, dcproto, peer::PeerLink};
 
 /// Size of one `InlineData` piece. Stays well below the server's
 /// WebSocket message limit.
@@ -40,6 +40,7 @@ pub struct Context {
     transfer: Arc<Transfer>,
     options: Options,
     relay: RelayTask,
+    events: OnSendEvent,
 }
 
 impl Context {
@@ -51,12 +52,14 @@ impl Context {
         manifest: TransferManifest,
         transfer: Transfer,
         options: Options,
+        events: OnSendEvent,
     ) -> Self {
         Context {
             server, our_id, session_id, relay_token, manifest,
             transfer: Arc::new(transfer),
             options,
             relay: RelayTask::default(),
+            events,
         }
     }
 }
@@ -89,8 +92,10 @@ struct Webrtc {
 }
 
 /// Serve one receiver until it says it is done.
-pub async fn serve_peer(ctx: Arc<Context>, peer_caps: PeerCaps, app: PeerLink, signaling: PeerLink) -> Result<()> {
+pub async fn serve_peer(ctx: Arc<Context>, id: ReceiverId, peer_caps: PeerCaps, app: PeerLink, signaling: PeerLink) -> Result<()> {
     let PeerLink { tx, mut rx } = app;
+    let receiver = id.as_hex().chars().take(8).collect::<String>();
+    (ctx.events)(SendEvent::Connected { receiver: receiver.clone() });
     let size = ctx.manifest.transfer_size;
     let mut signaling = Some(signaling);
     let mut webrtc: Option<Webrtc> = None;
@@ -132,8 +137,13 @@ pub async fn serve_peer(ctx: Arc<Context>, peer_caps: PeerCaps, app: PeerLink, s
                             pos += data.len() as u64;
                         }
                     }
-                    Peer2Peer::Complete => return Ok(()),
-                    Peer2Peer::Progress(_) => {}
+                    Peer2Peer::Complete => {
+                        (ctx.events)(SendEvent::Done { receiver });
+                        return Ok(());
+                    }
+                    Peer2Peer::Progress(bytes) => {
+                        (ctx.events)(SendEvent::Progress { receiver: receiver.clone(), bytes: bytes.min(size), total: size });
+                    }
                     _ => bail!("unexpected message from receiver"),
                 }
             }

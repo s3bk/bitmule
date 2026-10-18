@@ -417,15 +417,37 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
         return Ok(());
     }
     let server = parse_server(server);
-    v2::run_send(&server, manifest, transfer, v2::Options::from_mode(mode), |link| {
+    v2::run_send_events(&server, manifest, transfer, v2::Options::from_mode(mode), |link| {
         let url = server.share_url(link);
         println!("share:   {url}");
         if let Ok(qr) = QrCode::new(url.as_bytes()) {
             println!("{}", qr.render::<unicode::Dense1x2>().build());
         }
         println!("waiting for a receiver…");
-    }).await?;
+    }, std::sync::Arc::new(|event| {
+        use std::io::Write;
+        match event {
+            v2::SendEvent::Connected { receiver } => println!("receiver {receiver} connected"),
+            v2::SendEvent::Progress { receiver, bytes, total } => {
+                let pct = if total > 0 { bytes * 100 / total } else { 100 };
+                print!("\r  {receiver}: {pct:>3}%  {} / {}   ", human_bytes(bytes), human_bytes(total));
+                let _ = std::io::stdout().flush();
+            }
+            v2::SendEvent::Done { receiver } => println!("\r  {receiver}: done                                   "),
+        }
+    })).await?;
     Ok(())
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{n} B") } else { format!("{value:.1} {}", UNITS[unit]) }
 }
 
 async fn cmd_recv(

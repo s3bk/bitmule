@@ -36,6 +36,7 @@ pub async fn send(
     transfer: Transfer,
     options: Options,
     on_link: impl FnOnce(&ShareLink),
+    on_event: super::OnSendEvent,
 ) -> Result<()> {
     let share_key = ShareKey::random();
     let link = ShareLink::new(share_key.clone(), transfer.commitment());
@@ -44,7 +45,7 @@ pub async fn send(
     on_link(&link);
 
     let wire = Arc::new(peer::Wire { identity, session_id, to_server });
-    let ctx = Arc::new(send::Context::new(server.clone(), our_id, session_id, relay_token, manifest, transfer, options));
+    let ctx = Arc::new(send::Context::new(server.clone(), our_id, session_id, relay_token, manifest, transfer, options, on_event));
 
     // routes what the server says about a peer to that peer's worker
     let mut peers: HashMap<ReceiverId, mpsc::Sender<ServerToClient>> = HashMap::new();
@@ -66,7 +67,7 @@ pub async fn send(
                         let link = peer::spawn(wire.clone(), id, pub_key, peer_from_server);
                         let peer::Demuxed { app, signaling } = peer::demux(link);
                         let ctx = ctx.clone();
-                        workers.spawn(async move { (id, send::serve_peer(ctx, caps, app, signaling).await) });
+                        workers.spawn(async move { (id, send::serve_peer(ctx, id, caps, app, signaling).await) });
                     }
                     ServerToClient::Text(text) => println!("SERVER: {text:?}"),
                     ServerToClient::PeerMessage1 { from, .. } | ServerToClient::PeerMessage2 { from, .. } => {
@@ -286,5 +287,5 @@ pub async fn send_to_request(
     send(server, manifest, transfer, options, |link| {
         let _ = link_tx.send(link.clone());
         on_link(link);
-    }).await
+    }, Arc::new(|_| {})).await
 }
