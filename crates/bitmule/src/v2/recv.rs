@@ -728,6 +728,8 @@ async fn udp_download(
         UdpConfig {
             // Test aid: BITMULE_UDP_DROP=0.05 drops 5% of incoming data datagrams.
             drop: std::env::var("BITMULE_UDP_DROP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            // Test aid: BITMULE_UDP_MTU=1500 ignores longer datagrams, as a path with that MTU would.
+            max_datagram: std::env::var("BITMULE_UDP_MTU").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX),
             ..UdpConfig::default()
         }, BytesAssembler::new(),
     ).await?;

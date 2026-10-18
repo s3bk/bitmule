@@ -471,3 +471,14 @@ app link       -> transfer worker (v2/send.rs per receiver; v2/recv.rs)
   of reads already dropped with `Ignored(())`, freeing the buffer, msghdr and address the kernel was still to write.
   Fixed in `vendor/tokio-uring` (patched in the workspace); 60/60 clean runs afterwards, 0/60 failed with io_uring off before.
 - Not run: sudfa. The relay on artisan was not redeployed (ssh to it was refused in this session).
+
+### UDP to sudfa (2026-10-18)
+- First attempt: "no symbol over udp for 5 s". The sender's sends failed with EMSGSIZE: after the big (8972) DF probes the kernel had
+  cached a path MTU of 552 for the receiver's address (`ip route get` showed `mtu lock 552`, probably from an ICMP of a router on
+  the path), while the 1452 probe had passed before that ICMP arrived. Probing and sending now use `IP_PMTUDISC_PROBE` (DF set,
+  cached path MTU ignored), so only the device MTU and what the probes prove count.
+- After the fix, 100 MB sudfa -> here over `--udp-only` (path MTU 1500, 1445 bytes of symbol, six datagrams per symbol): 13.5 s
+  (7.1 MiB/s, hash matched). With 20% extra loss injected at the receiver: hash matched but 122 s (0.8 MiB/s): the rate control
+  recovers badly when real congestion loss is on top of steady loss. To look at.
+- `BITMULE_UDP_MTU=N` (recv.rs) ignores datagrams above N, to test fragment reassembly locally (works at 1480: 92 MiB/s on loopback).
+- `scripts/deploy.sh` (server deploy, sudfa test).

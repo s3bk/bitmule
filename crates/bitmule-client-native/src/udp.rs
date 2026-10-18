@@ -383,7 +383,7 @@ impl Wire<'_> {
 }
 
 /// Make the kernel refuse to fragment what this socket sends (and tell us when
-/// it is too big for the interface), so that a probe arrives only if the path
+/// it is too big for the interface, but not what it has learned from ICMP), so that a probe arrives only if the path
 /// carries it whole. False where that is not possible; then only the size that
 /// always worked is probed, since a big probe would pass in IP fragments.
 fn forbid_fragmentation(socket: &std::net::UdpSocket) -> bool {
@@ -395,7 +395,10 @@ fn forbid_fragmentation(socket: &std::net::UdpSocket) -> bool {
             Ok(_) => (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER),
             Err(_) => return false,
         };
-        let value: libc::c_int = libc::IP_PMTUDISC_DO;
+        // PROBE, not DO: DF is set, but the kernel's cached path MTU is ignored. A big probe can
+        // make a router answer with an ICMP that caches a bogus small MTU (552 seen), and then
+        // every send of the chosen size would fail with EMSGSIZE although the probe got through.
+        let value: libc::c_int = libc::IP_PMTUDISC_PROBE;
         let result = unsafe {
             libc::setsockopt(socket.as_raw_fd(), level, name, &value as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t)
         };
