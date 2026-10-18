@@ -157,6 +157,7 @@ pub async fn serve_peer(ctx: Arc<Context>, id: ReceiverId, peer_caps: PeerCaps, 
                         }
                         dcproto::Message::Data { .. } => bail!("receiver sent data"),
                     },
+                    Some(ChannelEvent::Segments(_)) => bail!("receiver sent a message in pieces"),
                     Some(ChannelEvent::Open) => {}
                     Some(ChannelEvent::Closed) | None => {
                         // the relay, if this receiver uses it, carries on without the channel

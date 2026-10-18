@@ -32,7 +32,7 @@ use str0m::{
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, warn};
 
-use crate::str0m_client::{SocketPool, build_rtc_with_pool_candidates, build_socket_pool_with};
+use crate::str0m_client::{SocketPool, build_rtc_with_delivery, build_socket_pool_with};
 
 #[derive(Debug)]
 pub enum ChannelEvent {
@@ -40,6 +40,8 @@ pub enum ChannelEvent {
     Open,
     /// A message from the other peer.
     Message(Bytes),
+    /// A message from the other peer, in the pieces it arrived in (the message is them joined).
+    Segments(Vec<Bytes>),
     /// The link is over (failed or closed). Nothing follows.
     Closed,
 }
@@ -86,7 +88,14 @@ pub async fn spawn(
     signal_rx: mpsc::Receiver<Peer2Peer>,
 ) -> Result<DataChannel> {
     let pool = build_socket_pool_with(stun).await?;
-    let rtc = build_rtc_with_pool_candidates(&pool);
+    // TEMP-INSTR: BITMULE_RX_MODE = merged (default: one slab buffer per message) | segments (the chunks
+    // as they arrived, written with one writev) | vec (str0m's Vec). Equal in speed and CPU, see docs/v2-status.md.
+    let delivery = match std::env::var("BITMULE_RX_MODE").as_deref() {
+        Ok("segments") => str0m::channel::Delivery::Segments,
+        Ok("vec") => str0m::channel::Delivery::Vec,
+        _ => str0m::channel::Delivery::Merged,
+    };
+    let rtc = build_rtc_with_delivery(&pool, delivery);
     let (send, send_rx) = mpsc::channel(SEND_QUEUE);
     let (events_tx, events) = mpsc::channel(EVENT_QUEUE);
     let task = tokio::spawn(async move {
@@ -316,6 +325,15 @@ impl Driver {
                 Output::Event(Event::ChannelData(data)) if Some(data.id) == self.channel => {
                     events.send(ChannelEvent::Message(Bytes::from(data.data))).await?;
                 }
+                Output::Event(Event::ChannelMessage(message)) if Some(message.id) == self.channel => {
+                    let mut parts = message.parts;
+                    let event = match parts.len() {
+                        0 => ChannelEvent::Message(Bytes::new()),
+                        1 => ChannelEvent::Message(parts.pop().unwrap()),
+                        _ => ChannelEvent::Segments(parts),
+                    };
+                    events.send(event).await?;
+                }
                 Output::Event(Event::ChannelClose(id)) if Some(id) == self.channel => {
                     bail!("data channel closed");
                 }
@@ -350,7 +368,7 @@ mod tests {
                 match next(channel).await {
                     ChannelEvent::Open => break,
                     ChannelEvent::Closed => panic!("closed before opening"),
-                    ChannelEvent::Message(_) => panic!("message before open"),
+                    ChannelEvent::Message(_) | ChannelEvent::Segments(_) => panic!("message before open"),
                 }
             }
         }

@@ -96,7 +96,7 @@ pub struct ChunkPayloadData {
     pub(crate) stream_identifier: u16,
     pub(crate) stream_sequence_number: u16,
     pub(crate) payload_type: PayloadProtocolIdentifier,
-    pub(crate) user_data: Bytes,
+    pub user_data: Bytes,
 
     /// Whether this data chunk was acknowledged (received by peer)
     pub(crate) acked: bool,

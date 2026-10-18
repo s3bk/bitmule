@@ -692,8 +692,13 @@ async fn send_mmsg(sock: &UdpSocket, batch: &[&(SocketAddr, SocketAddr, &[u8])])
 /// set of local candidates. `dispatch_pool_recv_to_rtcs` routes inbound
 /// packets to the owning Rtc via `Rtc::accepts()`.
 pub(crate) fn build_rtc_with_pool_candidates(pool: &SocketPool) -> Rtc {
+    build_rtc_with_delivery(pool, str0m::channel::Delivery::Vec)
+}
+
+/// As `build_rtc_with_pool_candidates`, with incoming data channel messages delivered as `delivery`.
+pub(crate) fn build_rtc_with_delivery(pool: &SocketPool, delivery: str0m::channel::Delivery) -> Rtc {
     let mtu = std::env::var("BITMULE_MTU").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(str0m::DATAGRAM_MTU_TARGET); // TEMP-INSTR
-    let mut rtc = str0m::RtcConfig::new().set_mtu(mtu..=usize::MAX).build(Instant::now());
+    let mut rtc = str0m::RtcConfig::new().set_mtu(mtu..=usize::MAX).set_channel_delivery(delivery).build(Instant::now());
     for addr in pool.bound_addrs() {
         match Candidate::host(addr, "udp") {
             Ok(c) => { rtc.add_local_candidate(c); }

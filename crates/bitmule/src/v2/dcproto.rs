@@ -72,6 +72,25 @@ impl Message {
     }
 }
 
+/// `Data` as it arrives in pieces (one per SCTP chunk): the offset, and the
+/// bytes after the 9 byte header, still in the memory they arrived in.
+pub fn data_parts(mut parts: Vec<Bytes>) -> Result<(u64, Vec<Bytes>)> {
+    use bytes::Buf;
+    // the first chunk holds the header unless it is tiny; then join them
+    if parts.first().is_none_or(|first| first.len() < 9) {
+        let joined: Bytes = parts.iter().flat_map(|p| p.iter().copied()).collect::<Vec<u8>>().into();
+        return match Message::decode(joined)? {
+            Message::Data { offset, bytes } => Ok((offset, vec![bytes])),
+            Message::Get { .. } => bail!("a Get where data was expected"),
+        };
+    }
+    ensure!(parts[0][0] == 2, "not a data message");
+    let offset = u64::from_le_bytes(parts[0][1..9].try_into().unwrap());
+    parts[0].advance(9);
+    parts.retain(|p| !p.is_empty());
+    Ok((offset, parts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -76,6 +76,41 @@ impl Context {
     }
 }
 
+/// What a data channel message carries: one piece, or the pieces it arrived in
+/// (written out one after the other, never joined).
+enum Payload {
+    One(Bytes),
+    Parts(Vec<Bytes>),
+}
+
+impl Payload {
+    fn len(&self) -> u64 {
+        match self {
+            Payload::One(bytes) => bytes.len() as u64,
+            Payload::Parts(parts) => parts.iter().map(|p| p.len() as u64).sum(),
+        }
+    }
+
+    fn copy_to(&self, out: &mut [u8]) {
+        let parts = match self {
+            Payload::One(bytes) => std::slice::from_ref(bytes),
+            Payload::Parts(parts) => &parts[..],
+        };
+        let mut at = 0;
+        for part in parts {
+            out[at..][..part.len()].copy_from_slice(part);
+            at += part.len();
+        }
+    }
+
+    async fn write(self, writer: &BlockWriter, offset: u64) -> std::io::Result<()> {
+        match self {
+            Payload::One(bytes) => writer.write_bytes(offset, bytes).await,
+            Payload::Parts(parts) => writer.write_parts(offset, parts).await,
+        }
+    }
+}
+
 /// How a relay download ended.
 enum RelayEnd {
     /// Every block is in the file.
@@ -258,12 +293,23 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
                             let _ = stop.send(());
                         }
                     }
-                    Some(ChannelEvent::Message(message)) => match dcproto::Message::decode(message)? {
-                        dcproto::Message::Data { offset, bytes } if data_channel_active && dc.current.is_some() => {
-                            let len = bytes.len() as u64;
+                    Some(event @ (ChannelEvent::Message(_) | ChannelEvent::Segments(_))) => {
+                        let (offset, payload) = match event {
+                            ChannelEvent::Message(message) => match dcproto::Message::decode(message)? {
+                                dcproto::Message::Data { offset, bytes } => (offset, Payload::One(bytes)),
+                                _ => bail!("unexpected data channel message"),
+                            },
+                            ChannelEvent::Segments(parts) => {
+                                let (offset, parts) = dcproto::data_parts(parts)?;
+                                (offset, Payload::Parts(parts))
+                            }
+                            _ => unreachable!(),
+                        };
+                        if data_channel_active && dc.current.is_some() {
+                            let len = payload.len();
                             ensure!(dc.accepts(offset, len), "sender sent data that was not asked for");
                             data_channel_time.mark();
-                            if let Some(mem) = mem.as_mut() { mem[offset as usize..][..bytes.len()].copy_from_slice(&bytes); } else { dc_writer.as_ref().unwrap().write_bytes(offset, bytes).await?; } // TEMP-INSTR
+                            if let Some(mem) = mem.as_mut() { payload.copy_to(&mut mem[offset as usize..]); } else { payload.write(dc_writer.as_ref().unwrap(), offset).await?; } // TEMP-INSTR
                             dc_bytes += len;
                             bump(len);
                             match dc.received(len) {
@@ -278,8 +324,10 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
                                 None => {}
                             }
                         }
-                        _ => bail!("unexpected data channel message"),
-                    },
+                        else {
+                            bail!("unexpected data channel message")
+                        }
+                    }
                     Some(ChannelEvent::Closed) | None => {
                         channel = None;
                         if data_channel_active {

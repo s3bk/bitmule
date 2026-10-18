@@ -63,6 +63,7 @@ pub(crate) struct RtcSctp {
     client: bool,
     remote_max_message_size: u32,
     snap_enabled: bool,
+    delivery: crate::channel::Delivery,
     snap_init: Option<SctpInitData>,
     #[cfg(test)]
     max_payload_size: usize,
@@ -160,6 +161,11 @@ pub(crate) enum SctpEvent {
         id: u16,
         binary: bool,
         data: Vec<u8>,
+    },
+    Message {
+        id: u16,
+        binary: bool,
+        parts: Vec<bytes::Bytes>,
     },
     BufferedAmountLow {
         id: u16,
@@ -320,6 +326,7 @@ impl RtcSctp {
             client: false,
             remote_max_message_size: DEFAULT_REMOTE_MAX_MESSAGE_SIZE,
             snap_enabled: false,
+            delivery: crate::channel::Delivery::default(),
             snap_init: None,
             #[cfg(test)]
             max_payload_size,
@@ -679,6 +686,10 @@ impl RtcSctp {
         Ok(stream.write_owned_with_ppi(buf, ppi)?)
     }
 
+    pub fn set_delivery(&mut self, delivery: crate::channel::Delivery) {
+        self.delivery = delivery;
+    }
+
     pub fn buffered_amount(&mut self, id: u16) -> usize {
         let Some(assoc) = self.assoc.as_mut() else {
             return 0;
@@ -700,10 +711,12 @@ impl RtcSctp {
     }
 
     pub fn handle_input(&mut self, now: Instant, data: &[u8]) {
-        trace!("Handle input: {}", data.len());
+        self.handle_input_bytes(now, data.to_vec().into());
+    }
 
-        // TODO, remove Bytes in sctp and just use &[u8].
-        let data = data.to_vec().into();
+    /// The packet as memory SCTP may keep slices of: nothing is copied.
+    pub fn handle_input_bytes(&mut self, now: Instant, data: bytes::Bytes) {
+        trace!("Handle input: {}", data.len());
         let r = self.endpoint.handle(now, self.fake_addr, None, None, data);
 
         let Some((handle, event)) = r else {
@@ -1050,22 +1063,36 @@ impl RtcSctp {
 
                     entry.buffered_threshold = BufferedThresholdConfig::Configured(x);
                 }
-                match stream_read_data(&mut stream) {
-                    Ok(Some((buf, ppi))) => {
+                match stream_read_data(&mut stream, self.delivery) {
+                    Ok(Some((read, ppi))) => {
                         if ppi != PayloadProtocolIdentifier::Dcep {
                             // This is the normal path for incoming data.
-                            let buf = ppi_adjust_buf(buf, ppi);
                             let binary = matches!(
                                 ppi,
                                 PayloadProtocolIdentifier::Binary
                                     | PayloadProtocolIdentifier::BinaryEmpty
                             );
-                            return Some(SctpEvent::Data {
-                                id: entry.id,
-                                binary,
-                                data: buf,
-                            });
+                            match read {
+                                Read::Vec(buf) => {
+                                    let buf = ppi_adjust_buf(buf, ppi);
+                                    return Some(SctpEvent::Data {
+                                        id: entry.id,
+                                        binary,
+                                        data: buf,
+                                    });
+                                }
+                                Read::Parts(parts) => {
+                                    return Some(SctpEvent::Message {
+                                        id: entry.id,
+                                        binary,
+                                        parts,
+                                    });
+                                }
+                            }
                         }
+                        let Read::Vec(buf) = read else {
+                            unreachable!("DCEP is always read into a Vec")
+                        };
 
                         // It's Dcep, either a DcepOpen or DcepAck.
                         match entry.state {
@@ -1292,14 +1319,51 @@ fn stream_entry<'a>(
     &mut entries[idx]
 }
 
+/// A message read from a stream.
+enum Read {
+    Vec(Vec<u8>),
+    /// The message is these concatenated.
+    Parts(Vec<bytes::Bytes>),
+}
+
 fn stream_read_data(
     stream: &mut Stream,
-) -> Result<Option<(Vec<u8>, PayloadProtocolIdentifier)>, SctpError> {
+    delivery: crate::channel::Delivery,
+) -> Result<Option<(Read, PayloadProtocolIdentifier)>, SctpError> {
+    use crate::channel::Delivery;
+
     let Some(chunks) = stream.read()? else {
         return Ok(None);
     };
 
     let n = chunks.len();
+
+    if delivery != Delivery::Vec {
+        match chunks.ppi {
+            PayloadProtocolIdentifier::String | PayloadProtocolIdentifier::Binary => {
+                let parts = if delivery == Delivery::Segments {
+                    chunks.chunks.iter().map(|c| c.user_data.clone()).collect()
+                } else if n <= crate::rxbuf::MESSAGE {
+                    let mut message = crate::rxbuf::messages().get();
+                    let l = chunks.read(&mut message.array_mut()[..n])?;
+                    assert!(l == n);
+                    message.set_len(n);
+                    vec![message.into_bytes()]
+                } else {
+                    let mut buf = vec![0; n];
+                    let l = chunks.read(&mut buf)?;
+                    assert!(l == n);
+                    vec![bytes::Bytes::from(buf)]
+                };
+                return Ok(Some((Read::Parts(parts), chunks.ppi)));
+            }
+            PayloadProtocolIdentifier::StringEmpty | PayloadProtocolIdentifier::BinaryEmpty => {
+                return Ok(Some((Read::Parts(Vec::new()), chunks.ppi)));
+            }
+            _ => {} // DCEP and the unknown: as before
+        }
+    }
+
     let mut buf = vec![0; n];
 
     let l = chunks.read(&mut buf)?;
@@ -1316,7 +1380,7 @@ fn stream_read_data(
         }
     }
 
-    Ok(Some((buf, chunks.ppi)))
+    Ok(Some((Read::Vec(buf), chunks.ppi)))
 }
 
 fn ppi_adjust_buf(mut buf: Vec<u8>, ppi: PayloadProtocolIdentifier) -> Vec<u8> {
@@ -1349,6 +1413,12 @@ impl fmt::Debug for SctpEvent {
             Self::StreamResetComplete { id } => f
                 .debug_struct("StreamResetComplete")
                 .field("id", id)
+                .finish(),
+            Self::Message { id, binary, parts } => f
+                .debug_struct("Message")
+                .field("id", id)
+                .field("binary", binary)
+                .field("parts", &parts.len())
                 .finish(),
             Self::Data { id, binary, data } => f
                 .debug_struct("Data")

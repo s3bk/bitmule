@@ -163,19 +163,15 @@ fn read_ranges_blocking(
 enum WriteJob {
     Block(DecodedBlock),
     Bytes { offset: u64, data: bytes::Bytes },
+    /// Consecutive pieces from `offset` on.
+    Parts { offset: u64, parts: Vec<bytes::Bytes> },
 }
 
 impl WriteJob {
     fn offset(&self) -> u64 {
         match self {
             WriteJob::Block(block) => block.offset(),
-            WriteJob::Bytes { offset, .. } => *offset,
-        }
-    }
-    fn data(&self) -> &[u8] {
-        match self {
-            WriteJob::Block(block) => block.data(),
-            WriteJob::Bytes { data, .. } => data,
+            WriteJob::Bytes { offset, .. } | WriteJob::Parts { offset, .. } => *offset,
         }
     }
 }
@@ -212,6 +208,12 @@ impl BlockWriter {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "block writer stopped"))
     }
 
+    /// Queue consecutive pieces for `offset` on, as they are (no copy to join them).
+    pub async fn write_parts(&self, offset: u64, parts: Vec<bytes::Bytes>) -> io::Result<()> {
+        self.tx.send(WriteJob::Parts { offset, parts }).await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "block writer stopped"))
+    }
+
     /// Wait until everything queued is written.
     pub fn finish(self) -> io::Result<()> {
         drop(self.tx);
@@ -221,7 +223,17 @@ impl BlockWriter {
 
 fn write_blocks_blocking(file: Arc<File>, mut rx: mpsc::Receiver<WriteJob>) -> io::Result<()> {
     while let Some(job) = rx.blocking_recv() {
-        write_all_at(&file, job.data(), job.offset())?;
+        match &job {
+            WriteJob::Block(block) => write_all_at(&file, block.data(), job.offset())?,
+            WriteJob::Bytes { data, .. } => write_all_at(&file, data, job.offset())?,
+            WriteJob::Parts { parts, .. } => {
+                let mut at = job.offset();
+                for part in parts {
+                    write_all_at(&file, part, at)?;
+                    at += part.len() as u64;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -649,6 +661,11 @@ mod uring {
                             }
                             WriteJob::Bytes { data, .. } => {
                                 pending.push(file.write_all_at(UringBytes(data), offset).map(|(result, _buf)| result).boxed_local());
+                            }
+                            WriteJob::Parts { parts, .. } => {
+                                // one vectored write for all the pieces
+                                let bufs: Vec<_> = parts.into_iter().map(UringBytes).collect();
+                                pending.push(file.writev_at_all(bufs, Some(offset)).map(|(result, _bufs)| result.map(|_| ())).boxed_local());
                             }
                         }
                         // as in the demo: keep a bounded number in flight

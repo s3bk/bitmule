@@ -36,6 +36,15 @@ in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData
 - DONE (stage 1): `Channel::write_bytes(Bytes)` -> `Sctp::write_bytes` -> `Stream::write_owned_with_ppi` with `OwnedBytes`
   (slices, no `to_owned`); used by `rtc.rs`. One copy fewer; throughput unchanged (copies are not the bottleneck: 64 MB memcpy
   is a few ms against 1.5 s).
+- DONE (receive experiment, `BITMULE_RX_MODE`): the decrypted packet is now a slab buffer (`vendor/str0m/src/rxbuf.rs`, polled straight
+  into it, handed to SCTP as `Bytes`: no `to_vec`). `RtcConfig::set_channel_delivery(Delivery)`:
+  `Vec` (old `Event::ChannelData`), `Merged` (the chunks copied into ONE slab buffer, `Event::ChannelMessage`, default in bitmule)
+  and `Segments` (one part per SCTP chunk, slices of the decrypted packets; the receiver writes them with one `writev_at_all`,
+  `BlockWriter::write_parts`). Compared interleaved, 6 runs each, 256 MiB over loopback, release: all three the same,
+  42.0 / 43.1 / 42.6 MiB/s (vec / merged / segments) and receiver CPU 8.97 / 8.98 / 8.96 s. An earlier version of segments with one
+  write per chunk cost about 15% more CPU (14 small writes per message). Conclusion: the copies are not what the receiver spends
+  its CPU on. perf of the receiver (35 ms CPU per MiB): 54% kernel, threads: tokio worker 51%, pool-uring 41%, writer 2%.
+  The remaining copies (dimpl input copy and `poll_output` copy) need the dimpl fork.
 - NEXT stages all need forks: `dimpl` 0.7.3 (record creation straight into a caller buffer with headroom for header/nonce and
   room for the tag, encrypt in place; DTLS 1.2 and 1.3), `str0m-proto` (`DatagramSend` / `DatagramRecv` as owned `Bytes`), sctp-proto
   (marshal into that buffer; keep reassembled messages as `Bytes` segments), str0m glue (buffer allocator hook so the datagram

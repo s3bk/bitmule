@@ -35,6 +35,31 @@ pub struct ChannelData {
     pub data: Vec<u8>,
 }
 
+/// How incoming data channel messages are delivered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Delivery {
+    /// [`Event::ChannelData`][crate::Event::ChannelData], the message in a `Vec`.
+    #[default]
+    Vec,
+    /// [`Event::ChannelMessage`][crate::Event::ChannelMessage], one part: the chunks
+    /// copied together into one pooled buffer.
+    Merged,
+    /// [`Event::ChannelMessage`][crate::Event::ChannelMessage], one part per SCTP chunk:
+    /// slices of the decrypted packets, nothing copied.
+    Segments,
+}
+
+/// A data channel message as the memory it arrived in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelMessage {
+    /// The channel the message arrived on.
+    pub id: ChannelId,
+    /// Whether it was sent as binary or text.
+    pub binary: bool,
+    /// The message is these concatenated (none if it is empty).
+    pub parts: Vec<bytes::Bytes>,
+}
+
 /// Channel for sending data to the remote peer.
 ///
 /// Get this handle from [`Rtc::channel()`][crate::Rtc::channel()].

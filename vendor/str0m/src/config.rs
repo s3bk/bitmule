@@ -53,6 +53,7 @@ pub struct RtcConfig {
     pub(crate) dtls_version: DtlsVersion,
     pub(crate) vp9_packetizer_mode: Vp9PacketizerMode,
     pub(crate) snap_enabled: bool,
+    pub(crate) channel_delivery: crate::channel::Delivery,
     pub(crate) mtu: RangeInclusive<usize>,
 }
 
@@ -630,6 +631,12 @@ impl RtcConfig {
         self
     }
 
+    /// How incoming data channel messages are delivered (default: in a `Vec`).
+    pub fn set_channel_delivery(mut self, delivery: crate::channel::Delivery) -> Self {
+        self.channel_delivery = delivery;
+        self
+    }
+
     /// Enable SNAP (SCTP Negotiation Acceleration Protocol).
     ///
     /// When enabled, the `a=sctp-init` attribute is included in outgoing SDP
@@ -775,6 +782,7 @@ impl Default for RtcConfig {
             dtls_version: DtlsVersion::Dtls12,
             vp9_packetizer_mode: Vp9PacketizerMode::default(),
             snap_enabled: false,
+            channel_delivery: crate::channel::Delivery::default(),
             mtu: DATAGRAM_MTU_TARGET..=DATAGRAM_MTU_WARN,
         }
     }
