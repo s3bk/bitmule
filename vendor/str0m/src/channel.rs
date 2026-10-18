@@ -75,6 +75,21 @@ impl<'a> Channel<'a> {
         Ok(true)
     }
 
+    /// Like `write`, but takes the data over: SCTP sends slices of it, so it is not copied.
+    #[must_use = "Whether the buffer was accepted by the write()"]
+    pub fn write_bytes(&mut self, binary: bool, buf: bytes::Bytes) -> Result<bool, RtcError> {
+        let available = self.rtc.sctp.available();
+        if buf.len() > available {
+            return Ok(false);
+        }
+
+        let len = buf.len();
+        let written = self.rtc.sctp.write_bytes(self.sctp_stream_id, binary, buf)?;
+        assert_eq!(written, len, "Data channel write_bytes() less than entire buffer");
+
+        Ok(true)
+    }
+
     /// Get the amount of buffered data.
     ///
     /// Returns 0 if the channel is closed or encountered some error. This is to

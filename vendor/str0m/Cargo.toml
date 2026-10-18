@@ -340,6 +340,9 @@ path = "tests/vla.rs"
 [dependencies.arrayvec]
 version = "0.7.6"
 
+[dependencies.bytes]
+version = "1"
+
 [dependencies.base64ct]
 version = "1"
 

@@ -650,6 +650,35 @@ impl RtcSctp {
         Ok(stream.write_with_ppi(buf, ppi)?)
     }
 
+    /// Like `write`, but takes the data over instead of copying it.
+    pub fn write_bytes(&mut self, id: u16, binary: bool, buf: bytes::Bytes) -> Result<usize, SctpError> {
+        if self.state != RtcSctpState::Established || self.is_closing() || self.is_closed() {
+            return Err(SctpError::WriteBeforeEstablished);
+        }
+
+        let assoc = self
+            .assoc
+            .as_mut()
+            .ok_or(SctpError::WriteBeforeEstablished)?;
+
+        let rec = entry_by_id(&self.entries, id).expect("stream entry for write");
+
+        if rec.state != StreamEntryState::Open {
+            return Err(SctpError::WriteBeforeEstablished);
+        }
+
+        let mut stream = assoc.stream(id)?;
+
+        let ppi = match (binary, buf.is_empty()) {
+            (true, true) => PayloadProtocolIdentifier::BinaryEmpty,
+            (true, false) => PayloadProtocolIdentifier::Binary,
+            (false, true) => PayloadProtocolIdentifier::StringEmpty,
+            (false, false) => PayloadProtocolIdentifier::String,
+        };
+
+        Ok(stream.write_owned_with_ppi(buf, ppi)?)
+    }
+
     pub fn buffered_amount(&mut self, id: u16) -> usize {
         let Some(assoc) = self.assoc.as_mut() else {
             return 0;

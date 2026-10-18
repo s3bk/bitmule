@@ -27,6 +27,23 @@ Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update al
   block hashes; no SAS / revocation of the link; `bitmule-server-signal-ws` does not compile (stale v1 crate, untouched);
   axum 0.8 and rand 0.9 migrations would remove more duplicates.
 
+## Zero-copy WebRTC data channel (2026-10-18, in progress)
+Goal (user): send = one copy, done by the encryption step, from the dcproto message into the io_uring send buffer; receive = one
+copy, into a slab-allocated `ChannelData` buffer. Today (traced in `vendor/`): send has about six copies per byte
+(dcproto message, `ByteSlice::pop_chunk` `to_owned`, SCTP `marshal_to`, dimpl fragment buffer, dimpl queue_tx record, `poll_output`
+into buf, `DatagramSend` `to_vec`, then the pooled `Buf` for io_uring); receive: pooled recv buf -> dimpl input buffer -> decrypt
+in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData.data`.
+- DONE (stage 1): `Channel::write_bytes(Bytes)` -> `Sctp::write_bytes` -> `Stream::write_owned_with_ppi` with `OwnedBytes`
+  (slices, no `to_owned`); used by `rtc.rs`. One copy fewer; throughput unchanged (copies are not the bottleneck: 64 MB memcpy
+  is a few ms against 1.5 s).
+- NEXT stages all need forks: `dimpl` 0.7.3 (record creation straight into a caller buffer with headroom for header/nonce and
+  room for the tag, encrypt in place; DTLS 1.2 and 1.3), `str0m-proto` (`DatagramSend` / `DatagramRecv` as owned `Bytes`), sctp-proto
+  (marshal into that buffer; keep reassembled messages as `Bytes` segments), str0m glue (buffer allocator hook so the datagram
+  buffer is a slab `Buf` of the socket pool).
+- Receive cannot copy "at the decrypt step into ChannelData": the SCTP header that says where a chunk belongs is inside the
+  ciphertext, and a message spans many datagrams. Plan: decrypt in place in the (slab) receive buffer, parse SCTP as `Bytes`
+  slices of it, and make `ChannelData` a list of those slices (or one copy at reassembly into a slab buffer).
+
 ## Path MTU discovery for the UDP symbol path (2026-10-18)
 - `udp.rs`: after HELLO/ACK, `discover_mtu`. The sender seals a `PROBE` of every size in `MTU_LADDER` (8972 jumbo, 1472, 1452,
   1432, 1400, 1280, 1232, 1194), the receiver echoes the size it saw (`PROBE_ACK`), the sender takes the largest answered

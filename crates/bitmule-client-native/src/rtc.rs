@@ -218,7 +218,7 @@ async fn run(
         if let (Some(buf), true) = (&unsent, d.open) {
             let id = d.channel.expect("open implies a channel");
             let accepted = d.rtc.channel(id).ok_or_else(|| anyhow!("channel gone"))?
-                .write(true, buf).map_err(|e| anyhow!("channel write: {e}"))?;
+                .write_bytes(true, buf.clone()).map_err(|e| anyhow!("channel write: {e}"))?;
             if accepted {
                 unsent = None;
                 continue; // drain after every mutation

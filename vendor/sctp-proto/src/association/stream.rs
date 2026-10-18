@@ -192,6 +192,14 @@ impl<'a> Stream<'a> {
         self.write_source(&mut ByteSlice::from_slice(data), ppi)
     }
 
+    /// Send `data` with a specific payload protocol, taking it over: the
+    /// chunks sent are slices of it, so it is not copied.
+    ///
+    /// Returns the number of bytes successfully written.
+    pub fn write_owned_with_ppi(&mut self, data: Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
+        self.write_source(&mut crate::util::OwnedBytes(data), ppi)
+    }
+
     /// write writes len(p) bytes from p with the default Payload Protocol Identifier
     pub fn write_chunk(&mut self, p: &Bytes) -> Result<usize> {
         self.write_source(

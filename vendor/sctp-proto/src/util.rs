@@ -196,6 +196,28 @@ impl<'a> BytesSource for ByteSlice<'a> {
     }
 }
 
+/// One `Bytes` as a source: the chunks are slices of it, nothing is copied.
+pub struct OwnedBytes(pub Bytes);
+
+impl BytesSource for OwnedBytes {
+    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
+        let limit = limit.min(self.0.len());
+        if limit == 0 {
+            return (Bytes::new(), 0);
+        }
+        let chunk = self.0.split_to(limit);
+        (chunk, usize::from(self.0.is_empty()))
+    }
+
+    fn has_remaining(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    fn remaining(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// A source of one or more buffers which can be converted into `Bytes` buffers on demand
 ///
 /// The purpose of this data type is to defer conversion as long as possible,
