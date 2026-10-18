@@ -21,9 +21,17 @@ use crate::{
 };
 
 /// Reads outstanding per socket.
-const RECV_INFLIGHT: usize = 1024;
+// Not more: with hundreds outstanding the completions come back out of order, which SCTP
+// takes for loss (T3 timeouts; 12 MiB/s against 43 with 64, 64 MB over loopback).
+const RECV_INFLIGHT_DEFAULT: usize = 64;
 /// Datagrams the thread may have handed to the kernel and not yet seen complete.
-const SEND_INFLIGHT: usize = 2048;
+const SEND_INFLIGHT_DEFAULT: usize = 2048;
+
+fn knob(name: &str, default: usize) -> usize { // TEMP-INSTR
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+fn recv_inflight() -> usize { knob("BITMULE_URING_RECV", RECV_INFLIGHT_DEFAULT) } // TEMP-INSTR
+fn send_inflight() -> usize { knob("BITMULE_URING_SEND", SEND_INFLIGHT_DEFAULT) } // TEMP-INSTR
 /// Batches waiting for the thread.
 const BATCHES_QUEUED: usize = 1024;
 
@@ -37,7 +45,7 @@ pub(crate) struct Outgoing {
 /// The buffers outgoing datagrams are copied into: one slab, made on first use.
 pub(crate) fn buffers() -> &'static Arc<Pool<DATAGRAM_MAX>> {
     static POOL: OnceLock<Arc<Pool<DATAGRAM_MAX>>> = OnceLock::new();
-    POOL.get_or_init(|| Pool::slab(SEND_INFLIGHT * 2))
+    POOL.get_or_init(|| Pool::slab(send_inflight() * 2))
 }
 
 pub(crate) struct Started {
@@ -64,20 +72,20 @@ async fn run(
     mut outgoing: mpsc::Receiver<Vec<Outgoing>>,
 ) {
     // the reads in flight, and what waits in the peers' queues
-    let received = Pool::<DATAGRAM_MAX>::slab(sockets.len() * RECV_INFLIGHT + 2048);
+    let received = Pool::<DATAGRAM_MAX>::slab(sockets.len() * recv_inflight() + 2048);
     let mut by_ip = HashMap::new();
     for (ip, socket, local) in sockets {
         let socket = Rc::new(UdpSocket::from_std(socket));
-        for _ in 0..RECV_INFLIGHT {
+        for _ in 0..recv_inflight() {
             tokio_uring::spawn(read(socket.clone(), local, received.clone(), peers.clone(), unclaimed.clone()));
         }
         by_ip.insert(ip, socket);
     }
 
-    let permits = Arc::new(Semaphore::new(SEND_INFLIGHT));
+    let permits = Arc::new(Semaphore::new(send_inflight()));
     while let Some(batch) = outgoing.recv().await {
         // a batch larger than the whole allowance still goes (alone)
-        let wanted = batch.len().clamp(1, SEND_INFLIGHT) as u32;
+        let wanted = batch.len().clamp(1, send_inflight()) as u32;
         let Ok(permit) = permits.clone().acquire_many_owned(wanted).await else { return };
         let sends: Vec<_> = batch.into_iter().filter_map(|out| {
             let socket = by_ip.get(&out.socket)?.clone();
