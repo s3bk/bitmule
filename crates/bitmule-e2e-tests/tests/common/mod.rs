@@ -142,7 +142,7 @@ async fn wait_for_tcp(addr: &str, timeout: Duration) -> Result<()> {
 pub fn random_size_bytes() -> usize {
     let mut rng = rand::thread_rng();
     let n: u32 = rng.gen_range(4..=7);
-    let scale: f64 = 1.0 + rng.gen::<f64>();
+    let scale: f64 = 1.0 + rng.r#gen::<f64>();
     (scale * (1u64 << n) as f64 * 1024.0) as usize
 }
 

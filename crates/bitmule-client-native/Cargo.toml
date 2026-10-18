@@ -27,7 +27,7 @@ tungstenite = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { workspace = true }
-str0m = { version = "0.23", default-features = false }
+str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 mdns = "3.0.0"
 x25519-dalek.workspace = true
 sha2.workspace = true
@@ -46,6 +46,10 @@ futures = { workspace = true }
 bitvec = { workspace = true }
 zstd = "0.14.0"
 postcard = { workspace = true, features = ["use-std"] }
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # version pins
 dimpl =  { version = "0.7.3", default-features = false }

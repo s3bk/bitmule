@@ -1,0 +1,71 @@
+//! What travels over the WebRTC data channel, once it is open.
+//!
+//! The channel is reliable and ordered, and DTLS encrypts it, so the file's
+//! bytes go over it as they are. The receiver asks for a range and the sender
+//! answers with the range cut into pieces.
+//!
+//! `Get`:  `1 | start: u64 LE | end: u64 LE`
+//! `Data`: `2 | offset: u64 LE | bytes`
+
+use anyhow::{Result, bail, ensure};
+use bytes::{BufMut, Bytes, BytesMut};
+
+/// File bytes per `Data` message; small enough for every WebRTC stack.
+pub const PIECE: usize = 16 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Message {
+    Get { start: u64, end: u64 },
+    Data { offset: u64, bytes: Bytes },
+}
+
+impl Message {
+    pub fn encode(&self) -> Bytes {
+        let mut out = BytesMut::new();
+        match self {
+            Message::Get { start, end } => {
+                out.put_u8(1);
+                out.put_u64_le(*start);
+                out.put_u64_le(*end);
+            }
+            Message::Data { offset, bytes } => {
+                out.reserve(9 + bytes.len());
+                out.put_u8(2);
+                out.put_u64_le(*offset);
+                out.put_slice(bytes);
+            }
+        }
+        out.freeze()
+    }
+
+    pub fn decode(message: Bytes) -> Result<Self> {
+        ensure!(message.len() >= 9, "short data channel message");
+        let number = |at: usize| u64::from_le_bytes(message[at..at + 8].try_into().unwrap());
+        match message[0] {
+            1 => {
+                ensure!(message.len() == 17, "bad Get message");
+                Ok(Message::Get { start: number(1), end: number(9) })
+            }
+            2 => Ok(Message::Data { offset: number(1), bytes: message.slice(9..) }),
+            tag => bail!("unknown data channel message {tag}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_survive_the_wire() {
+        for m in [
+            Message::Get { start: 3, end: 1 << 40 },
+            Message::Data { offset: 77, bytes: Bytes::from_static(b"hello") },
+            Message::Data { offset: 0, bytes: Bytes::new() },
+        ] {
+            assert_eq!(Message::decode(m.encode()).unwrap(), m);
+        }
+        assert!(Message::decode(Bytes::from_static(b"\x09abcdefgh")).is_err());
+        assert!(Message::decode(Bytes::from_static(b"\x01")).is_err());
+    }
+}

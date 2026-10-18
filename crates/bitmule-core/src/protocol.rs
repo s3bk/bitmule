@@ -18,6 +18,46 @@ pub struct SessionId(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct ReceiverId(pub [u8; 32]);
 
+/// Server-issued secret handed to a peer in its `SessionCreated` /
+/// `SessionJoined` reply. Used as a reconnect token (owner regains its id)
+/// and as a relay token (authorizes the relay GET/POST for that peer).
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct Token(pub [u8; 16]);
+
+impl Token {
+    pub fn random() -> Self {
+        let mut buf = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        Self(buf)
+    }
+
+    pub fn as_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self, Error> {
+        let v = hex::decode(s).map_err(|e| Error::Protocol(format!("token hex: {e}")))?;
+        let buf: [u8; 16] = v.try_into().map_err(|v: Vec<u8>| {
+            Error::Protocol(format!("token must be 16 bytes, got {}", v.len()))
+        })?;
+        Ok(Self(buf))
+    }
+}
+
+impl PartialEq for Token {
+    /// Constant time.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().zip(&other.0).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
+    }
+}
+impl Eq for Token {}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
+}
+
 impl SessionId {
     pub const SIZE: usize = 32;
     pub fn random() -> Self {
@@ -145,12 +185,8 @@ pub mod relay_frame {
     #[repr(u8)]
     pub enum FrameType {
         Data = 1,
-        SelectionUpdate = 2,
-        RoutingUpdate = 3,
     }
     pub const F_DATA: u8 = FrameType::Data as u8;
-    pub const F_SELECTION_UPDATE: u8 = FrameType::SelectionUpdate as u8;
-    pub const F_ROUTING_UPDATE: u8 = FrameType::RoutingUpdate as u8;
 
     pub type FrameSize = u16;
     pub const FRAME_SIZE_BYTES: usize = size_of::<FrameSize>();
@@ -162,10 +198,10 @@ pub mod websocket {
 
     use bitmule_crypto::BulkKey;
 use serde::{Deserialize, Serialize};
-    use crate::{ContentKey, ReceiverId, SessionId, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
+    use crate::{ContentKey, ReceiverId, SessionId, Token, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
 
     bitflags! {
-        #[derive(Serialize, Deserialize, Clone)]
+        #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
         pub struct PeerCaps: u8 {
             const RELAY = 1;
             const WEBRTC = 2;
@@ -211,18 +247,28 @@ use serde::{Deserialize, Serialize};
         // just display it or ignore it
         Text(String),
 
-        SessionCreated,
+        // reply to CreateSession. To reconnect as owner after a dropped
+        // connection, pass `reconnect_token` as `?token=` to /ws/create.
+        // `relay_token` authorizes the relay POST (`?token=`).
+        SessionCreated {
+            reconnect_token: Token,
+            relay_token: Token,
+        },
         // we just joined a session, here is the info of the session owner
         SessionJoined {
+            // authorizes the relay GET (`?token=`)
+            relay_token: Token,
             sender_id: ReceiverId,
             sender_pub_key: PublicKey,
             sender_mac: SessionMac,
+            sender_caps: PeerCaps,
         },
         // a peer has joined a session that we created
         PeerJoined {
             id: ReceiverId,
             pub_key: PublicKey,
             mac: SessionMac,
+            caps: PeerCaps,
         },
         // someone sent us a message
         PeerMessage1 {

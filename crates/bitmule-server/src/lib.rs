@@ -23,6 +23,7 @@ pub mod room;
 pub mod state;
 pub mod ws;
 pub mod relay2;
+pub mod stun;
 
 use rand::Rng;
 pub use room::{Role, Room};
@@ -30,9 +31,9 @@ use serde::{Deserialize, Serialize};
 pub use state::AppState;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
-struct Difficulty(u8);
+pub struct Difficulty(u8);
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-struct Magic(u32);
+pub struct Magic(u32);
 impl Magic {
     pub fn new(n: u32) -> Option<Self> {
         if n < (1<<28) {
@@ -42,7 +43,7 @@ impl Magic {
         }
     }
     pub fn random(rng: &mut impl Rng) -> Self {
-        Magic(rng.r#gen::<u32>() & (1 << 28 - 1))
+        Magic(rng.r#gen::<u32>() & ((1 << 28) - 1))
     }
 }
 fn encode_difficulty_and_magic(diffficulty: Difficulty, magic1: Magic, magic2: Magic) -> u64 {
@@ -51,7 +52,18 @@ fn encode_difficulty_and_magic(diffficulty: Difficulty, magic1: Magic, magic2: M
 fn decode_difficulty_and_magic(n: u64) -> (Difficulty, Magic, Magic) {
     (
         Difficulty((n >> 56) as u8),
-        Magic(((n >> 28) & (1<<28 - 1)) as u32),
-        Magic((n & (1<<28 - 1)) as u32)
+        Magic(((n >> 28) & ((1 << 28) - 1)) as u32),
+        Magic((n & ((1 << 28) - 1)) as u32)
     )
+}
+
+/// All HTTP/WS routes, without the static-file fallback.
+pub fn router(state: std::sync::Arc<AppState>) -> axum::Router {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/pow", get(ws::pow_challenge))
+        .route("/ws/join", get(ws::ws_join_session))
+        .route("/ws/create", get(ws::ws_create_session))
+        .route("/session/:sess/:receiver_id", post(relay2::post).get(relay2::get))
+        .with_state(state)
 }

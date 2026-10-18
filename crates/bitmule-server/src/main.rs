@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use bitmule_server::{relay2, state::AppState, ws::{ws_create_session, ws_join_session}};
+use bitmule_server::{relay2, state::AppState, ws::{pow_challenge, ws_create_session, ws_join_session}};
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::services::{ServeDir, ServeFile};
@@ -31,6 +31,15 @@ struct Args {
     /// as the signaling + relay endpoints.
     #[arg(long)]
     web_dir: Option<PathBuf>,
+
+    /// UDP address of the STUN server, which tells clients their public
+    /// address for WebRTC.
+    #[arg(long, default_value = "0.0.0.0:3478")]
+    stun_bind: SocketAddr,
+
+    /// Do not run the STUN server.
+    #[arg(long)]
+    no_stun: bool,
 }
 
 #[tokio::main]
@@ -44,12 +53,30 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let state = Arc::new(AppState::new());
+    {
+        // rotate the PoW magic; the previous one stays valid for one more period
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                state.rotate_magic();
+            }
+        });
+    }
 
-    let mut app = Router::new()
-        .route("/ws/join", get(ws_join_session))
-        .route("/ws/create", get(ws_create_session))
-        .route("/session/:sess/:receiver_id", post(relay2::post).get(relay2::get))
-        .with_state(state);
+    if !args.no_stun {
+        match tokio::net::UdpSocket::bind(args.stun_bind).await {
+            Ok(socket) => {
+                info!(bind = %args.stun_bind, "stun up");
+                tokio::spawn(bitmule_server::stun::serve(socket));
+            }
+            Err(e) => tracing::warn!("stun disabled, cannot bind {}: {e}", args.stun_bind),
+        }
+    }
+
+    let mut app = bitmule_server::router(state);
 
     // If --web-dir is set, mount a static-file fallback for everything
     // else. ServeDir serves index.html for `/` automatically and 404s

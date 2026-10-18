@@ -9,7 +9,7 @@
 //! last peer disconnects. State that must survive restart (chunks, delivery
 //! ledger, quota) lives in the [`bitmule_core::traits::ChunkStore`].
 
-use bitmule_core::{ReceiverId, crypto::{PublicKey, SessionMac}, protocol::websocket::{PeerCaps, ServerToClient}};
+use bitmule_core::{ReceiverId, Token, crypto::{PublicKey, SessionMac}, protocol::websocket::{PeerCaps, ServerToClient}};
 use bytes::Bytes;
 use std::collections::HashMap;
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -31,6 +31,10 @@ pub struct PeerEntry {
     pub caps: PeerCaps,
     pub pub_key: PublicKey,
     pub mac: SessionMac,
+    /// Lets the owner regain its id after a dropped connection.
+    pub reconnect_token: Token,
+    /// Authorizes this peer's relay GET/POST.
+    pub relay_token: Token,
 }
 
 /// One session's live signaling state.

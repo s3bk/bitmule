@@ -3,6 +3,9 @@ use std::io;
 use async_zip::error::ZipError;
 
 pub mod transfer;
+pub mod fountain;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod blockio;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 pub mod fs;

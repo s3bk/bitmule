@@ -124,7 +124,7 @@ async fn encoder_task(
 
 /// Independent iid loss. Returns true if the packet should be dropped.
 fn should_drop(loss: f64, rng: &mut impl Rng) -> bool {
-    loss > 0.0 && rng.gen::<f64>() < loss
+    loss > 0.0 && rng.r#gen::<f64>() < loss
 }
 
 async fn decoder_task(

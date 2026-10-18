@@ -14,12 +14,20 @@ async_zip = { version = "0.0.19", features = ["zstd"] }
 futures-lite = "2"
 async-trait = { workspace = true }
 bytes = { workspace = true }
+crossbeam-queue = "0.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+raptorq = { git = "https://github.com/s3bk/raptorq" }
 uuid = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt", "sync", "macros"] }
+futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 tempfile = "3"
+
+# io_uring file I/O, as in raptor-demo
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = "0.5.0"
 
 # Wasm-only: web bindings for OPFS (async main-thread + sync worker-scope).
 [target.'cfg(target_arch = "wasm32")'.dependencies]

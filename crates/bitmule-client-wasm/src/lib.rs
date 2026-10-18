@@ -68,7 +68,7 @@ impl ShareKey {
         let arr: [u8; 32] = pub_bytes
             .try_into()
             .map_err(|_| JsError::new("mac_ephemeral_pub: pub_bytes must be 32 bytes"))?;
-        Ok(self.0.mac_ephemeral_pub(&arr).to_vec())
+        Ok(self.0.mac_ephemeral_pub(&bx::PublicKey(arr)).0.to_vec())
     }
 }
 
@@ -129,7 +129,7 @@ impl Ephemeral {
             .0
             .as_ref()
             .ok_or_else(|| JsError::new("Ephemeral already consumed"))?;
-        Ok(inner.public_keypublic_key().to_vec())
+        Ok(inner.public_keypublic_key().0.to_vec())
     }
 
     /// Derive the shared secret with the peer's public bytes. Consumes
@@ -144,7 +144,7 @@ impl Ephemeral {
             .0
             .take()
             .ok_or_else(|| JsError::new("Ephemeral already consumed"))?;
-        eph.derive_shared_secret(&arr)
+        eph.derive_shared_secret(&bx::PublicKey(arr))
             .map(SessionKey)
             .map_err(|e| JsError::new(&format!("{e}")))
     }

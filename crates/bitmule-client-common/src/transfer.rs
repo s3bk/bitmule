@@ -74,7 +74,7 @@ impl TransferBuilder {
 
         let manifest = TransferManifest {
             transfer_typ,
-            block_size: 1024 * 1024, // 1 MiB relay chunks — matches BulkKey chunk-nonce assumption
+            block_size: crate::fountain::BLOCK_PLAIN as u32,
             transfer_size,
             bulk_key: bulk_key.clone(),
         };
@@ -98,6 +98,43 @@ pub struct Transfer {
     data: PreparedFile,
     bulk_key: BulkKey,
     commitment: [u8; 32],
+}
+
+impl Transfer {
+    /// Where the data to send is staged.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn path(&self) -> &std::path::Path {
+        self.data.tmp_file.path()
+    }
+
+    /// `SHA256(data || bulk_key)`; the signature half of the share link.
+    pub fn commitment(&self) -> [u8; 32] {
+        self.commitment
+    }
+
+    /// Read up to `len` bytes at `start` (fewer at end of file).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn read_at(&self, start: u64, len: usize) -> Result<Bytes> {
+        use std::io::SeekFrom;
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        // a fresh handle per call, so concurrent peers don't share a cursor
+        let mut file = File::open(self.data.tmp_file.path()).await?;
+        file.seek(SeekFrom::Start(start)).await?;
+        let mut buf = Vec::with_capacity(len);
+        file.take(len as u64).read_to_end(&mut buf).await?;
+        Ok(buf.into())
+    }
+
+    /// Fill `buf` from `start`; errors if the data ends first.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn read_exact_at(&self, start: u64, buf: &mut [u8]) -> Result<()> {
+        use std::io::SeekFrom;
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        let mut file = File::open(self.data.tmp_file.path()).await?;
+        file.seek(SeekFrom::Start(start)).await?;
+        file.read_exact(buf).await?;
+        Ok(())
+    }
 }
 
 pub struct FileEntry {

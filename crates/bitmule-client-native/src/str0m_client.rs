@@ -79,6 +79,8 @@ pub struct SocketPool {
     /// the recv tasks; when they all exit, the receiver observes Close.
     unclaimed_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<PoolRecv>>>>,
     _recv_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// (public address, local address) pairs learned from a STUN server.
+    reflexive: Vec<(SocketAddr, SocketAddr)>,
 }
 
 /// Per-peer mpsc capacity (packet count). Individual peers consume
@@ -282,19 +284,30 @@ pub struct LiveSession {
 /// recognize as any known local candidate → drops. Per-IP sockets give
 /// each recv a specific, matchable destination.
 pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
+    build_socket_pool_with(None).await
+}
+
+/// Like `build_socket_pool`; with a STUN server, each IPv4 socket also learns
+/// its public address, which `build_rtc_with_pool_candidates` offers.
+pub(crate) async fn build_socket_pool_with(stun: Option<SocketAddr>) -> Result<SocketPool> {
     // Decide which IPs to bind on.
     let mut announced: Vec<IpAddr> = Vec::new();
-    if let Ok(ip) = discover_outbound_ip().await {
-        announced.push(ip);
-    }
-    for ip in local_interface_ips() {
-        if !announced.contains(&ip) { announced.push(ip); }
-    }
-    if !announced.iter().any(|ip| ip.is_loopback()) {
-        announced.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    }
-    if announced.is_empty() {
-        announced.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    if let Some(nic) = crate::nic::get() {
+        // limited to one interface: only its addresses, no loopback
+        announced = crate::nic::ips(nic)?;
+    } else {
+        if let Ok(ip) = discover_outbound_ip().await {
+            announced.push(ip);
+        }
+        for ip in local_interface_ips() {
+            if !announced.contains(&ip) { announced.push(ip); }
+        }
+        if !announced.iter().any(|ip| ip.is_loopback()) {
+            announced.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
+        if announced.is_empty() {
+            announced.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
     }
 
     // Bind the first socket at (ip, 0) to get an OS-assigned port; then
@@ -305,7 +318,7 @@ pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
     let mut port: Option<u16> = None;
     for ip in &announced {
         let bind_addr = SocketAddr::new(*ip, port.unwrap_or(0));
-        let sock = match UdpSocket::bind(bind_addr).await {
+        let sock = match crate::nic::bind_udp(bind_addr) {
             Ok(s) => s,
             Err(e) => {
                 warn!("bind {bind_addr} failed: {e} — skipping");
@@ -321,6 +334,24 @@ pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
         bail!("could not bind any UDP socket for host candidates");
     }
     let port = port.expect("at least one socket bound → port set");
+
+    // Ask the STUN server about every socket (before the recv tasks own them).
+    let mut reflexive = Vec::new();
+    if let Some(server) = stun {
+        let lookups = sockets.iter()
+            .filter(|(ip, _)| ip.is_ipv4() && !ip.is_loopback() && server.is_ipv4())
+            .map(|(ip, sock)| async move {
+                let base = SocketAddr::new(*ip, port);
+                (base, crate::stun::public_addr(sock, server).await)
+            });
+        for (base, answer) in futures::future::join_all(lookups).await {
+            match answer {
+                Ok(public) if public != base => reflexive.push((public, base)),
+                Ok(_) => {} // not behind a NAT: the host candidate is the public one
+                Err(e) => warn!("stun for {base}: {e}"),
+            }
+        }
+    }
 
     // Spawn one recv task per socket. Each packet: look up the source
     // SocketAddr in the peers map and hand off to that peer's mpsc
@@ -414,6 +445,7 @@ pub(crate) async fn build_socket_pool() -> Result<SocketPool> {
         peers,
         unclaimed_rx: Arc::new(tokio::sync::Mutex::new(Some(unclaimed_rx))),
         _recv_tasks: recv_tasks,
+        reflexive,
     })
 }
 
@@ -427,6 +459,12 @@ pub(crate) fn build_rtc_with_pool_candidates(pool: &SocketPool) -> Rtc {
         match Candidate::host(addr, "udp") {
             Ok(c) => { rtc.add_local_candidate(c); }
             Err(e) => warn!("skipping host candidate {addr}: {e}"),
+        }
+    }
+    for (public, base) in &pool.reflexive {
+        match Candidate::server_reflexive(*public, *base, "udp") {
+            Ok(c) => { rtc.add_local_candidate(c); }
+            Err(e) => warn!("skipping server reflexive candidate {public}: {e}"),
         }
     }
     rtc
@@ -601,10 +639,10 @@ pub async fn recv_connect(server_url: &str, share_key: ShareKey) -> Result<LiveS
                             warn!("duplicate KexPub from peer — ignoring");
                             continue;
                         }
-                        let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                        let peer_pub = bitmule_crypto::PublicKey(hex_decode_fixed::<32>(&pub_hex)?);
                         let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
                         let expected_mac = share_key.mac_ephemeral_pub(&peer_pub);
-                        if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                        if !constant_time_eq_bytes(&expected_mac.0, &peer_mac) {
                             bail!("KexPub MAC verify failed — peer does not know the share key");
                         }
                         let eph = ephemeral_holder.take()
@@ -1470,8 +1508,8 @@ pub(crate) async fn handshake_bulk_key_over_ws(
     let local_pub = local_ephemeral.public_keypublic_key();
     let local_mac = share_key.mac_ephemeral_pub(&local_pub);
     ws_send(ws, &SignalFrame::KexPub {
-        pub_hex: hex_encode(&local_pub),
-        mac_hex: hex_encode(&local_mac),
+        pub_hex: hex_encode(&local_pub.0),
+        mac_hex: hex_encode(&local_mac.0),
     }).await?;
 
     let mut ephemeral_holder = Some(local_ephemeral);
@@ -1533,10 +1571,10 @@ pub(crate) async fn handshake_bulk_key_over_ws(
                     warn!("duplicate KexPub during relay handshake — ignoring");
                     continue;
                 }
-                let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                let peer_pub = bitmule_crypto::PublicKey(hex_decode_fixed::<32>(&pub_hex)?);
                 let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
                 let expected_mac = share_key.mac_ephemeral_pub(&peer_pub);
-                if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                if !constant_time_eq_bytes(&expected_mac.0, &peer_mac) {
                     bail!("relay-handshake KexPub MAC verify failed — peer does not know share key");
                 }
                 let eph = ephemeral_holder.take()
@@ -2031,8 +2069,8 @@ async fn peer_session_run(
     ws_enqueue_targeted(
         &outbox_tx,
         &SignalFrame::KexPub {
-            pub_hex: hex_encode(&local_pub),
-            mac_hex: hex_encode(&local_mac),
+            pub_hex: hex_encode(&local_pub.0),
+            mac_hex: hex_encode(&local_mac.0),
         },
         Some(&rid_hex),
     )?;
@@ -2099,10 +2137,10 @@ async fn peer_session_run(
                             warn!(peer = %rid_hex, "duplicate KexPub — ignoring");
                             continue;
                         }
-                        let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                        let peer_pub = bitmule_crypto::PublicKey(hex_decode_fixed::<32>(&pub_hex)?);
                         let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
                         let expected_mac = session.shared.share_key.mac_ephemeral_pub(&peer_pub);
-                        if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                        if !constant_time_eq_bytes(&expected_mac.0, &peer_mac) {
                             bail!("peer {rid_hex} KexPub MAC verify failed — does not know share key");
                         }
                         let eph = ephemeral_holder.take()
@@ -2199,10 +2237,10 @@ async fn peer_session_run(
                 maybe_frame = inbox_rx.recv() => {
                     match maybe_frame {
                         Some(SignalFrame::KexPub { pub_hex, mac_hex }) => {
-                            let peer_pub = hex_decode_fixed::<32>(&pub_hex)?;
+                            let peer_pub = bitmule_crypto::PublicKey(hex_decode_fixed::<32>(&pub_hex)?);
                             let peer_mac = hex_decode_fixed::<32>(&mac_hex)?;
                             let expected_mac = session.shared.share_key.mac_ephemeral_pub(&peer_pub);
-                            if !constant_time_eq_bytes(&expected_mac, &peer_mac) {
+                            if !constant_time_eq_bytes(&expected_mac.0, &peer_mac) {
                                 bail!("peer {rid_hex} post-DC-open KexPub MAC verify failed");
                             }
                             let eph = ephemeral_holder.take()

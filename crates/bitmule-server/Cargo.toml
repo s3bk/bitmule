@@ -33,3 +33,9 @@ itertools = "*"
 futures = "*"
 tokio-stream = "*"
 rand = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio-tungstenite = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { workspace = true, features = ["macros", "time"] }

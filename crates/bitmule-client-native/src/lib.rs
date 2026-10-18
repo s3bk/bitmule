@@ -28,10 +28,12 @@ pub mod container;
 pub mod session;
 use bitmule_crypto::{BulkKey, CommitmentHasher};
 pub use multipeer::ServeMode;
-pub mod send_loop;
 pub mod recv_loop;pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
 
 pub mod websocket;
+pub mod rtc;
+pub mod nic;
+pub mod stun;
 
 /// Return value from [`recv_file`] — the on-disk path plus the wire's
 /// `container` flag so the caller can post-process (e.g. unzip a

@@ -488,6 +488,16 @@ impl BulkKey {
         Ok(tag.into())
     }
 
+    /// In-place AEAD-decrypt `buf` (ciphertext without tag), verifying the
+    /// detached `tag` produced by `encrypt_chunk_in_place`.
+    pub fn decrypt_chunk_in_place(&self, idx: u64, buf: &mut [u8], tag: &[u8; 16]) -> Result<()> {
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
+        let nonce = Self::chunk_nonce(idx);
+        cipher
+            .decrypt_in_place_detached(Nonce::from_slice(&nonce), &[], buf, Tag::from_slice(tag))
+            .map_err(|e| anyhow!("decrypt_chunk_in_place {idx}: {e}"))
+    }
+
     /// Const-generic fixed-size variant of `encrypt_chunk_in_place`. For
     /// callsites that operate on known-size chunks (page/block-sized pipeline
     /// buffers). Same detached-tag semantics.

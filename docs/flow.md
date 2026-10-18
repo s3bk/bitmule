@@ -2,12 +2,12 @@ C1 := client 1
 C2 := client 2
 R := relay
 
-C1 -> R     GET /api/v0.1/pow/challenge
-              returns level, magic
+C1 -> R     GET /pow
+              returns {difficulty, magic}
 C1          generate reconnect token and solve
             HASH(session_id, reconnect_token, magic, nonce).leading_zeros() == level
             
-C1 -> R     connect to /api/v0.1/create?sid=abdefg&pow=42&token=deadcat
+C1 -> R     connect to /ws/create?sid=abdefg&magic=1234&pow=42&token=deadcat
               server verifies POW before the websocket handshake
 
 C1 -> R     send CreateSession
@@ -17,7 +17,7 @@ C1 -> R     send CreateSession
               mac (proof that we know the share key)
 R -> C1     send SessionCreated
 
-C2 -> R     connect to /api/v0.1/join?sid=abdefg
+C2 -> R     connect to /ws/join?sid=abdefg
 C2 -> R     send JoinSession
               id (our id, randomly generated)
               capabilities (relay + SDP optional)

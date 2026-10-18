@@ -15,7 +15,7 @@ use std::ops;
 pub use manifest::{Manifest, FileEntry, ChunkSize};
 pub use chunk::{ChunkId, ChunkHeader, ChunkPayload};
 pub use crypto::{SessionKey, ContentKey, WrappedContentKey, KeyExchange};
-pub use protocol::{SessionId, ReceiverId, ChunkBitmap};
+pub use protocol::{SessionId, ReceiverId, Token, ChunkBitmap};
 use xxhash_rust::xxh3;
 
 #[derive(Debug, thiserror::Error)]
