@@ -1,15 +1,16 @@
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use bitmule_crypto::{BulkKey, CommitmentHasher};
 use bytes::Bytes;
 
+#[cfg(target_arch = "wasm32")]
 use futures_lite::AsyncReadExt;
 #[cfg(not(target_arch = "wasm32"))]
 use tempfile::NamedTempFile;
 
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::{fs::File, io::AsyncWrite};
+use tokio::fs::File;
 
 #[cfg(target_arch = "wasm32")]
 use js_sys::{wasm_bindgen::JsCast, Uint8Array};
@@ -52,6 +53,12 @@ impl TransferBuilder {
         let bulk_key = BulkKey::random();
         let use_zip = self.force_zip || self.files.len() != 1;
 
+        // what the receiver saves it as: the file's name, or a name for the zip
+        let name = if use_zip {
+            "bitmule-files.zip".to_string()
+        } else {
+            self.files[0].name.as_ref().and_then(|n| n.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "bitmule-download".to_string())
+        };
         let (transfer_typ, transfer_size, commitment, storage) = if use_zip {
             let (zip_size, zip_commit, zip_file) = zip_and_commit(&self.files, &bulk_key).await?;
             (
@@ -77,6 +84,7 @@ impl TransferBuilder {
             block_size: crate::fountain::BLOCK_PLAIN as u32,
             transfer_size,
             bulk_key: bulk_key.clone(),
+            name: Some(name),
         };
         let transfer = Transfer {
             data: storage,
@@ -85,7 +93,7 @@ impl TransferBuilder {
         };
         Ok((manifest, transfer))
     }
-    pub async fn commit_stream(mut self) -> Result<()> {
+    pub async fn commit_stream(self) -> Result<()> {
         todo!("streaming commit");
     }
 }
@@ -94,6 +102,7 @@ impl Default for TransferBuilder {
     fn default() -> Self { Self::new() }
 }
 
+#[allow(dead_code)]
 pub struct Transfer {
     data: PreparedFile,
     bulk_key: BulkKey,
@@ -137,11 +146,13 @@ impl Transfer {
     }
 }
 
+#[allow(dead_code)]
 pub struct FileEntry {
     name: Option<PathBuf>,
     storage: Storage,
 }
 
+#[allow(dead_code)]
 pub struct TransferEntry {
     name: Option<PathBuf>,
     storage: Storage,

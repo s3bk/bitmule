@@ -152,3 +152,44 @@ async fn create_join_reconnect() {
     drop(rx2);
     assert!(matches!(recv(&mut owner).await, Some(ServerToClient::PeerDisconnected { id }) if id == r2));
 }
+
+
+/// `enablePing` makes the server ping an otherwise quiet connection; without it, it stays silent.
+#[tokio::test]
+async fn pings_only_when_asked() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = router(Arc::new(AppState::new().with_ping_interval(Duration::from_millis(100))));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    async fn join_with(addr: &str, query: &str) -> Ws {
+        let sid = SessionId::random();
+        let mut owner = connect_create(addr, &sid, None).await;
+        send(&mut owner, create_msg(ReceiverId::random(), 1)).await;
+        assert!(matches!(recv(&mut owner).await, Some(ServerToClient::SessionCreated { .. })));
+        let mut ws = connect_async(format!("ws://{addr}/ws/join?sid={}{query}", sid.as_hex())).await.unwrap().0;
+        send(&mut ws, join_msg(ReceiverId::random(), 2)).await;
+        assert!(matches!(recv(&mut ws).await, Some(ServerToClient::SessionJoined { .. })));
+        std::mem::forget(owner); // keep the session alive
+        ws
+    }
+
+    // count pings seen in half a second
+    async fn pings(ws: &mut Ws) -> usize {
+        let mut n = 0;
+        let end = tokio::time::Instant::now() + Duration::from_millis(550);
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(end, ws.next()).await {
+            if matches!(msg, Message::Ping(_)) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    let mut quiet = join_with(&addr, "").await;
+    assert_eq!(pings(&mut quiet).await, 0);
+    let mut off = join_with(&addr, "&enablePing=0").await;
+    assert_eq!(pings(&mut off).await, 0);
+    let mut asked = join_with(&addr, "&enablePing=1").await;
+    assert!(pings(&mut asked).await >= 3);
+}

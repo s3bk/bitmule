@@ -13,6 +13,26 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// File bytes per `Data` message; small enough for every WebRTC stack.
 pub const PIECE: usize = 16 * 1024;
 
+/// The longest message: a `Data` header and a full piece.
+pub const MESSAGE_MAX: usize = 9 + PIECE;
+
+/// Buffers for `Data` messages. A message is made in one of these and goes
+/// on as it is; the buffer returns to the pool once the channel has taken it.
+pub type MessagePool = bitmule_buf::Pool<MESSAGE_MAX>;
+
+pub fn message_pool() -> std::sync::Arc<MessagePool> {
+    MessagePool::new(512, 128)
+}
+
+/// `Data { offset, bytes }` made in a pooled buffer; the piece is copied once, behind its header.
+pub fn data_message(pool: &std::sync::Arc<MessagePool>, offset: u64, bytes: &[u8]) -> Bytes {
+    let mut buf = pool.get();
+    buf.push(2);
+    buf.extend_from_slice(&offset.to_le_bytes());
+    buf.extend_from_slice(bytes);
+    buf.into_bytes()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Message {
     Get { start: u64, end: u64 },
@@ -55,6 +75,19 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pooled_data_messages_match_encode() {
+        let pool = message_pool();
+        for (offset, piece) in [(0u64, &b""[..]), (77, &b"hello"[..]), (1 << 40, &[7u8; PIECE][..])] {
+            let pooled = data_message(&pool, offset, piece);
+            let plain = Message::Data { offset, bytes: Bytes::copy_from_slice(piece) }.encode();
+            assert_eq!(pooled, plain);
+        }
+        let idle = pool.idle();
+        drop(data_message(&pool, 1, b"x"));
+        assert!(pool.idle() >= idle);
+    }
 
     #[test]
     fn messages_survive_the_wire() {

@@ -100,7 +100,7 @@ pub async fn send(
     }
 }
 
-pub async fn receive(server: &Server, link: &ShareLink, out: std::fs::File, options: Options) -> Result<Report> {
+pub async fn receive(server: &Server, link: &ShareLink, open: recv::OpenOutput, progress: Option<recv::Progress>, options: Options) -> Result<Report> {
     let Joined { our_id, identity, session_id, to_server, from_server, ws_worker, sender_id, sender_pub, sender_caps, relay_token } =
         join(server, &link.share_key, options).await?;
 
@@ -108,7 +108,7 @@ pub async fn receive(server: &Server, link: &ShareLink, out: std::fs::File, opti
     let wire = Arc::new(peer::Wire { identity, session_id, to_server });
     let peer::Demuxed { app, signaling } = peer::demux(peer::spawn(wire, sender_id, sender_pub, from_server));
 
-    let ctx = recv::Context::new(server.clone(), session_id, our_id, relay_token, link.clone(), out, options);
+    let ctx = recv::Context::new(server.clone(), session_id, our_id, relay_token, link.clone(), open, progress, options);
     let report = recv::receive(ctx, sender_caps, app, signaling).await;
 
     // The last thing we say (that we are done) is still on its way through

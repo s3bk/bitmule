@@ -28,10 +28,15 @@ pub mod container;
 pub mod session;
 use bitmule_crypto::{BulkKey, CommitmentHasher};
 pub use multipeer::ServeMode;
-pub mod recv_loop;pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
+pub use str0m_client::{LiveSession, recv_file, send_file_multi, send_file_relay};
 
 pub mod websocket;
 pub mod rtc;
+pub mod udp;
+#[cfg(target_os = "linux")]
+mod uring;
+#[cfg(target_os = "linux")]
+mod pool_uring;
 pub mod nic;
 pub mod stun;
 
@@ -49,7 +54,7 @@ use bitmule_core::{ReceiverId, SessionId};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
-use tokio::{io::{AsyncRead, AsyncReadExt}, pin, sync::{Mutex, mpsc}};
+use tokio::{io::{AsyncRead, AsyncReadExt}, sync::{Mutex, mpsc}};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 
@@ -425,15 +430,6 @@ struct MetaRelayFrame {
 pub enum Role {
     Sender,
     Receiver,
-}
-
-impl Role {
-    fn as_str(self) -> &'static str {
-        match self {
-            Role::Sender => "sender",
-            Role::Receiver => "receiver",
-        }
-    }
 }
 
 /// Wire-protocol version this client speaks. Bumped whenever the on-wire

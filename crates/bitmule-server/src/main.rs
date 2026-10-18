@@ -8,11 +8,7 @@
 //! and evicts undelivered chunks older than the retention threshold every
 //! 10 minutes.
 
-use axum::{
-    routing::{get, post, put},
-    Router,
-};
-use bitmule_server::{relay2, state::AppState, ws::{pow_challenge, ws_create_session, ws_join_session}};
+use bitmule_server::state::AppState;
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::services::{ServeDir, ServeFile};

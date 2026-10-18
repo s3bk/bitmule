@@ -4,9 +4,10 @@ use argon2::{Algorithm, Argon2, Block, Params, Version};
 use sha2::block_api::compress256;
 use sha2::{Digest, Sha256};
 
+use std::hint::black_box;
 use criterion::measurement::WallTime;
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion, Throughput,
+    criterion_group, criterion_main, BenchmarkGroup, Criterion, Throughput,
 };
 
 const MAGIC: u32 = 0x1234_5678;

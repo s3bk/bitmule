@@ -19,16 +19,15 @@
 use std::sync::Arc;
 
 use crate::{
-    Difficulty, Magic, room::{PeerEntry, PeerSink, Role, SendError}, state::{AppState, SessionState},
+    Difficulty, Magic, room::{PeerEntry, SendError}, state::{AppState, SessionState},
 };
 use anyhow::bail;
 use axum::{
     extract::{
-        Path, Query, State, ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State, ws::{Message, WebSocket, WebSocketUpgrade},
     }, Json, http::StatusCode, response::IntoResponse,
 };
 use bitmule_core::{ReceiverId, SessionId, Token, pow, protocol::websocket::{ClientToServer, ServerToClient}};
-use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{select, sync::mpsc};
 use tracing::{error, warn};
@@ -43,11 +42,22 @@ pub struct CreateSessionArgs {
     /// Reconnect token from `SessionCreated`. Required if the session is
     /// live, and skips the PoW. Only valid for a live session.
     token: Option<String>,
+    /// Ping the client now and then. Browsers cannot send websocket pings, and
+    /// a proxy in front of us may drop a connection that stays quiet.
+    #[serde(rename = "enablePing")]
+    enable_ping: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct JoinSessionArgs {
     sid: String,
+    #[serde(rename = "enablePing")]
+    enable_ping: Option<String>,
+}
+
+/// Is `enablePing` present and not switched off (`?enablePing`, `=1`, `=true`)?
+fn ping_requested(arg: &Option<String>) -> bool {
+    arg.as_deref().is_some_and(|v| !matches!(v, "0" | "false"))
 }
 
 /// Largest accepted signaling message.
@@ -78,8 +88,9 @@ pub async fn ws_join_session(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
+    let ping = ping_requested(&args.enable_ping);
     ws.max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_socket(socket, state, session_id, None))
+        .on_upgrade(move |socket| handle_socket(socket, state, session_id, None, ping))
         .into_response()
 }
 
@@ -109,15 +120,16 @@ pub async fn ws_create_session(
             return (StatusCode::BAD_REQUEST, "bad pow").into_response();
         }
     }
+    let ping = ping_requested(&args.enable_ping);
     ws.max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_socket(socket, state, session_id, Some(reconnect)))
+        .on_upgrade(move |socket| handle_socket(socket, state, session_id, Some(reconnect), ping))
         .into_response()
 }
 
 /// `reconnect`: `None` for a receiver joining, `Some(token)` for the owner
 /// (inner `None` on the first connect).
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>, session_id: SessionId, owner: Option<Option<Token>>) {
-    if let Err(e) = handle_socket_inner(socket, state, session_id, owner).await {
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, session_id: SessionId, owner: Option<Option<Token>>, ping: bool) {
+    if let Err(e) = handle_socket_inner(socket, state, session_id, owner, ping).await {
         error!("during handle_socket_inner: {e:?}");
     }
 }
@@ -128,7 +140,8 @@ async fn reject(socket: &mut WebSocket, reason: impl ToString) -> Result<(), any
     bail!(reason)
 }
 
-async fn handle_socket_inner(mut socket: WebSocket, state: Arc<AppState>, session_id: SessionId, owner: Option<Option<Token>>) -> Result<(), anyhow::Error> {
+async fn handle_socket_inner(mut socket: WebSocket, state: Arc<AppState>, session_id: SessionId, owner: Option<Option<Token>>, ping: bool) -> Result<(), anyhow::Error> {
+    let ping_interval = ping.then_some(state.ping_interval);
     let (dispatch_tx, mut dispatch_rx) = mpsc::channel(16);
     let is_owner = owner.is_some();
 
@@ -214,7 +227,7 @@ async fn handle_socket_inner(mut socket: WebSocket, state: Arc<AppState>, sessio
         }
     }
 
-    let result = relay_loop(&mut socket, &session, our_id, hello, &mut dispatch_rx).await;
+    let result = relay_loop(&mut socket, &session, our_id, hello, &mut dispatch_rx, ping_interval).await;
     if !is_owner {
         session.remove_peer(our_id).await;
     }
@@ -227,12 +240,21 @@ async fn relay_loop(
     our_id: ReceiverId,
     hello: Vec<ServerToClient>,
     dispatch_rx: &mut mpsc::Receiver<ServerToClient>,
+    ping_interval: Option<std::time::Duration>,
 ) -> Result<(), anyhow::Error> {
     for msg in hello {
         send_msg(socket, msg).await?;
     }
+    let mut ping = ping_interval.map(|every| {
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker
+    });
     loop {
         select! {
+            _ = async { ping.as_mut().unwrap().tick().await }, if ping.is_some() => {
+                socket.send(Message::Ping(Default::default())).await?;
+            }
             ev = socket.recv() => match ev {
                 None | Some(Ok(Message::Close(_))) => return Ok(()),
                 Some(Ok(Message::Binary(data))) => match postcard::from_bytes(&data) {

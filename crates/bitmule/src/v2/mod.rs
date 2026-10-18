@@ -121,6 +121,41 @@ pub enum Transport {
     WebRtc,
 }
 
+/// When the first and the last piece (data channel) or symbol (relay) of a
+/// transfer went by: the time the bytes were in flight, without the
+/// connection set-up before and the verification after.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Span {
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+}
+
+impl Span {
+    pub fn mark(&mut self) {
+        let now = std::time::Instant::now();
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+    }
+
+    /// Cover what `other` covers too.
+    pub fn merge(&mut self, other: Span) {
+        self.first = self.first.into_iter().chain(other.first).min();
+        self.last = self.last.into_iter().chain(other.last).max();
+    }
+
+    /// First mark to last mark; `None` if nothing was marked.
+    pub fn elapsed(&self) -> Option<std::time::Duration> {
+        Some(self.last?.duration_since(self.first?))
+    }
+
+    /// "256.0 MiB in 3.42 s (74.8 MiB/s)", or `None` if nothing went by.
+    pub fn describe(&self, bytes: u64) -> Option<String> {
+        let time = self.elapsed()?.as_secs_f64();
+        let mib = bytes as f64 / (1024.0 * 1024.0);
+        Some(format!("{mib:.1} MiB in {time:.2} s ({:.1} MiB/s)", mib / time.max(1e-9)))
+    }
+}
+
 pub struct Report {
     pub manifest: TransferManifest,
     pub transport: Transport,
@@ -128,6 +163,9 @@ pub struct Report {
     /// that starts on the relay and moves to the data channel has both.
     pub relay_bytes: u64,
     pub data_channel_bytes: u64,
+    /// First to last relay symbol / data channel piece received.
+    pub relay_time: Span,
+    pub data_channel_time: Span,
 }
 
 /// Send `transfer` to every receiver that joins; returns once the receivers
@@ -175,5 +213,28 @@ pub async fn run_recv(
     out: std::fs::File,
     options: Options,
 ) -> Result<Report> {
-    session::receive(server, link, out, options).await
+    run_recv_with(server, link, move |_| Ok(out), options).await
+}
+
+/// Like `run_recv`, with the output file made once the sender's manifest is
+/// known, so it can be named after what the sender calls the file
+/// (`TransferManifest::file_name`).
+pub async fn run_recv_with(
+    server: &Server,
+    link: &ShareLink,
+    open: impl FnOnce(&TransferManifest) -> std::io::Result<std::fs::File> + Send + 'static,
+    options: Options,
+) -> Result<Report> {
+    session::receive(server, link, Box::new(open), None, options).await
+}
+
+/// Like `run_recv_with`, calling `progress(received, total)` as data arrives.
+pub async fn run_recv_progress(
+    server: &Server,
+    link: &ShareLink,
+    open: impl FnOnce(&TransferManifest) -> std::io::Result<std::fs::File> + Send + 'static,
+    progress: impl Fn(u64, u64) + Send + Sync + 'static,
+    options: Options,
+) -> Result<Report> {
+    session::receive(server, link, Box::new(open), Some(std::sync::Arc::new(progress)), options).await
 }

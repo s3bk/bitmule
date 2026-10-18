@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/bitmule",
     "crates/bitmule-core",
+    "crates/bitmule-buf",
     "crates/bitmule-crypto",
     "crates/bitmule-server",
     "crates/bitmule-server-signal-ws",
@@ -82,3 +83,9 @@ postcard = "1.1.3"
 #strip = "symbols"
 debug = 1
 lto = "thin"
+
+# local forks: str0m (data channel send buffer 1 MiB, not 128 KiB: vendor/str0m/src/sctp/mod.rs) and
+# sctp-proto (Fx hashing in the payload queue, SACK delay settable: vendor/sctp-proto)
+[patch.crates-io]
+str0m = { path = "vendor/str0m" }
+sctp-proto = { path = "vendor/sctp-proto" }

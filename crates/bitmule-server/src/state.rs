@@ -2,8 +2,7 @@
 
 use crate::{Difficulty, Magic, decode_difficulty_and_magic, encode_difficulty_and_magic, relay2::MulticastSession, room::{PeerEntry, Room}};
 use bitmule_core::{ReceiverId, SessionId, Token, protocol::websocket::ServerToClient};
-use rand::Rng;
-use std::{collections::HashMap, sync::{Arc, Weak, atomic::{AtomicU8, AtomicU64, Ordering}}};
+use std::{collections::HashMap, sync::{Arc, Weak, atomic::{AtomicU64, Ordering}}};
 use tokio::sync::Mutex;
 
 pub struct SessionState {
@@ -126,6 +125,8 @@ pub struct Created {
 pub struct AppState {
     pub rooms: Mutex<HashMap<SessionId, Weak<SessionState>>>,
     difficulty_and_magic: AtomicU64,
+    /// How often a websocket that asked for it (`enablePing`) is pinged.
+    pub ping_interval: std::time::Duration,
 }
 
 impl AppState {
@@ -138,8 +139,14 @@ impl AppState {
         ));
         Self {
             rooms: Mutex::new(HashMap::new()),
-            difficulty_and_magic
+            difficulty_and_magic,
+            ping_interval: std::time::Duration::from_secs(20),
         }
+    }
+
+    pub fn with_ping_interval(mut self, interval: std::time::Duration) -> Self {
+        self.ping_interval = interval;
+        self
     }
 
     pub fn rotate_magic(&self) {

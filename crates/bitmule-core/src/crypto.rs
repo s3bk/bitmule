@@ -1,9 +1,7 @@
-use std::marker::PhantomData;
 
 use crate::{Error};
 use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 pub use bitmule_crypto::{PublicKey, SessionMac};
 

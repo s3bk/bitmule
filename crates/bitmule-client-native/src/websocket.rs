@@ -3,7 +3,7 @@ use std::time::Duration;
 use bitmule_core::protocol::websocket::{ClientToServer, ServerToClient};
 use bytes::Bytes;
 use futures::SinkExt;
-use tokio::{select, spawn, sync::mpsc, time::{Instant, interval, interval_at}};
+use tokio::{select, spawn, sync::mpsc, time::{Instant, interval_at}};
 use tokio_stream::StreamExt;
 use tokio_tungstenite::connect_async;
 use tungstenite::Message;

@@ -70,7 +70,7 @@ pub struct PoolRecv {
 /// so every packet flows through it; that is the correct semantics.
 pub struct SocketPool {
     sockets: HashMap<IpAddr, Arc<UdpSocket>>,
-    peers: Arc<std::sync::RwLock<HashMap<SocketAddr, mpsc::Sender<PoolRecv>>>>,
+    peers: Peers,
     /// Held under an async mutex + Option so `take_unclaimed_rx()` and
     /// `SocketPool::recv()` can't race to consume the same receiver.
     /// The receiver is single-consumer: whichever caller takes it first
@@ -79,18 +79,49 @@ pub struct SocketPool {
     /// the recv tasks; when they all exit, the receiver observes Close.
     unclaimed_rx: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<PoolRecv>>>>,
     _recv_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The io_uring thread that reads and sends for all the sockets, if there is one
+    /// (then there are no `_recv_tasks`).
+    #[cfg(target_os = "linux")]
+    uring: std::sync::Mutex<Option<crate::pool_uring::Started>>,
     /// (public address, local address) pairs learned from a STUN server.
     reflexive: Vec<(SocketAddr, SocketAddr)>,
 }
 
-/// Per-peer mpsc capacity (packet count). Individual peers consume
-/// steadily so a small bounded channel is enough; overflow means the
-/// peer's Rtc-drive loop has stalled long enough that str0m's DTLS/SCTP
-/// retransmit will handle any drops.
-const POOL_PEER_CHAN_CAP: usize = 128;
-/// Unclaimed queue capacity. Pre-ICE-connected + stray-STUN traffic is
-/// low-volume; a small queue keeps memory bounded if a gatherer stalls.
-const POOL_UNCLAIMED_CAP: usize = 64;
+/// Where packets from a known peer go.
+pub(crate) type Peers = Arc<std::sync::RwLock<HashMap<SocketAddr, mpsc::Sender<PoolRecv>>>>;
+
+/// Hand a received packet to the peer it is from, or to the unclaimed queue.
+/// False when the pool is torn down and the reader should stop.
+pub(crate) async fn route_packet(peers: &Peers, unclaimed: &mpsc::Sender<PoolRecv>, pr: PoolRecv) -> bool {
+    // the read guard is held only for the lookup
+    let peer_tx = match peers.read() {
+        Ok(map) => map.get(&pr.source).cloned(),
+        Err(_) => return false, // poisoned: pool torn down
+    };
+    match peer_tx {
+        Some(tx) => {
+            // if a peer stalls, drop rather than block the socket reader; SCTP's
+            // retransmission makes up for it
+            if let Err(mpsc::error::TrySendError::Full(pr)) = tx.try_send(pr) {
+                warn!("peer {} mpsc full, dropped packet", pr.source);
+            }
+            true
+        }
+        // wait for room rather than drop: what waits stays in the socket's buffer,
+        // and a dropped packet costs SCTP a 1 s retransmit timeout. Closed: no
+        // gatherer left, the pool is abandoned.
+        None => unclaimed.send(pr).await.is_ok(),
+    }
+}
+
+/// Per-peer mpsc capacity (packet count). Overflow means the peer's
+/// Rtc-drive loop has stalled long enough that str0m's DTLS/SCTP retransmit
+/// will handle the drops.
+const POOL_PEER_CHAN_CAP: usize = 1024;
+/// Unclaimed queue capacity. In the 1:1 flow nothing registers as a peer, so
+/// all traffic goes through here: it has to hold a sender's burst (up to 64
+/// datagrams per `sendmmsg`). The socket readers wait when it is full.
+const POOL_UNCLAIMED_CAP: usize = 1024;
 
 /// A peer's registration in the pool. Holds the receive side of its
 /// per-peer mpsc; on drop, removes the registration from the pool so
@@ -164,7 +195,7 @@ impl SocketPool {
     /// first call, lazily takes the unclaimed receiver; subsequent calls
     /// on the same pool reuse it. Returns `None` once the pool's recv
     /// tasks have all exited.
-    pub async fn recv(&mut self) -> Option<PoolRecv> {
+    pub async fn recv(&self) -> Option<PoolRecv> {
         // Fast path via a cached receiver held in a per-call closure
         // would require &mut self surgery through many callers; instead
         // drain the mutex-guarded Option on each call. The mutex is
@@ -192,46 +223,120 @@ impl SocketPool {
     /// catch) is logged and swallowed — str0m's ICE state machine
     /// retries other pairs on its own.
     pub async fn send_from(&self, source: SocketAddr, dest: SocketAddr, bytes: &[u8]) -> Result<()> {
+        let Some(sock) = self.route(source, dest) else { return Ok(()) };
+        #[cfg(target_os = "linux")]
+        if self.send_uring(vec![(source, dest, bytes)]).await {
+            return Ok(());
+        }
+        if let Err(e) = sock.send_to(bytes, dest).await {
+            return ignorable(e, source, dest);
+        }
+        Ok(())
+    }
+
+    /// Hand datagrams (already routed) to the io_uring thread. False if there is
+    /// none, it has been stopped, or a datagram is too big for its buffers: the
+    /// caller sends them itself then.
+    #[cfg(target_os = "linux")]
+    async fn send_uring(&self, batch: Vec<(SocketAddr, SocketAddr, &[u8])>) -> bool {
+        let tx = match &*self.uring.lock().unwrap() {
+            Some(started) => started.tx.clone(),
+            None => return false,
+        };
+        if batch.iter().any(|(_, _, bytes)| bytes.len() > DATAGRAM_MAX) {
+            return false;
+        }
+        let outgoing = batch.into_iter().map(|(source, dest, bytes)| crate::pool_uring::Outgoing {
+            socket: source.ip(),
+            dest,
+            data: crate::pool_uring::buffers().get_from(bytes),
+        }).collect();
+        tx.send(outgoing).await.is_ok()
+    }
+
+    /// The socket a send from `source` to `dest` goes out on, or `None` if
+    /// the pre-flight checks above rule it out.
+    fn route(&self, source: SocketAddr, dest: SocketAddr) -> Option<&Arc<UdpSocket>> {
         let src_ip = source.ip();
         let dst_ip = dest.ip();
-        let src_loopback = src_ip.is_loopback();
-        let dst_loopback = dst_ip.is_loopback();
         let is_v4_link_local = |ip: IpAddr| match ip {
             IpAddr::V4(v4) => v4.octets()[0] == 169 && v4.octets()[1] == 254,
             IpAddr::V6(_) => false,
         };
-        if src_loopback != dst_loopback {
+        if src_ip.is_loopback() != dst_ip.is_loopback() {
             debug!("send_from {source} → {dest}: loopback scope mismatch, skipping");
-            return Ok(());
+            return None;
         }
         if is_v4_link_local(src_ip) != is_v4_link_local(dst_ip) {
             debug!("send_from {source} → {dest}: link-local scope mismatch, skipping");
-            return Ok(());
+            return None;
         }
+        let sock = self.sockets.get(&src_ip);
+        if sock.is_none() {
+            warn!("no socket for source IP {src_ip} — dropping send to {dest}");
+        }
+        sock
+    }
 
-        let sock = match self.sockets.get(&src_ip) {
-            Some(s) => s.clone(),
-            None => {
-                warn!("no socket for source IP {src_ip} — dropping send to {dest}");
+    /// Send many datagrams, `(source, destination, bytes)`, as few syscalls
+    /// as possible: on Linux, runs that go out on the same socket are handed
+    /// to the kernel together (`sendmmsg`). Same rules as `send_from`.
+    pub async fn send_batch(&self, batch: &[(SocketAddr, SocketAddr, &[u8])]) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let routed: Vec<_> = batch.iter().copied().filter(|(s, d, _)| self.route(*s, *d).is_some()).collect();
+            if self.send_uring(routed).await {
                 return Ok(());
             }
-        };
-        if let Err(e) = sock.send_to(bytes, dest).await {
-            use std::io::ErrorKind;
-            match e.kind() {
-                ErrorKind::InvalidInput
-                | ErrorKind::NetworkUnreachable
-                | ErrorKind::HostUnreachable
-                | ErrorKind::AddrNotAvailable => {
-                    debug!("send_to {dest} from {source}: {e} — ignoring, str0m will retry another pair");
-                }
-                _ => {
-                    return Err(anyhow::Error::from(e))
-                        .with_context(|| format!("send_to {dest} from {source}"));
+            let mut rest = batch;
+            while let Some(&(source, _, _)) = rest.first() {
+                let run = rest.iter().take_while(|(s, _, _)| s.ip() == source.ip()).count();
+                let (now, later) = rest.split_at(run);
+                rest = later;
+                let routed: Vec<_> = now.iter().filter(|(s, d, _)| self.route(*s, *d).is_some()).collect();
+                if let Some(&&(source, dest, _)) = routed.first() {
+                    let sock = self.route(source, dest).unwrap();
+                    for chunk in routed.chunks(SENDMMSG_MAX) {
+                        send_mmsg(sock, chunk).await?;
+                    }
                 }
             }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        {
+            for &(source, dest, bytes) in batch {
+                self.send_from(source, dest, bytes).await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A duplicate of the socket bound to `ip`, as a std socket (the same
+    /// socket underneath: same port, same NAT mapping). For code that takes
+    /// the data path over from the pool (io_uring); follow with
+    /// `stop_receiving` so the pool's readers do not compete for datagrams.
+    pub fn dup_socket(&self, ip: IpAddr) -> Result<std::net::UdpSocket> {
+        let sock = self.sockets.get(&ip).ok_or_else(|| anyhow::anyhow!("no socket bound to {ip}"))?;
+        Ok(socket2::SockRef::from(&**sock).try_clone()?.into())
+    }
+
+    /// Stop the pool's reader tasks. Sending still works; `recv` and
+    /// registrations get nothing more.
+    pub fn stop_receiving(&self) {
+        for task in &self._recv_tasks {
+            task.abort();
+        }
+        #[cfg(target_os = "linux")]
+        self.uring.lock().unwrap().take();
+    }
+
+    /// Where this pool can be reached: every socket's address, and the public
+    /// ones STUN told about.
+    pub fn candidate_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs = self.bound_addrs();
+        addrs.extend(self.reflexive.iter().map(|(public, _)| *public));
+        addrs
     }
 
     /// Every socket's bound address, for logging + advertising.
@@ -359,94 +464,227 @@ pub(crate) async fn build_socket_pool_with(stun: Option<SocketAddr>) -> Result<S
     // through to the unclaimed queue for the gatherer to pick up.
     // Peers map + unclaimed queue live on the pool struct; every
     // recv task clones the Arc<RwLock<...>> + unclaimed Sender.
-    let peers: Arc<std::sync::RwLock<HashMap<SocketAddr, mpsc::Sender<PoolRecv>>>> =
-        Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let peers: Peers = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let (unclaimed_tx, unclaimed_rx) = mpsc::channel::<PoolRecv>(POOL_UNCLAIMED_CAP);
     let mut recv_tasks = Vec::new();
-    for (ip, sock) in &sockets {
+    #[cfg(target_os = "linux")]
+    let mut uring = None;
+    #[cfg(target_os = "linux")]
+    if crate::uring::available() && std::env::var_os("BITMULE_NO_NET_URING").is_none() {
+        let dups: Result<Vec<_>> = sockets.iter().map(|(ip, sock)| {
+            let dup: std::net::UdpSocket = socket2::SockRef::from(&**sock).try_clone()?.into();
+            Ok((*ip, dup, SocketAddr::new(*ip, port)))
+        }).collect();
+        match dups {
+            Ok(dups) => match crate::pool_uring::start(dups, peers.clone(), unclaimed_tx.clone()).await {
+                Ok(started) => uring = Some(started),
+                Err(e) => warn!("io_uring for the socket pool: {e} — using tokio sockets"),
+            },
+            Err(e) => warn!("duplicating the sockets: {e:#} — using tokio sockets"),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let tokio_recv = uring.is_none();
+    #[cfg(not(target_os = "linux"))]
+    let tokio_recv = true;
+    for (ip, sock) in sockets.iter().filter(|_| tokio_recv) {
         let sock = sock.clone();
         let dest = SocketAddr::new(*ip, port);
         let peers_task = peers.clone();
         let unclaimed_task = unclaimed_tx.clone();
         let task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
+            let mut receiver = DatagramReceiver::new();
             loop {
-                match sock.recv_from(&mut buf).await {
-                    Ok((n, source)) => {
-                        let pr = PoolRecv {
-                            bytes: Bytes::copy_from_slice(&buf[..n]),
-                            source,
-                            destination: dest,
-                        };
-                        // Try the peer map first (hot path once ICE
-                        // resolves). Held only for the lookup; the
-                        // send() is on the cloned Sender outside the
-                        // read guard.
-                        let peer_tx = {
-                            let map = match peers_task.read() {
-                                Ok(g) => g,
-                                Err(_) => break, // poisoned: pool torn down
-                            };
-                            map.get(&source).cloned()
-                        };
-                        match peer_tx {
-                            Some(tx) => {
-                                // try_send: if a peer stalls we'd
-                                // rather drop than block the socket
-                                // reader. Str0m's DTLS/SCTP retx
-                                // handles losses.
-                                if let Err(e) = tx.try_send(pr) {
-                                    use mpsc::error::TrySendError;
-                                    match e {
-                                        TrySendError::Full(_) => {
-                                            warn!("peer {source} mpsc full, dropped packet");
-                                        }
-                                        TrySendError::Closed(_) => {
-                                            // Peer went away without
-                                            // dropping registration
-                                            // cleanly; will be cleared
-                                            // on next register/drop.
-                                        }
-                                    }
-                                }
-                            }
-                            None => {
-                                if let Err(e) = unclaimed_task.try_send(pr) {
-                                    use mpsc::error::TrySendError;
-                                    match e {
-                                        TrySendError::Full(_) => {
-                                            debug!("unclaimed queue full, dropped packet from {source}");
-                                        }
-                                        TrySendError::Closed(_) => {
-                                            // No gatherer left. Pool
-                                            // abandoned; exit task.
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                match receiver.recv(&sock).await {
+                    Ok(datagrams) => for (bytes, source) in datagrams {
+                        if !route_packet(&peers_task, &unclaimed_task, PoolRecv { bytes, source, destination: dest }).await {
+                            return;
                         }
                     }
                     Err(e) => {
                         warn!("recv task for {dest} exiting: {e}");
-                        break;
+                        return;
                     }
                 }
             }
         });
         recv_tasks.push(task);
     }
-    // Drop the local unclaimed_tx: only the recv-task clones remain.
-    // When they all exit, the receiver observes Close and legacy
-    // `recv()` returns None as expected by 1:1 callers.
     drop(unclaimed_tx);
     Ok(SocketPool {
         sockets,
         peers,
         unclaimed_rx: Arc::new(tokio::sync::Mutex::new(Some(unclaimed_rx))),
         _recv_tasks: recv_tasks,
+        #[cfg(target_os = "linux")]
+        uring: std::sync::Mutex::new(uring),
         reflexive,
     })
+}
+
+/// Largest datagram taken in; WebRTC packets are at most the MTU (1500).
+pub(crate) const DATAGRAM_MAX: usize = 2048;
+/// Datagrams taken from a socket per `recvmmsg` call.
+#[cfg(target_os = "linux")]
+const RECVMMSG_MAX: usize = 32;
+
+/// Takes datagrams from a socket, as many per syscall as are waiting. On
+/// Linux they are read straight into pooled buffers (`recvmmsg`) which then go
+/// on as `Bytes`, so a packet is never copied or allocated on the way in.
+struct DatagramReceiver {
+    #[cfg(target_os = "linux")]
+    pool: Arc<bitmule_buf::Pool<DATAGRAM_MAX>>,
+    /// Buffers waiting for the next datagrams.
+    #[cfg(target_os = "linux")]
+    spare: Vec<bitmule_buf::Buf<DATAGRAM_MAX>>,
+}
+
+impl DatagramReceiver {
+    fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let pool = bitmule_buf::Pool::new(1024, 2 * RECVMMSG_MAX);
+            let spare = (0..RECVMMSG_MAX).map(|_| pool.get()).collect();
+            DatagramReceiver { pool, spare }
+        }
+        #[cfg(not(target_os = "linux"))]
+        DatagramReceiver {}
+    }
+
+    /// Wait for datagrams: at least one, up to a batch.
+    #[cfg(target_os = "linux")]
+    async fn recv(&mut self, sock: &UdpSocket) -> std::io::Result<Vec<(Bytes, SocketAddr)>> {
+        use std::os::fd::AsRawFd;
+        loop {
+            sock.readable().await?;
+            while self.spare.len() < RECVMMSG_MAX {
+                self.spare.push(self.pool.get());
+            }
+            let spare = &mut self.spare;
+            let result = sock.try_io(tokio::io::Interest::READABLE, || {
+                // raw pointers into the buffers: made and used inside this call only
+                let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; RECVMMSG_MAX];
+                let mut iovecs: Vec<libc::iovec> = spare.iter_mut()
+                    .map(|buf| libc::iovec { iov_base: buf.array_mut().as_mut_ptr() as *mut _, iov_len: DATAGRAM_MAX })
+                    .collect();
+                let mut headers: Vec<libc::mmsghdr> = (0..RECVMMSG_MAX).map(|i| {
+                    let mut header: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                    header.msg_hdr.msg_name = &mut names[i] as *mut _ as *mut _;
+                    header.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+                    header.msg_hdr.msg_iov = &mut iovecs[i];
+                    header.msg_hdr.msg_iovlen = 1;
+                    header
+                }).collect();
+                let n = unsafe { libc::recvmmsg(sock.as_raw_fd(), headers.as_mut_ptr(), RECVMMSG_MAX as u32, 0, std::ptr::null_mut()) };
+                if n < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(headers[..n as usize].iter().zip(&names).map(|(h, name)| (h.msg_len as usize, socket_addr(name))).collect::<Vec<_>>())
+            });
+            match result {
+                Ok(received) => {
+                    let mut out = Vec::with_capacity(received.len());
+                    for (mut buf, (len, source)) in self.spare.drain(..received.len()).zip(received) {
+                        buf.set_len(len.min(DATAGRAM_MAX));
+                        if let Some(source) = source {
+                            out.push((buf.into_bytes(), source));
+                        }
+                    }
+                    return Ok(out);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn recv(&mut self, sock: &UdpSocket) -> std::io::Result<Vec<(Bytes, SocketAddr)>> {
+        let mut buf = vec![0u8; DATAGRAM_MAX];
+        let (n, source) = sock.recv_from(&mut buf).await?;
+        buf.truncate(n);
+        Ok(vec![(Bytes::from(buf), source)])
+    }
+}
+
+/// The address in a `sockaddr_storage` the kernel filled in.
+#[cfg(target_os = "linux")]
+fn socket_addr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match storage.ss_family as i32 {
+        libc::AF_INET => {
+            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))), u16::from_be(sin.sin_port)))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr),
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// A send error that is not worth failing over: the ICE state machine retries other pairs.
+fn ignorable(e: std::io::Error, source: SocketAddr, dest: SocketAddr) -> Result<()> {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::InvalidInput
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable
+        | ErrorKind::AddrNotAvailable => {
+            debug!("send_to {dest} from {source}: {e} — ignoring, str0m will retry another pair");
+            Ok(())
+        }
+        _ => Err(anyhow::Error::from(e)).with_context(|| format!("send_to {dest} from {source}")),
+    }
+}
+
+/// Datagrams per `sendmmsg` call.
+#[cfg(target_os = "linux")]
+const SENDMMSG_MAX: usize = 64;
+
+/// All of `batch` out of `sock`, in as few `sendmmsg` calls as the socket's buffer allows.
+#[cfg(target_os = "linux")]
+async fn send_mmsg(sock: &UdpSocket, batch: &[&(SocketAddr, SocketAddr, &[u8])]) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let addrs: Vec<socket2::SockAddr> = batch.iter().map(|(_, dest, _)| socket2::SockAddr::from(*dest)).collect();
+    let mut sent = 0;
+    while sent < batch.len() {
+        sock.writable().await?;
+        let result = sock.try_io(tokio::io::Interest::WRITABLE, || {
+            // the iovecs and headers hold raw pointers, so they are made here, not kept across an await
+            let todo = &batch[sent..];
+            let mut iovecs: Vec<libc::iovec> = todo.iter()
+                .map(|(_, _, bytes)| libc::iovec { iov_base: bytes.as_ptr() as *mut _, iov_len: bytes.len() })
+                .collect();
+            let mut headers: Vec<libc::mmsghdr> = Vec::with_capacity(todo.len());
+            for (i, addr) in addrs[sent..].iter().enumerate() {
+                let mut header: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                header.msg_hdr.msg_name = addr.as_ptr() as *mut _;
+                header.msg_hdr.msg_namelen = addr.len();
+                header.msg_hdr.msg_iov = &mut iovecs[i];
+                header.msg_hdr.msg_iovlen = 1;
+                headers.push(header);
+            }
+            let n = unsafe { libc::sendmmsg(sock.as_raw_fd(), headers.as_mut_ptr(), headers.len() as u32, 0) };
+            if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+        });
+        match result {
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                // the first datagram of what is left failed; drop it and go on
+                let (source, dest, _) = *batch[sent];
+                ignorable(e, source, dest)?;
+                sent += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a fresh Rtc seeded with host candidates from `pool.bound_addrs()`.
@@ -454,7 +692,8 @@ pub(crate) async fn build_socket_pool_with(stun: Option<SocketAddr>) -> Result<S
 /// set of local candidates. `dispatch_pool_recv_to_rtcs` routes inbound
 /// packets to the owning Rtc via `Rtc::accepts()`.
 pub(crate) fn build_rtc_with_pool_candidates(pool: &SocketPool) -> Rtc {
-    let mut rtc = Rtc::new(Instant::now());
+    let mtu = std::env::var("BITMULE_MTU").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(str0m::DATAGRAM_MTU_TARGET); // TEMP-INSTR
+    let mut rtc = str0m::RtcConfig::new().set_mtu(mtu..=usize::MAX).build(Instant::now());
     for addr in pool.bound_addrs() {
         match Candidate::host(addr, "udp") {
             Ok(c) => { rtc.add_local_candidate(c); }
@@ -475,6 +714,7 @@ pub(crate) fn build_rtc_with_pool_candidates(pool: &SocketPool) -> Rtc {
 /// (recv_connect, tests, exploratory code). New sender-side call sites
 /// should use `build_socket_pool` + `build_rtc_with_pool_candidates`
 /// directly and dispatch via `dispatch_pool_recv_to_rtcs`.
+#[allow(dead_code)]
 async fn build_rtc() -> Result<(Rtc, SocketPool)> {
     let pool = build_socket_pool().await?;
     let rtc = build_rtc_with_pool_candidates(&pool);
@@ -1446,6 +1686,7 @@ async fn drain_rtc_capture_open(
 
 /// Drain variant used by recv_connect: str0m assigns the channel id on
 /// the passive side, so we discover it via the ChannelOpen event.
+#[allow(dead_code)]
 async fn drain_rtc_capture_id(
     rtc: &mut Rtc,
     pool: &SocketPool,

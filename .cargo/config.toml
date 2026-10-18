@@ -17,3 +17,8 @@ rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=65536"]
 
 [target.i686-linux-android]
 rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=65536"]
+
+# getrandom 0.3+/0.4 (pulled in by argon2 -> password-hash) picks its wasm
+# backend by cfg, not only by feature.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

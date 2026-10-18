@@ -93,6 +93,9 @@ fn pin(_socket: &socket2::Socket, _name: &str) -> std::io::Result<()> {
     Ok(()) // bound by address only
 }
 
+/// Receive and send buffer asked for on the WebRTC sockets.
+const UDP_BUFFER: usize = 8 * 1024 * 1024;
+
 /// A UDP socket at `addr`, pinned to the interface if one is set.
 pub fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     let socket = socket2::Socket::new(
@@ -103,6 +106,11 @@ pub fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     if let Some(name) = get() {
         pin(&socket, name)?;
     }
+    // A burst of packets must fit while the receiver's task is not running: with the
+    // default 208 KiB the kernel drops what does not fit, and SCTP then waits out a
+    // retransmit timeout (1 s). The kernel caps the size at net.core.[rw]mem_max.
+    let _ = socket.set_recv_buffer_size(UDP_BUFFER);
+    let _ = socket.set_send_buffer_size(UDP_BUFFER);
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())

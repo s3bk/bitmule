@@ -10,7 +10,6 @@
 //! ledger, quota) lives in the [`bitmule_core::traits::ChunkStore`].
 
 use bitmule_core::{ReceiverId, Token, crypto::{PublicKey, SessionMac}, protocol::websocket::{PeerCaps, ServerToClient}};
-use bytes::Bytes;
 use std::collections::HashMap;
 use tokio::sync::mpsc::{self, error::TrySendError};
 

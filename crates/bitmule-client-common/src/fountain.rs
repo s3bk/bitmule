@@ -56,8 +56,17 @@ const RELAY_HEADER: usize = FRAME_SIZE_BYTES + 1;
 const HASH_OFFSET: usize = RELAY_HEADER + 4;
 const ID_OFFSET: usize = HASH_OFFSET + 8;
 const SYMBOL_OFFSET: usize = ID_OFFSET + 4;
-/// What the relay frame's length field covers.
-pub const PAYLOAD_SIZE: usize = 4 + 8 + 4 + SYMBOL_SIZE;
+/// What the relay frame's length field covers: the header and the symbol.
+pub const PAYLOAD_SIZE: usize = SYMBOL_HEADER + SYMBOL_SIZE;
+/// A payload starts with `block_nr: u32 | block hash: u64 | payload id (4)`.
+pub const SYMBOL_HEADER: usize = 4 + 8 + 4;
+
+/// A symbol payload split into its header and its symbol, as
+/// `Decoder::push_symbol` takes it.
+pub struct SymbolPacket {
+    pub header: [u8; SYMBOL_HEADER],
+    pub symbol: Symbol,
+}
 
 fn block_hash(coded_block: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(coded_block)
@@ -66,6 +75,12 @@ pub const FRAME_SIZE: usize = RELAY_HEADER + PAYLOAD_SIZE;
 
 fn config() -> ObjectTransmissionInformation {
     ObjectTransmissionInformation::new(0, SYMBOL_SIZE as u16, 0, 1, 1)
+}
+
+/// The symbol payload of a relay frame (what `Decoder::push` takes), without
+/// the frame's length and type bytes. No copy.
+pub fn frame_payload(frame: &Bytes) -> Bytes {
+    frame.slice(RELAY_HEADER..)
 }
 
 pub fn num_blocks(transfer_size: u64) -> u32 {
@@ -230,8 +245,17 @@ fn finish_frame(mut frame: FrameBuf, block_nr: u32, hash: u64, id: PayloadId) ->
 impl EncodedBlock {
     /// The relay frames of `pass`. Passes never repeat a symbol.
     pub fn frames(self, pass: u32) -> Vec<Bytes> {
+        self.frames_with(pass, FIRST_PASS_REPAIR, LATER_PASS_REPAIR)
+    }
+
+    /// Like `frames`, with the number of repair symbols of the first pass
+    /// (after the source symbols) and of each later pass given. A sender that
+    /// knows the loss to expect sizes these to cover it: with `first_repair`
+    /// = 15% of `N_SYMBOLS`, the receiver rebuilds the block from the first
+    /// pass alone as long as under about 13% of the symbols are lost.
+    pub fn frames_with(self, pass: u32, first_repair: u32, later_repair: u32) -> Vec<Bytes> {
         let EncodedBlock { block_nr, hash, encoder, ciphertext, frames } = self;
-        let mut out = Vec::with_capacity(N_SYMBOLS + FIRST_PASS_REPAIR as usize);
+        let mut out = Vec::with_capacity(N_SYMBOLS + first_repair as usize);
 
         let (start, count) = if pass == 0 {
             // source symbols are the ciphertext itself
@@ -240,9 +264,9 @@ impl EncodedBlock {
                 frame[SYMBOL_OFFSET..].copy_from_slice(symbol);
                 out.push(finish_frame(frame, block_nr, hash, PayloadId::new(SBN, i as u32)));
             }
-            (0, FIRST_PASS_REPAIR)
+            (0, first_repair)
         } else {
-            (FIRST_PASS_REPAIR + (pass - 1) * LATER_PASS_REPAIR, LATER_PASS_REPAIR)
+            (first_repair + (pass - 1) * later_repair, later_repair)
         };
         drop(ciphertext);
 
@@ -294,7 +318,7 @@ mod native_io {
     use std::{fs::File, io};
 
     /// Write at an offset without touching the file's cursor.
-    pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -313,7 +337,7 @@ mod native_io {
     }
 
     /// Read exactly `buf.len()` bytes at an offset.
-    pub fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -473,13 +497,23 @@ impl Decoder {
     /// once it is complete. Symbols of finished blocks are ignored.
     pub fn push(&mut self, payload: &[u8]) -> Result<Option<DecodedBlock>> {
         ensure!(payload.len() == PAYLOAD_SIZE, "bad symbol frame length {}", payload.len());
-        let block_nr = u32::from_le_bytes(payload[..4].try_into().unwrap());
+        let mut symbol = self.symbols.get();
+        symbol.copy_from_slice(&payload[SYMBOL_HEADER..]);
+        self.push_symbol(payload[..SYMBOL_HEADER].try_into().unwrap(), symbol)
+    }
+
+    /// Like `push`, with the payload already split: its header and its symbol,
+    /// which the decoder takes over as it is (no copy). A receiver that
+    /// reassembles symbols from datagrams can write them into a `Symbol` of
+    /// its own to begin with.
+    pub fn push_symbol(&mut self, header: &[u8; SYMBOL_HEADER], symbol: Symbol) -> Result<Option<DecodedBlock>> {
+        let block_nr = u32::from_le_bytes(header[..4].try_into().unwrap());
         ensure!(block_nr < num_blocks(self.transfer_size), "block {block_nr} out of range");
         if self.done.contains(&block_nr) {
             return Ok(None);
         }
-        let hash = u64::from_le_bytes(payload[4..12].try_into().unwrap());
-        let id = PayloadId::deserialize(payload[12..16].try_into().unwrap());
+        let hash = u64::from_le_bytes(header[4..12].try_into().unwrap());
+        let id = PayloadId::deserialize(header[12..16].try_into().unwrap());
         ensure!(id.source_block_number() == SBN, "unexpected source block number");
         match self.announced.entry(block_nr) {
             std::collections::hash_map::Entry::Vacant(e) => { e.insert(hash); }
@@ -490,8 +524,6 @@ impl Decoder {
 
         self.tick += 1;
         let esi = id.encoding_symbol_id();
-        let mut symbol = self.symbols.get();
-        symbol.copy_from_slice(&payload[16..]);
 
         if let Some(waiting) = self.loading.get_mut(&block_nr) {
             if waiting.len() < 2 * N_SYMBOLS {

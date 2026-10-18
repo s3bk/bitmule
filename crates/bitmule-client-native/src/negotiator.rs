@@ -93,6 +93,7 @@ pub(crate) enum Event2 {
 /// candidates loaded (see `build_rtc_with_pool_candidates` in
 /// `str0m_client`). Returns the two channel endpoints plus the join
 /// handle whose result is the Rtc for post-open use.
+#[allow(dead_code)]
 pub(crate) fn spawn(
     rtc: Rtc,
 ) -> (

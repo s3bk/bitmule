@@ -9,7 +9,7 @@ use std::{fs::File, io, path::PathBuf, sync::Arc, thread::JoinHandle};
 
 use tokio::sync::mpsc;
 
-use crate::fountain::{BLOCK_SIZE, Block, DecodedBlock, Pool, Pooled, SYMBOL_SIZE, SpillSink, Symbol, block_span, num_blocks, read_exact_at, write_all_at};
+use crate::fountain::{BLOCK_SIZE, Block, DecodedBlock, Pool, Pooled, SYMBOL_SIZE, SpillSink, Symbol, BLOCK_PLAIN, block_span, num_blocks, read_exact_at, write_all_at};
 
 /// An io_uring runtime, unless there is none or `BITMULE_NO_IO_URING` is set
 /// (to run on the blocking fallback).
@@ -78,6 +78,80 @@ fn read_blocks_blocking(
             let mut buf = pool.get();
             let result = read_exact_at(&file, &mut buf[..len], offset)
                 .map(|()| ReadBlock { pass, block_nr, buf, len });
+            let failed = result.is_err();
+            if tx.blocking_send(result).is_err() || failed {
+                return;
+            }
+        }
+    }
+}
+
+/// A piece of a requested range: `data` starts at `offset` in the file.
+pub struct RangeData {
+    pub offset: u64,
+    pub data: bytes::Bytes,
+}
+
+/// Serve byte ranges of the file, reading whole blocks like `read_blocks`
+/// (io_uring on Linux, blocking positional reads elsewhere, pooled buffers):
+/// for each requested `(start, end)` every block it touches is read with one
+/// read and handed on trimmed to the range, without a copy. The buffer goes
+/// back to the pool when the last piece of it is dropped. Reads ahead as far
+/// as the output channel has room; stops when either channel is dropped.
+pub fn read_ranges(
+    path: PathBuf,
+    size: u64,
+    requests: mpsc::Receiver<(u64, u64)>,
+) -> mpsc::Receiver<io::Result<RangeData>> {
+    let (tx, rx) = mpsc::channel(READ_AHEAD);
+    let pool = Pool::<BLOCK_SIZE>::new(READ_AHEAD + 4, READ_AHEAD);
+    std::thread::Builder::new().name("bitmule-read-ranges".into()).spawn(move || {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = uring_runtime() {
+            return runtime.block_on(uring::read_ranges(path, size, pool, requests, tx));
+        }
+        read_ranges_blocking(path, size, pool, requests, tx)
+    }).expect("spawning the range reader thread");
+    rx
+}
+
+/// The blocks a request touches.
+fn blocks_of(start: u64, end: u64) -> std::ops::RangeInclusive<u32> {
+    (start / BLOCK_PLAIN as u64) as u32..=((end - 1) / BLOCK_PLAIN as u64) as u32
+}
+
+/// The part of block `block_nr` (read into `buf`) that lies in `start..end`.
+fn trim_to_range(buf: Block, size: u64, block_nr: u32, start: u64, end: u64) -> RangeData {
+    let (offset, len) = block_span(size, block_nr);
+    let from = start.saturating_sub(offset) as usize;
+    let to = (end - offset).min(len as u64) as usize;
+    RangeData { offset: offset + from as u64, data: bytes::Bytes::from_owner(buf).slice(from..to) }
+}
+
+fn read_ranges_blocking(
+    path: PathBuf,
+    size: u64,
+    pool: Arc<Pool<BLOCK_SIZE>>,
+    mut requests: mpsc::Receiver<(u64, u64)>,
+    tx: mpsc::Sender<io::Result<RangeData>>,
+) {
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = tx.blocking_send(Err(e));
+            return;
+        }
+    };
+    while let Some((start, end)) = requests.blocking_recv() {
+        let end = end.min(size);
+        if start >= end {
+            continue;
+        }
+        for block_nr in blocks_of(start, end) {
+            let (offset, len) = block_span(size, block_nr);
+            let mut buf = pool.get();
+            let result = read_exact_at(&file, &mut buf[..len], offset)
+                .map(|()| trim_to_range(buf, size, block_nr, start, end));
             let failed = result.is_err();
             if tx.blocking_send(result).is_err() || failed {
                 return;
@@ -389,6 +463,37 @@ mod uring {
         }
         fn bytes_total(&self) -> usize {
             self.0.len()
+        }
+    }
+
+    pub async fn read_ranges(
+        path: PathBuf,
+        size: u64,
+        pool: Arc<Pool<BLOCK_SIZE>>,
+        mut requests: mpsc::Receiver<(u64, u64)>,
+        tx: mpsc::Sender<io::Result<RangeData>>,
+    ) {
+        let file = match tokio_uring::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+        while let Some((start, end)) = requests.recv().await {
+            let end = end.min(size);
+            if start >= end {
+                continue;
+            }
+            for block_nr in blocks_of(start, end) {
+                let (offset, len) = block_span(size, block_nr);
+                let (result, slice) = file.read_exact_at(UringBuf(pool.get()).slice(..len), offset).await;
+                let result = result.map(|()| trim_to_range(slice.into_inner().0, size, block_nr, start, end));
+                let failed = result.is_err();
+                if tx.send(result).await.is_err() || failed {
+                    return;
+                }
+            }
         }
     }
 

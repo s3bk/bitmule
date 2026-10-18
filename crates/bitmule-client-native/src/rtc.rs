@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use bitmule_core::protocol::websocket::{Peer2Peer, SdpAnswer as AnswerMsg, SdpOffer as OfferMsg};
 use bytes::Bytes;
 use str0m::{
@@ -56,6 +56,8 @@ pub enum Role {
 const SEND_QUEUE: usize = 64;
 /// Events queued towards the caller before the worker waits.
 const EVENT_QUEUE: usize = 256;
+/// Datagrams collected before they are sent, if str0m has that many ready.
+const TRANSMIT_BATCH: usize = 64;
 /// Below this much buffered data the channel takes more.
 const BUFFER_LOW: usize = 256 * 1024;
 
@@ -101,6 +103,63 @@ struct Driver {
     pool: SocketPool,
     channel: Option<ChannelId>,
     open: bool,
+    /// TEMP-INSTR: BITMULE_UDS: the data goes over a Unix socket once the channel is open
+    uds: Option<std::path::PathBuf>,
+    uds_ready: bool,
+    /// TEMP-INSTR: packets sent / received / received but not accepted by str0m
+    counts: PacketCounts,
+}
+
+#[derive(Default)]
+struct PacketCounts { out: u64, inn: u64, rejected: u64 }
+impl Drop for PacketCounts {
+    fn drop(&mut self) {
+        if std::env::var_os("BITMULE_SCTP_TRACE").is_some() {
+            eprintln!("PACKETS out={} in={} rejected={}", self.out, self.inn, self.rejected);
+        }
+    }
+}
+
+/// TEMP-INSTR: frames `u32 LE length | bytes` over the Unix socket, in both directions.
+async fn uds_pumps(
+    stream: tokio::net::UnixStream,
+    mut send_rx: mpsc::Receiver<Bytes>,
+    events: mpsc::Sender<ChannelEvent>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+    let (read, write) = stream.into_split();
+    tokio::spawn(async move {
+        let mut write = BufWriter::with_capacity(256 * 1024, write);
+        while let Some(message) = send_rx.recv().await {
+            let mut next = Some(message);
+            while let Some(m) = next.take() {
+                if write.write_all(&(m.len() as u32).to_le_bytes()).await.is_err() || write.write_all(&m).await.is_err() {
+                    return;
+                }
+                next = send_rx.try_recv().ok();
+            }
+            if write.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut read = BufReader::with_capacity(256 * 1024, read);
+        loop {
+            let mut len = [0u8; 4];
+            if read.read_exact(&mut len).await.is_err() {
+                break;
+            }
+            let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+            if read.read_exact(&mut buf).await.is_err() {
+                break;
+            }
+            if events.send(ChannelEvent::Message(Bytes::from(buf))).await.is_err() {
+                return;
+            }
+        }
+        let _ = events.send(ChannelEvent::Closed).await;
+    });
 }
 
 async fn run(
@@ -109,10 +168,19 @@ async fn run(
     pool: SocketPool,
     signal_tx: mpsc::Sender<Peer2Peer>,
     mut signal_rx: mpsc::Receiver<Peer2Peer>,
-    mut send_rx: mpsc::Receiver<Bytes>,
+    send_rx: mpsc::Receiver<Bytes>,
     events: &mpsc::Sender<ChannelEvent>,
 ) -> Result<()> {
-    let mut d = Driver { rtc, pool, channel: None, open: false };
+    let mut send_rx = Some(send_rx);
+    let uds = std::env::var_os("BITMULE_UDS").map(std::path::PathBuf::from); // TEMP-INSTR
+    let uds_listener = match (&uds, role) {
+        (Some(path), Role::Offerer) => {
+            let _ = std::fs::remove_file(path);
+            Some(tokio::net::UnixListener::bind(path)?)
+        }
+        _ => None,
+    };
+    let mut d = Driver { rtc, pool, channel: None, open: false, uds, uds_ready: false, counts: PacketCounts::default() };
     let mut pending_offer: Option<SdpPendingOffer> = None;
 
     if role == Role::Offerer {
@@ -127,6 +195,25 @@ async fn run(
     let mut unsent: Option<Bytes> = None;
     loop {
         let timeout = d.drain(events).await?;
+        if d.uds_ready {
+            d.uds_ready = false;
+            let stream = match (&uds_listener, &d.uds) {
+                (Some(listener), _) => listener.accept().await?.0,
+                (None, Some(path)) => {
+                    let mut tries = 0;
+                    loop {
+                        match tokio::net::UnixStream::connect(path).await {
+                            Ok(stream) => break stream,
+                            Err(e) if tries < 100 => { tries += 1; debug!("uds connect: {e}"); tokio::time::sleep(std::time::Duration::from_millis(20)).await; }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            };
+            tokio::spawn(uds_pumps(stream, send_rx.take().unwrap(), events.clone()));
+            events.send(ChannelEvent::Open).await?;
+        }
 
         if let (Some(buf), true) = (&unsent, d.open) {
             let id = d.channel.expect("open implies a channel");
@@ -148,8 +235,11 @@ async fn run(
                     destination: packet.destination,
                     contents: (&*packet.bytes).try_into().map_err(|_| anyhow!("oversized packet"))?,
                 });
+                d.counts.inn += 1;
                 if d.rtc.accepts(&input) {
                     d.rtc.handle_input(input).map_err(|e| anyhow!("handle_input: {e}"))?;
+                } else {
+                    d.counts.rejected += 1;
                 }
             }
             message = signal_rx.recv() => {
@@ -169,7 +259,7 @@ async fn run(
                     _ => {} // not for us
                 }
             }
-            message = send_rx.recv(), if d.open && unsent.is_none() => {
+            message = async { send_rx.as_mut().unwrap().recv().await }, if send_rx.is_some() && d.open && unsent.is_none() => {
                 match message {
                     Some(message) => unsent = Some(message),
                     None => return Ok(()), // the owner dropped its sender: done
@@ -183,19 +273,41 @@ async fn run(
 }
 
 impl Driver {
+    async fn flush(&mut self, transmits: &mut Vec<str0m::net::Transmit>) -> Result<()> {
+        if transmits.is_empty() {
+            return Ok(());
+        }
+        self.counts.out += transmits.len() as u64;
+        let batch: Vec<_> = transmits.iter().map(|t| (t.source, t.destination, &t.contents[..])).collect();
+        self.pool.send_batch(&batch).await?;
+        transmits.clear();
+        Ok(())
+    }
+
     /// Run str0m until it has nothing more to say; the rule is that this
     /// happens after every change. Returns when it wants to be woken next.
     async fn drain(&mut self, events: &mpsc::Sender<ChannelEvent>) -> Result<Instant> {
+        // what str0m wants sent goes out together, in as few syscalls as possible
+        let mut transmits = Vec::new();
         loop {
             match self.rtc.poll_output().map_err(|e| anyhow!("poll_output: {e}"))? {
-                Output::Timeout(at) => return Ok(at),
+                Output::Timeout(at) => {
+                    self.flush(&mut transmits).await?;
+                    return Ok(at);
+                }
                 Output::Transmit(t) => {
-                    self.pool.send_from(t.source, t.destination, &t.contents).await
-                        .with_context(|| format!("send to {}", t.destination))?;
+                    transmits.push(t);
+                    if transmits.len() >= TRANSMIT_BATCH {
+                        self.flush(&mut transmits).await?;
+                    }
                 }
                 Output::Event(Event::ChannelOpen(id, _label)) => {
                     self.channel = Some(id);
                     self.open = true;
+                    if self.uds.is_some() {
+                        self.uds_ready = true;
+                        continue;
+                    }
                     if let Some(mut channel) = self.rtc.channel(id) {
                         channel.set_buffered_amount_low_threshold(BUFFER_LOW);
                     }

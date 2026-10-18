@@ -198,13 +198,15 @@ pub mod websocket {
 
     use bitmule_crypto::BulkKey;
 use serde::{Deserialize, Serialize};
-    use crate::{ContentKey, ReceiverId, SessionId, Token, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
+    use crate::{ReceiverId, Token, crypto::{PublicKey, SessionMac}, inner::{Envelope, InnerKeyKind, OuterKeyKind}};
 
     bitflags! {
         #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
         pub struct PeerCaps: u8 {
             const RELAY = 1;
             const WEBRTC = 2;
+            /// Raw fountain symbols over UDP, straight between the peers (native clients only).
+            const UDP = 4;
         }
     }
 
@@ -343,6 +345,16 @@ use serde::{Deserialize, Serialize};
         // sender -> requester (receiver-initiated flow): the share link
         // (base64url) of the session the sender created for the transfer
         ShareLink(String),
+
+        // both ways, before a UDP transfer: where this peer can be reached
+        UdpHello(UdpHello),
+    }
+
+    /// The addresses (`ip:port`) a peer's UDP sockets can be reached at: its
+    /// own interfaces and, if STUN told it, the public ones.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct UdpHello {
+        pub addrs: Vec<String>,
     }
     /// WebRTC session description, offer half. Wire form is the standard
     /// SDP text blob (RFC 8866). The offer/answer distinction is carried
@@ -362,6 +374,52 @@ use serde::{Deserialize, Serialize};
         pub block_size: u32,
         pub transfer_size: u64,
         pub bulk_key: BulkKey,
+        /// What the sender calls the file (or the zip). Use [`TransferManifest::file_name`]
+        /// to save it: this is whatever the peer sent.
+        pub name: Option<String>,
+    }
+
+    impl TransferManifest {
+        /// `name` made safe to use as a file name in a directory: no path
+        /// components, no control characters, not empty, not too long. `None`
+        /// if nothing usable is left.
+        pub fn file_name(&self) -> Option<String> {
+            sanitize_file_name(self.name.as_deref()?)
+        }
+    }
+
+    pub fn sanitize_file_name(name: &str) -> Option<String> {
+        // the last component, whichever separator the sender's system uses
+        let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+        let cleaned: String = last.chars().filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|')).collect();
+        let cleaned = cleaned.trim().trim_matches('.').trim();
+        if cleaned.is_empty() {
+            return None;
+        }
+        // 200 bytes, on a character boundary
+        let mut end = cleaned.len().min(200);
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(cleaned[..end].to_string())
+    }
+
+    #[cfg(test)]
+    mod name_tests {
+        use super::sanitize_file_name as clean;
+
+        #[test]
+        fn names_lose_paths_and_oddities() {
+            assert_eq!(clean("photo.jpg").as_deref(), Some("photo.jpg"));
+            assert_eq!(clean("../../etc/passwd").as_deref(), Some("passwd"));
+            assert_eq!(clean("C:\\Users\\me\\a.txt").as_deref(), Some("a.txt"));
+            assert_eq!(clean("a\nb\0c.txt").as_deref(), Some("abc.txt"));
+            assert_eq!(clean("..").as_deref(), None);
+            assert_eq!(clean("/").as_deref(), None);
+            assert_eq!(clean("").as_deref(), None);
+            assert_eq!(clean(".hidden").as_deref(), Some("hidden"));
+            assert_eq!(clean(&"é".repeat(300)).unwrap().len(), 200);
+        }
     }
 
     #[derive(Serialize, Deserialize, Clone)]

@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use bitmule::v2;
 use bitmule_client_common::transfer::{Storage, TransferBuilder};
 use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
-use bitmule_client_native::{recv_file, send_file_multi, send_file_relay, ServeMode, TransportMode};
+use bitmule_client_native::{send_file_multi, send_file_relay, ServeMode, TransportMode};
 use clap::{Parser, Subcommand};
 use qrcode::{render::unicode, QrCode};
 use std::path::{Path, PathBuf};
@@ -135,14 +135,6 @@ enum IdentityAction {
         #[arg(long, default_value = identity::DEFAULT_CONTACT_BASE)]
         contact_base: String,
     },
-}
-
-fn mode_label(m: TransportMode) -> &'static str {
-    match m {
-        TransportMode::Webrtc => "WebRTC only",
-        TransportMode::Relay => "relay only",
-        TransportMode::Auto => "auto (WebRTC first, relay fallback)",
-    }
 }
 
 #[tokio::main]
@@ -466,12 +458,24 @@ async fn cmd_recv(
         }
     };
 
-    // `out` is the file to write; the manifest carries no name yet
-    let dest = if out.is_dir() { out.join("bitmule-download") } else { out };
-    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&dest)?;
-    println!("receiving into {}", dest.display());
-    let report = v2::run_recv(&server, &link, file, options).await?;
+    // `out` is the file to write, or a directory to put the sender's file in
+    let open = move |manifest: &bitmule_core::protocol::websocket::TransferManifest| {
+        let dest = if out.is_dir() {
+            out.join(manifest.file_name().unwrap_or_else(|| "bitmule-download".to_string()))
+        } else {
+            out
+        };
+        println!("receiving into {}", dest.display());
+        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&dest)
+    };
+    let report = v2::run_recv_with(&server, &link, open, options).await?;
     println!("done, over {:?} ({} bytes via relay, {} via data channel)", report.transport, report.relay_bytes, report.data_channel_bytes);
+    if let Some(line) = report.relay_time.describe(report.relay_bytes) {
+        println!("relay:        {line}");
+    }
+    if let Some(line) = report.data_channel_time.describe(report.data_channel_bytes) {
+        println!("data channel: {line}");
+    }
     Ok(())
 }
 

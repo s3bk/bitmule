@@ -31,7 +31,7 @@ use futures_util::StreamExt;
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle};
 use tracing::warn;
 
-use super::{Options, Report, Server, Transport, dcproto, peer::PeerLink};
+use super::{Options, Report, Server, Span, Transport, dcproto, peer::PeerLink};
 
 /// Symbols queued for the decoder thread.
 const DECODE_QUEUE: usize = 4096;
@@ -42,9 +42,17 @@ pub struct Context {
     our_id: ReceiverId,
     relay_token: Token,
     link: ShareLink,
-    out: Arc<std::fs::File>,
+    /// Makes the output file once the manifest is known (its name is in there).
+    open: Option<OpenOutput>,
+    progress: Option<Progress>,
     options: Options,
 }
+
+/// Called with (bytes received so far, total) as data comes in.
+pub type Progress = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// Makes the file the transfer is written to (read and write) from the manifest.
+pub type OpenOutput = Box<dyn FnOnce(&TransferManifest) -> std::io::Result<std::fs::File> + Send>;
 
 impl Context {
     pub fn new(
@@ -53,10 +61,11 @@ impl Context {
         our_id: ReceiverId,
         relay_token: Token,
         link: ShareLink,
-        out: std::fs::File,
+        open: OpenOutput,
+        progress: Option<Progress>,
         options: Options,
     ) -> Self {
-        Context { server, session_id, our_id, relay_token, link, out: Arc::new(out), options }
+        Context { server, session_id, our_id, relay_token, link, open: Some(open), progress, options }
     }
 
     fn relay_url(&self) -> String {
@@ -70,9 +79,22 @@ impl Context {
 /// How a relay download ended.
 enum RelayEnd {
     /// Every block is in the file.
-    Complete,
+    Complete(Span),
     /// Stopped on request; these blocks are in the file.
-    Stopped(Vec<u32>),
+    Stopped(Vec<u32>, Span),
+}
+
+/// Counts `n` more bytes as received and reports.
+type Bump = Arc<dyn Fn(u64) + Send + Sync>;
+
+fn bump_for(progress: Option<Progress>, size: u64) -> Bump {
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    Arc::new(move |n| {
+        let total = done.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
+        if let Some(progress) = &progress {
+            progress(total.min(size), size);
+        }
+    })
 }
 
 /// A running relay download.
@@ -83,9 +105,9 @@ struct Relay {
 }
 
 impl Relay {
-    fn start(url: String, manifest: TransferManifest, out: Arc<std::fs::File>) -> Self {
+    fn start(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, bump: Bump) -> Self {
         let (stop, stop_rx) = oneshot::channel();
-        Relay { task: tokio::spawn(relay_download(url, manifest, out, stop_rx)), stop: Some(stop) }
+        Relay { task: tokio::spawn(relay_download(url, manifest, out, stop_rx, bump)), stop: Some(stop) }
     }
 }
 
@@ -142,7 +164,7 @@ impl DcRequests {
     }
 }
 
-pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signaling: PeerLink) -> Result<Report> {
+pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, signaling: PeerLink) -> Result<Report> {
     let PeerLink { tx, mut rx } = app;
 
     let manifest = loop {
@@ -155,6 +177,8 @@ pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signali
     };
     ensure!(manifest.block_size as usize == fountain::BLOCK_PLAIN, "sender uses an unsupported block size");
     let size = manifest.transfer_size;
+    let out = Arc::new((ctx.open.take().expect("the output is opened once"))(&manifest)?);
+    let bump = bump_for(ctx.progress.take(), size);
 
     let use_relay = ctx.options.relay && sender_caps.contains(PeerCaps::RELAY);
     let use_webrtc = ctx.options.webrtc && sender_caps.contains(PeerCaps::WEBRTC);
@@ -162,7 +186,11 @@ pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signali
 
     tx.send(Peer2Peer::Get { start: 0, end: size }).await?;
 
+    // TEMP-INSTR: BITMULE_MEMOUT=1 puts the data channel's output in memory, not the file
+    let mut mem: Option<Vec<u8>> = std::env::var_os("BITMULE_MEMOUT").map(|_| vec![0u8; size as usize]);
     let mut transport = Transport::Relay;
+    let mut relay_time = Span::default();
+    let mut data_channel_time = Span::default();
     let mut dc_bytes = 0u64;
     let mut relay_bytes = size;
     if size > 0 {
@@ -193,9 +221,9 @@ pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signali
                 result = async { (&mut relay.as_mut().unwrap().task).await }, if relay.is_some() => {
                     relay = None;
                     match result? {
-                        Ok(RelayEnd::Complete) => break,
+                        Ok(RelayEnd::Complete(span)) => { relay_time.merge(span); break }
                         // handed over to the data channel, which takes the rest
-                        Ok(RelayEnd::Stopped(done)) => have.extend(done),
+                        Ok(RelayEnd::Stopped(done, span)) => { relay_time.merge(span); have.extend(done) }
                         Err(e) if channel.is_some() || data_channel_active => {
                             warn!("relay download: {e}");
                             relay_failed = true;
@@ -209,7 +237,7 @@ pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signali
                         // holds, and the data channel asks for the rest
                         data_channel_active = true;
                         dc_start_due = true;
-                        dc_writer.get_or_insert_with(|| BlockWriter::spawn(ctx.out.clone()));
+                        dc_writer.get_or_insert_with(|| BlockWriter::spawn(out.clone()));
                         if let Some(stop) = relay.as_mut().and_then(|r| r.stop.take()) {
                             let _ = stop.send(());
                         }
@@ -218,8 +246,10 @@ pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signali
                         dcproto::Message::Data { offset, bytes } if data_channel_active && dc.current.is_some() => {
                             let len = bytes.len() as u64;
                             ensure!(dc.accepts(offset, len), "sender sent data that was not asked for");
-                            dc_writer.as_ref().unwrap().write_bytes(offset, bytes).await?;
+                            data_channel_time.mark();
+                            if let Some(mem) = mem.as_mut() { mem[offset as usize..][..bytes.len()].copy_from_slice(&bytes); } else { dc_writer.as_ref().unwrap().write_bytes(offset, bytes).await?; } // TEMP-INSTR
                             dc_bytes += len;
+                            bump(len);
                             match dc.received(len) {
                                 Some(Some((start, end))) => {
                                     channel.as_ref().unwrap().send.send(dcproto::Message::Get { start, end }.encode()).await?;
@@ -262,7 +292,7 @@ pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signali
                 }
             }
             if use_relay && relay_offered && !relay_failed && !data_channel_active && relay.is_none() {
-                relay = Some(Relay::start(ctx.relay_url(), manifest.clone(), ctx.out.clone()));
+                relay = Some(Relay::start(ctx.relay_url(), manifest.clone(), out.clone(), bump.clone()));
             }
         }
         // whatever the data channel wrote has to be on disk before it is read back
@@ -271,11 +301,18 @@ pub async fn receive(ctx: Context, sender_caps: PeerCaps, app: PeerLink, signali
         }
     }
 
-    if commitment_of(ctx.out.clone(), size, manifest.bulk_key.clone()).await? != ctx.link.signature {
+    if let Some(mem) = &mem { // TEMP-INSTR: the data channel wrote into memory; check it there
+        let mut hasher = CommitmentHasher::new();
+        hasher.update(mem);
+        ensure!(hasher.finalize(&manifest.bulk_key) == ctx.link.signature, "data does not match the share link's signature");
+        tx.send(Peer2Peer::Complete).await?;
+        return Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, relay_time, data_channel_time });
+    }
+    if commitment_of(out.clone(), size, manifest.bulk_key.clone()).await? != ctx.link.signature {
         bail!("data does not match the share link's signature");
     }
     tx.send(Peer2Peer::Complete).await?;
-    Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes })
+    Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, relay_time, data_channel_time })
 }
 
 /// `SHA256(file || bulk_key)`, read back from the finished file.
@@ -302,7 +339,7 @@ async fn commitment_of(file: Arc<std::fs::File>, size: u64, key: BulkKey) -> Res
 /// gap in `out`. Dropping the future stops it all; `stop` ends it gracefully:
 /// the frames already taken are decoded, the blocks written, and the blocks
 /// that are in `out` are reported.
-async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, stop: oneshot::Receiver<()>) -> Result<RelayEnd> {
+async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, stop: oneshot::Receiver<()>, bump: Bump) -> Result<RelayEnd> {
     let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
     let mut stream = response.bytes_stream();
     let mut splitter = fountain::FrameSplitter::default();
@@ -345,6 +382,7 @@ async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::f
                     Event::End => return Ok(()),
                 };
                 if let Some(block) = block {
+                    bump(block.data().len() as u64);
                     writer.write(block)?;
                 }
             }
@@ -359,6 +397,7 @@ async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::f
     let mut tx = Some(tx);
     let mut stop = Some(stop);
     let mut stopped = false;
+    let mut span = Span::default();
     loop {
         tokio::select! {
             asked = async { stop.as_mut().unwrap().await }, if stop.is_some() => {
@@ -373,6 +412,7 @@ async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::f
                     Some(chunk) => {
                         let chunk = chunk?;
                         for payload in splitter.push(&chunk)? {
+                            span.mark();
                             // a full queue holds the download back; the relay then drops
                             // frames for us and the sender covers them with fresh symbols
                             if tx.as_ref().unwrap().send(payload).await.is_err() {
@@ -387,9 +427,9 @@ async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::f
             result = &mut decode => {
                 let done = result??;
                 return if done.len() == fountain::num_blocks(size) as usize {
-                    Ok(RelayEnd::Complete)
+                    Ok(RelayEnd::Complete(span))
                 } else if stopped {
-                    Ok(RelayEnd::Stopped(done))
+                    Ok(RelayEnd::Stopped(done, span))
                 } else {
                     bail!("relay stream ended before the transfer was complete")
                 };

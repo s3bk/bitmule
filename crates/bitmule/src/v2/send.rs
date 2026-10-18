@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
-use bitmule_client_common::{blockio::read_blocks, fountain, transfer::Transfer};
+use bitmule_client_common::{blockio::{RangeData, read_blocks, read_ranges}, fountain, transfer::Transfer};
 use bitmule_core::{
     ReceiverId, SessionId, Token,
     protocol::websocket::{Peer2Peer, PeerCaps, TransferManifest},
@@ -18,11 +18,11 @@ use futures_util::stream::FuturesOrdered;
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::warn;
+use tracing::{info, warn};
 
 use bitmule_client_native::rtc::{self, ChannelEvent, DataChannel};
 
-use super::{Options, Server, dcproto, peer::PeerLink};
+use super::{Options, Server, Span, dcproto, peer::PeerLink};
 
 /// Size of one `InlineData` piece. Stays well below the server's
 /// WebSocket message limit.
@@ -94,6 +94,7 @@ pub async fn serve_peer(ctx: Arc<Context>, peer_caps: PeerCaps, app: PeerLink, s
     let size = ctx.manifest.transfer_size;
     let mut signaling = Some(signaling);
     let mut webrtc: Option<Webrtc> = None;
+    let relay_offered = ctx.options.relay && peer_caps.contains(PeerCaps::RELAY);
 
     tx.send(Peer2Peer::Manifest(ctx.manifest.clone())).await?;
     loop {
@@ -102,7 +103,7 @@ pub async fn serve_peer(ctx: Arc<Context>, peer_caps: PeerCaps, app: PeerLink, s
                 let Some(message) = message else { bail!("receiver went away") };
                 match message {
                     Peer2Peer::Get { start, end } if start == 0 && end == size && size > 0 => {
-                        if ctx.options.relay && peer_caps.contains(PeerCaps::RELAY) {
+                        if relay_offered {
                             tx.send(Peer2Peer::JoinRelay).await?;
                             let relay = ctx.clone();
                             ctx.relay.start_once(async move {
@@ -115,7 +116,7 @@ pub async fn serve_peer(ctx: Arc<Context>, peer_caps: PeerCaps, app: PeerLink, s
                             if let Some(signaling) = signaling.take() {
                                 let channel = rtc::spawn(rtc::Role::Offerer, ctx.server.stun_addr().await, signaling.tx, signaling.rx).await?;
                                 let (requests, ranges) = mpsc::channel(8);
-                                tokio::spawn(serve_ranges(ctx.transfer.clone(), ranges, channel.send.clone()));
+                                tokio::spawn(serve_ranges(ctx.transfer.path().to_path_buf(), size, ranges, channel.send.clone()));
                                 webrtc = Some(Webrtc { channel, requests });
                             }
                         }
@@ -146,30 +147,61 @@ pub async fn serve_peer(ctx: Arc<Context>, peer_caps: PeerCaps, app: PeerLink, s
                         dcproto::Message::Data { .. } => bail!("receiver sent data"),
                     },
                     Some(ChannelEvent::Open) => {}
-                    // the relay (if any) carries on without it
-                    Some(ChannelEvent::Closed) | None => webrtc = None,
+                    Some(ChannelEvent::Closed) | None => {
+                        // the relay, if this receiver uses it, carries on without the channel
+                        ensure!(relay_offered, "data channel closed and there is no relay to fall back on");
+                        webrtc = None;
+                    }
                 }
             }
         }
     }
 }
 
-/// Reads the ranges the receiver asks for over the data channel and sends
-/// them as pieces. Ends when either side is dropped.
-async fn serve_ranges(transfer: Arc<Transfer>, mut requests: mpsc::Receiver<(u64, u64)>, send: mpsc::Sender<Bytes>) {
-    while let Some((start, end)) = requests.recv().await {
-        let mut pos = start;
-        while pos < end {
-            let len = dcproto::PIECE.min((end - pos) as usize);
-            let bytes = match transfer.read_at(pos, len).await {
-                Ok(bytes) if !bytes.is_empty() => bytes,
-                _ => return,
-            };
-            let offset = pos;
-            pos += bytes.len() as u64;
-            if send.send(dcproto::Message::Data { offset, bytes }.encode()).await.is_err() {
+/// Reads the ranges the receiver asks for over the data channel, a block at
+/// a time (`read_ranges`), and sends them as pieces. Ends when either side is
+/// dropped.
+async fn serve_ranges(path: std::path::PathBuf, size: u64, requests: mpsc::Receiver<(u64, u64)>, send: mpsc::Sender<Bytes>) {
+    let mut ranges = read_ranges(path, size, requests);
+    let mut stats = SendStats::new("data channel");
+    let messages = dcproto::message_pool();
+    while let Some(Ok(RangeData { offset, data })) = ranges.recv().await {
+        let mut pos = 0;
+        while pos < data.len() {
+            let end = (pos + dcproto::PIECE).min(data.len());
+            let message = dcproto::data_message(&messages, offset + pos as u64, &data[pos..end]);
+            if send.send(message).await.is_err() {
                 return;
             }
+            stats.sent((end - pos) as u64);
+            pos = end;
+        }
+    }
+}
+
+/// What a sending task handed on, first to last piece. Logs the figures
+/// when the task ends.
+struct SendStats {
+    what: &'static str,
+    span: Span,
+    bytes: u64,
+}
+
+impl SendStats {
+    fn new(what: &'static str) -> Self {
+        SendStats { what, span: Span::default(), bytes: 0 }
+    }
+
+    fn sent(&mut self, bytes: u64) {
+        self.span.mark();
+        self.bytes += bytes;
+    }
+}
+
+impl Drop for SendStats {
+    fn drop(&mut self) {
+        if let Some(line) = self.span.describe(self.bytes) {
+            info!("sent over the {}: {line}", self.what);
         }
     }
 }
@@ -193,6 +225,8 @@ async fn relay_upload(ctx: &Context) -> Result<()> {
         bitmule_client_native::nic::http_client().post(url).body(reqwest::Body::wrap_stream(ReceiverStream::new(rx))).send()
     );
 
+    // the frames count, repair symbols included, so this is wire bytes
+    let mut stats = SendStats::new("relay");
     let encoder = Arc::new(fountain::Encoder::new());
     let mut blocks = read_blocks(ctx.transfer.path().to_path_buf(), size, encoder.block_pool());
     let parallel = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
@@ -215,10 +249,12 @@ async fn relay_upload(ctx: &Context) -> Result<()> {
         }
         let Some(frames) = encoding.next().await else { return Ok(()) };
         for frame in frames?? {
+            let len = frame.len() as u64;
             if tx.send(Ok(frame)).await.is_err() {
                 // the upload ended; see why
                 bail!("relay closed the upload: {:?}", post.await?.map(|r| r.status()));
             }
+            stats.sent(len);
         }
     }
 }

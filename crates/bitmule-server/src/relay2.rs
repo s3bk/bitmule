@@ -71,7 +71,7 @@ impl IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
         let (status, body): (StatusCode, Cow<str>) = match self {
-            Error::Io(e) => (StatusCode::BAD_REQUEST, "Io Error".into()),
+            Error::Io(_e) => (StatusCode::BAD_REQUEST, "Io Error".into()),
             Error::InvalidFrameType(t) => (StatusCode::BAD_REQUEST, format!("invalid frame type: {t}").into()),
             Error::Closed => (StatusCode::SERVICE_UNAVAILABLE, "session closed".into()),
             Error::BadSessionId => (StatusCode::BAD_REQUEST, "Invalid Session ID".into()),

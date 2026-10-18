@@ -12,6 +12,7 @@ name = "bitmule"
 path = "src/main.rs"
 
 [dependencies]
+bitmule-buf = { path = "../bitmule-buf" }
 bitmule-core = { path = "../bitmule-core" }
 bitmule-client-common = { path = "../bitmule-client-common" }
 bitmule-client-native = { path = "../bitmule-client-native" }
