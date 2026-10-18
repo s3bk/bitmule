@@ -52,6 +52,12 @@ impl<const N: usize> Array<N> {
     }
 }
 
+/// Touch the pages at mmap time where the OS can (Linux); elsewhere they fault in on first use.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAP_POPULATE: libc::c_int = libc::MAP_POPULATE;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const MAP_POPULATE: libc::c_int = 0;
+
 /// One allocation for a slab pool's arrays.
 struct Region {
     base: *mut u8,
@@ -71,7 +77,7 @@ impl Region {
                 std::ptr::null_mut(),
                 len.max(1),
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | MAP_POPULATE,
                 -1,
                 0,
             );
