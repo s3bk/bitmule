@@ -485,10 +485,38 @@ async fn array_buffer_chunks(data: &Uint8Array, mut cb: impl FnMut(&[u8])) {
     }
 }
 
+/// The entry's name inside the zip: the file's name as given, with its
+/// directories (`album/sub/a.txt`) so a folder keeps its layout. Only plain
+/// path components are kept, so a name can't point outside the folder it is
+/// unpacked into.
 fn zip_entry_name(entry: &FileEntry, idx: usize) -> String {
-    entry
+    let parts: Vec<String> = entry
         .name
-        .as_ref()
-        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| format!("file_{idx}"))
+        .iter()
+        .flat_map(|p| p.components())
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() { format!("file_{idx}") } else { parts.join("/") }
+}
+
+#[cfg(test)]
+mod zip_name_tests {
+    use super::*;
+
+    fn entry(name: Option<&str>) -> FileEntry {
+        FileEntry { name: name.map(PathBuf::from), storage: Storage::Bytes(Default::default()) }
+    }
+
+    #[test]
+    fn keeps_directories_and_drops_anything_that_escapes() {
+        assert_eq!(zip_entry_name(&entry(Some("a.txt")), 0), "a.txt");
+        assert_eq!(zip_entry_name(&entry(Some("album/sub/a.txt")), 0), "album/sub/a.txt");
+        assert_eq!(zip_entry_name(&entry(Some("../../etc/passwd")), 0), "etc/passwd");
+        assert_eq!(zip_entry_name(&entry(Some("/abs/path.txt")), 0), "abs/path.txt");
+        assert_eq!(zip_entry_name(&entry(None), 3), "file_3");
+        assert_eq!(zip_entry_name(&entry(Some("..")), 7), "file_7");
+    }
 }

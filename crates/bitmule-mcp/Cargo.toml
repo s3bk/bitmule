@@ -1,0 +1,24 @@
+[package]
+name = "bitmule-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MCP server (stdio) that lets agents send and receive files over bitmule"
+repository.workspace = true
+
+[[bin]]
+name = "bitmule-mcp"
+path = "src/main.rs"
+
+[dependencies]
+bitmule = { path = "../bitmule" }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+bitmule-server = { path = "../bitmule-server" }
+axum = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["process", "time"] }

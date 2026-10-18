@@ -17,6 +17,7 @@ members = [
     "crates/fountain-demo-v2",
     "crates/raptor-demo",
     "crates/bitmule-client-common",
+    "crates/bitmule-mcp",
 ]
 
 [workspace.package]

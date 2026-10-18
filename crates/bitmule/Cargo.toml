@@ -37,6 +37,7 @@ serde_json = { workspace = true }
 percent-encoding = "2"
 tempfile = { workspace = true }
 thiserror = "2"
+zip = { workspace = true, features = ["deflate", "zstd"] }
 
 [dev-dependencies]
 # In-process bitmule-server for integration tests — lets us spawn the
