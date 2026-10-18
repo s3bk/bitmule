@@ -91,6 +91,10 @@ const KIND_HELLO: u8 = 1;
 const KIND_ACK: u8 = 2;
 const KIND_DATA: u8 = 3;
 const KIND_FEEDBACK: u8 = 4;
+const KIND_PROBE: u8 = 5;
+const KIND_PROBE_ACK: u8 = 6;
+const KIND_MTU: u8 = 7;
+const KIND_MTU_ACK: u8 = 8;
 /// Set in the nonce of every sealed packet. Block nonces are small numbers.
 const SEAL_DOMAIN: u64 = 1 << 63;
 
@@ -100,6 +104,18 @@ const FEEDBACK_EVERY: Duration = Duration::from_millis(50);
 /// Incomplete symbols kept while waiting for their other fragments.
 const REASSEMBLY_WINDOW: usize = 512;
 const HELLO_EVERY: Duration = Duration::from_millis(100);
+/// What a sealed packet adds to its data: kind, nonce, the kind again inside, the tag.
+const SEAL_OVERHEAD: usize = 1 + 8 + 1 + 16;
+/// Datagram sizes (UDP payload bytes) the sender probes for, largest first: jumbo
+/// frames (a whole 8 KiB symbol in one datagram), IPv4 and IPv6 over Ethernet,
+/// PPPoE, tunnels, VPNs, the IPv6 minimum, and the size that always worked.
+const MTU_LADDER: [usize; 8] = [8972, 1472, 1452, 1432, 1400, 1280, 1232, FRAGMENT + DATA_HEADER];
+/// The most the pool's sockets read per datagram.
+const POOL_DATAGRAM: usize = 2048;
+const MTU_ROUND: Duration = Duration::from_millis(100);
+const MTU_ROUNDS: usize = 6;
+/// Time allowed for finding the size, on top of the time to find the path.
+const MTU_TIME: Duration = Duration::from_secs(3);
 /// The sender never goes below this (bytes per second).
 const MIN_RATE: f64 = 1_000_000.0;
 /// How much the sender may send in a burst without waiting.
@@ -121,6 +137,14 @@ pub struct UdpConfig {
     pub fragment: usize,
     /// Run the data phase on io_uring when the machine has it (Linux).
     pub io_uring: bool,
+    /// Find the datagram size the path carries (both peers must agree; the
+    /// sender decides and tells the receiver). Then `fragment` is ignored: a
+    /// whole symbol goes in one datagram where the path allows it, else in
+    /// the fewest that fit. Without this, `fragment` is used as it is.
+    pub discover_mtu: bool,
+    /// For tests: datagrams longer than this are ignored on receive, as a
+    /// path with a smaller MTU would drop them.
+    pub max_datagram: usize,
 }
 
 impl Default for UdpConfig {
@@ -132,6 +156,8 @@ impl Default for UdpConfig {
             drop: 0.0,
             io_uring: true,
             fragment: FRAGMENT,
+            discover_mtu: true,
+            max_datagram: usize::MAX,
         }
     }
 }
@@ -177,6 +203,8 @@ pub struct UdpLink<T> {
     pub block_done: mpsc::UnboundedSender<u32>,
     /// Sender: what the receiver has told us is complete.
     pub done: Arc<DoneBlocks>,
+    /// Symbol bytes per datagram, as found or configured.
+    pub fragment: usize,
     worker: Worker,
 }
 
@@ -206,7 +234,7 @@ pub async fn connect<A: Assembler>(
     signal_tx: mpsc::Sender<Peer2Peer>,
     mut signal_rx: mpsc::Receiver<Peer2Peer>,
     cfg: UdpConfig,
-    assembler: A,
+    mut assembler: A,
 ) -> Result<UdpLink<A::Item>> {
     let mut cfg = cfg;
     cfg.fragment = cfg.fragment.clamp(64, FRAGMENT_MAX);
@@ -272,6 +300,26 @@ pub async fn connect<A: Assembler>(
     };
     debug!("udp path {local} <-> {remote}");
 
+    if cfg.discover_mtu {
+        let dup = pool.dup_socket(local.ip())?;
+        let forbidden = forbid_fragmentation(&dup);
+        // a probe above what the pool reads would arrive cut short, so with
+        // io_uring (big buffers in the data phase) the probes use a socket of our own
+        let datagram = if uring {
+            pool.stop_receiving();
+            dup.set_nonblocking(true)?;
+            let wire = Wire::Socket(tokio::net::UdpSocket::from_std(dup)?);
+            discover_mtu(role, &key, &wire, remote, &mtu_ladder(forbidden, usize::MAX), cfg.max_datagram, deadline + MTU_TIME).await?
+        } else {
+            drop(dup);
+            let wire = Wire::Pool(&pool, local);
+            discover_mtu(role, &key, &wire, remote, &mtu_ladder(forbidden, POOL_DATAGRAM), cfg.max_datagram, deadline + MTU_TIME).await?
+        };
+        cfg.fragment = datagram - DATA_HEADER;
+        assembler.set_fragment(cfg.fragment);
+        debug!("udp datagrams of {datagram} bytes ({} per symbol of 8 KiB)", 8208usize.div_ceil(cfg.fragment));
+    }
+
     let (payloads_out, out_rx) = mpsc::channel(256);
     let (in_tx, payloads_in) = mpsc::channel(2048);
     let (block_done, done_rx) = mpsc::unbounded_channel();
@@ -288,14 +336,194 @@ pub async fn connect<A: Assembler>(
         }?;
         pool.stop_receiving();
         debug!("udp data phase on io_uring");
-        return Ok(UdpLink { payloads_out, payloads_in, block_done, done, worker: Worker::Uring(stop) });
+        return Ok(UdpLink { payloads_out, payloads_in, block_done, done, fragment: cfg.fragment, worker: Worker::Uring(stop) });
     }
 
     let task = match role {
         Role::Sender => tokio::spawn(sender(pool, key, path, cfg, out_rx, done.clone())),
         Role::Receiver => tokio::spawn(receiver(pool, key, path, cfg, assembler, in_tx, done_rx)),
     };
-    Ok(UdpLink { payloads_out, payloads_in, block_done, done, worker: Worker::Task(task) })
+    Ok(UdpLink { payloads_out, payloads_in, block_done, done, fragment: cfg.fragment, worker: Worker::Task(task) })
+}
+
+// ---- path MTU -----------------------------------------------------------------
+
+/// How the probes travel.
+enum Wire<'a> {
+    /// The pool's sockets, from this address. Reads are `POOL_DATAGRAM` at most.
+    Pool(&'a SocketPool, SocketAddr),
+    /// A socket of our own, read with a big buffer.
+    Socket(tokio::net::UdpSocket),
+}
+
+impl Wire<'_> {
+    async fn send(&self, to: SocketAddr, bytes: &[u8]) {
+        // too big for the path or the interface: that is an answer too
+        match self {
+            Wire::Pool(pool, local) => {
+                let _ = pool.send_from(*local, to, bytes).await;
+            }
+            Wire::Socket(socket) => {
+                let _ = socket.send_to(bytes, to).await;
+            }
+        }
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        match self {
+            Wire::Pool(pool, _) => {
+                let packet = pool.recv().await?;
+                let n = packet.bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&packet.bytes[..n]);
+                Some((n, packet.source))
+            }
+            Wire::Socket(socket) => socket.recv_from(buf).await.ok(),
+        }
+    }
+}
+
+/// Make the kernel refuse to fragment what this socket sends (and tell us when
+/// it is too big for the interface), so that a probe arrives only if the path
+/// carries it whole. False where that is not possible; then only the size that
+/// always worked is probed, since a big probe would pass in IP fragments.
+fn forbid_fragmentation(socket: &std::net::UdpSocket) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let (level, name) = match socket.local_addr() {
+            Ok(addr) if addr.is_ipv4() => (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER),
+            Ok(_) => (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER),
+            Err(_) => return false,
+        };
+        let value: libc::c_int = libc::IP_PMTUDISC_DO;
+        let result = unsafe {
+            libc::setsockopt(socket.as_raw_fd(), level, name, &value as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t)
+        };
+        result == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
+/// The datagram sizes to probe for: all that a reader of `read_max` bytes takes
+/// if fragmentation can be forbidden, else only the one that always worked.
+fn mtu_ladder(can_forbid: bool, read_max: usize) -> Vec<usize> {
+    if !can_forbid {
+        return vec![FRAGMENT + DATA_HEADER];
+    }
+    MTU_LADDER.iter().copied().filter(|&size| size <= read_max).collect()
+}
+
+/// Agree on the datagram size for the data phase. The sender sends a sealed
+/// `PROBE` of each size in `ladder`; the receiver answers each that arrives
+/// with the size it saw. The sender takes the largest answered, tells the
+/// receiver (`MTU`, repeated until `MTU_ACK`), and both use it. Everything is
+/// sealed, so nobody on the path can shrink it. Falls back to the size that
+/// always worked when no probe is answered.
+async fn discover_mtu(
+    role: Role,
+    key: &BulkKey,
+    wire: &Wire<'_>,
+    remote: SocketAddr,
+    ladder: &[usize],
+    max_datagram: usize,
+    deadline: Instant,
+) -> Result<usize> {
+    let mut buf = vec![0u8; 65536];
+    match role {
+        Role::Sender => {
+            let probes = ladder
+                .iter()
+                .map(|&size| seal(key, KIND_PROBE, &vec![0u8; size.saturating_sub(SEAL_OVERHEAD).max(1)]))
+                .collect::<Result<Vec<_>>>()?;
+            let mut best = 0usize;
+            for round in 0..MTU_ROUNDS {
+                for probe in &probes {
+                    wire.send(remote, probe).await;
+                }
+                let end = Instant::now() + MTU_ROUND;
+                while let Ok(Some((n, from))) = timeout_at(end, wire.recv(&mut buf)).await {
+                    if from != remote {
+                        continue;
+                    }
+                    if let Some((KIND_PROBE_ACK, data)) = open(key, &buf[..n]) {
+                        if let Ok(size) = <[u8; 2]>::try_from(&data[..]) {
+                            let size = u16::from_be_bytes(size) as usize;
+                            if ladder.contains(&size) {
+                                best = best.max(size);
+                            }
+                        }
+                    }
+                }
+                // two rounds at least: one lost probe should not cost the jumbo size
+                if best > 0 && round >= 1 {
+                    break;
+                }
+            }
+            if best == 0 {
+                warn!("udp: no probe was answered, using datagrams of {} bytes", FRAGMENT + DATA_HEADER);
+                best = FRAGMENT + DATA_HEADER;
+            }
+            let size = (best as u16).to_be_bytes();
+            let announce = seal(key, KIND_MTU, &size)?;
+            let mut tick = interval(Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        if Instant::now() >= deadline {
+                            bail!("the peer did not confirm the datagram size");
+                        }
+                        wire.send(remote, &announce).await;
+                    }
+                    received = wire.recv(&mut buf) => {
+                        let Some((n, from)) = received else { bail!("UDP socket closed") };
+                        if from == remote && matches!(open(key, &buf[..n]), Some((KIND_MTU_ACK, data)) if data == size) {
+                            return Ok(best);
+                        }
+                    }
+                }
+            }
+        }
+        Role::Receiver => {
+            let mut chosen = None;
+            let mut until = deadline;
+            loop {
+                let received = match timeout_at(until, wire.recv(&mut buf)).await {
+                    Ok(received) => received,
+                    // the sender stopped repeating itself: it has our answer
+                    Err(_) if chosen.is_some() => return Ok(chosen.unwrap()),
+                    Err(_) => bail!("the peer did not announce a datagram size"),
+                };
+                let Some((n, from)) = received else { bail!("UDP socket closed") };
+                if from != remote || n > max_datagram {
+                    continue;
+                }
+                match open(key, &buf[..n]) {
+                    // our own answer may not have left before the pool stopped: the sender is still asking
+                    Some((KIND_HELLO, data)) if data.len() == 17 && data[0] == role_byte(Role::Sender) => {
+                        wire.send(remote, &seal(key, KIND_ACK, &data[1..])?).await;
+                    }
+                    Some((KIND_PROBE, _)) => {
+                        wire.send(remote, &seal(key, KIND_PROBE_ACK, &(n as u16).to_be_bytes())?).await;
+                    }
+                    Some((KIND_MTU, data)) => {
+                        let Ok(size) = <[u8; 2]>::try_from(&data[..]) else { continue };
+                        let announced = u16::from_be_bytes(size) as usize;
+                        if !(DATA_HEADER + 64..=DATAGRAM_MAX).contains(&announced) {
+                            bail!("the peer announced a datagram size of {announced}");
+                        }
+                        chosen = Some(announced);
+                        wire.send(remote, &seal(key, KIND_MTU_ACK, &size)?).await;
+                        until = Instant::now() + Duration::from_millis(300);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 struct Path {
@@ -331,7 +559,7 @@ fn seal(key: &BulkKey, kind: u8, data: &[u8]) -> Result<Bytes> {
 
 /// The kind and data of a sealed packet, if it is one and is genuine.
 fn open(key: &BulkKey, packet: &[u8]) -> Option<(u8, Vec<u8>)> {
-    if packet.len() < 9 + 1 + 16 || !matches!(packet[0], KIND_HELLO | KIND_ACK | KIND_FEEDBACK) {
+    if packet.len() < 9 + 1 + 16 || !matches!(packet[0], KIND_HELLO | KIND_ACK | KIND_FEEDBACK | KIND_PROBE | KIND_PROBE_ACK | KIND_MTU | KIND_MTU_ACK) {
         return None;
     }
     let nonce = u64::from_le_bytes(packet[1..9].try_into().ok()?);
@@ -549,6 +777,9 @@ pub trait Assembler: Send + 'static {
     /// `count`, and payloads that never complete (keep a bounded window of
     /// those) are the assembler's to deal with.
     fn fragment(&mut self, seq: u32, index: u8, count: u8, bytes: &[u8]) -> Option<Self::Item>;
+
+    /// The fragment size found for the path; called once, before any fragment.
+    fn set_fragment(&mut self, _fragment: usize) {}
 }
 
 /// The fragments of a `DATA` datagram: sequence number, index, count, bytes.
@@ -586,6 +817,10 @@ impl Default for BytesAssembler {
 }
 
 impl Assembler for BytesAssembler {
+    fn set_fragment(&mut self, fragment: usize) {
+        self.fragment = fragment;
+    }
+
     type Item = Bytes;
 
     fn fragment(&mut self, seq: u32, index: u8, count: u8, fragment: &[u8]) -> Option<Bytes> {
@@ -920,7 +1155,68 @@ mod tests {
         let got = roundtrip(true, 0.0, 200).await;
         assert!(got >= 190, "{got} of 200");
         let lossy = roundtrip(true, 0.05, 200).await;
-        assert!((90..=185).contains(&lossy), "with 5% datagram loss (about 70% of symbols whole): {lossy} of 200");
+        // a symbol is one datagram on loopback, so about 95% arrive whole
+        assert!((165..=199).contains(&lossy), "with 5% datagram loss (about 95% of symbols whole): {lossy} of 200");
+    }
+
+    /// Both peers connect; the fragment sizes each ended up with.
+    async fn found(io_uring: bool, max_datagram: usize) -> (usize, usize) {
+        let key = BulkKey::random();
+        let (a_tx, a_rx) = mpsc::channel(8);
+        let (b_tx, b_rx) = mpsc::channel(8);
+        let cfg = |max_datagram| UdpConfig { io_uring, max_datagram, ..UdpConfig::default() };
+        let (sender, receiver) = tokio::join!(
+            connect(Role::Sender, key.clone(), None, a_tx, b_rx, cfg(usize::MAX), BytesAssembler::new()),
+            connect(Role::Receiver, key.clone(), None, b_tx, a_rx, cfg(max_datagram), BytesAssembler::new()),
+        );
+        (sender.unwrap().fragment, receiver.unwrap().fragment)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_whole_symbol_fits_in_a_datagram_on_loopback() {
+        if !crate::uring::available() {
+            println!("io_uring not available, skipped");
+            return;
+        }
+        let (sender, receiver) = found(true, usize::MAX).await;
+        assert_eq!(sender, 8972 - DATA_HEADER);
+        assert_eq!(receiver, sender);
+        assert!(8208 <= sender, "a symbol payload goes in one datagram");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tokio_path_stays_within_what_it_reads() {
+        let (sender, receiver) = found(false, usize::MAX).await;
+        assert_eq!(sender, 1472 - DATA_HEADER);
+        assert_eq!(receiver, sender);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_with_a_smaller_mtu_gets_smaller_datagrams() {
+        if !crate::uring::available() {
+            println!("io_uring not available, skipped");
+            return;
+        }
+        for (limit, expect) in [(1500, 1472), (1450, 1432), (1300, 1280), (1000, FRAGMENT + DATA_HEADER)] {
+            let (sender, receiver) = found(true, limit).await;
+            assert_eq!(sender, expect - DATA_HEADER, "limit {limit}");
+            assert_eq!(receiver, sender);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_discovery_the_configured_fragment_is_used() {
+        let key = BulkKey::random();
+        let (a_tx, a_rx) = mpsc::channel(8);
+        let (b_tx, b_rx) = mpsc::channel(8);
+        let cfg = UdpConfig { io_uring: false, discover_mtu: false, fragment: 900, ..UdpConfig::default() };
+        let (sender, receiver) = tokio::join!(
+            connect(Role::Sender, key.clone(), None, a_tx, b_rx, cfg, BytesAssembler::with_fragment(900)),
+            connect(Role::Receiver, key.clone(), None, b_tx, a_rx, cfg, BytesAssembler::with_fragment(900)),
+        );
+        assert_eq!((sender.unwrap().fragment, receiver.unwrap().fragment), (900, 900));
     }
 
     /// Throughput on loopback: `cargo test -p bitmule-client-native --release --lib udp_speed -- --ignored --nocapture`
@@ -932,7 +1228,8 @@ mod tests {
             let (a_tx, a_rx) = mpsc::channel(8);
             let (b_tx, b_rx) = mpsc::channel(8);
             let fragment = std::env::var("UDP_SPEED_FRAGMENT").ok().and_then(|v| v.parse().ok()).unwrap_or(FRAGMENT);
-            let cfg = UdpConfig { io_uring, max_rate: 2_000_000_000, fragment, ..UdpConfig::default() };
+            let discover_mtu = std::env::var_os("UDP_SPEED_FRAGMENT").is_none();
+            let cfg = UdpConfig { io_uring, max_rate: 2_000_000_000, fragment, discover_mtu, ..UdpConfig::default() };
             let (sender, receiver) = tokio::join!(
                 connect(Role::Sender, key.clone(), None, a_tx, b_rx, cfg, BytesAssembler::with_fragment(fragment)),
                 connect(Role::Receiver, key.clone(), None, b_tx, a_rx, cfg, BytesAssembler::with_fragment(fragment)),

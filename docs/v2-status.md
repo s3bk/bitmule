@@ -27,6 +27,35 @@ Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update al
   block hashes; no SAS / revocation of the link; `bitmule-server-signal-ws` does not compile (stale v1 crate, untouched);
   axum 0.8 and rand 0.9 migrations would remove more duplicates.
 
+## Path MTU discovery for the UDP symbol path (2026-10-18)
+- `udp.rs`: after HELLO/ACK, `discover_mtu`. The sender seals a `PROBE` of every size in `MTU_LADDER` (8972 jumbo, 1472, 1452,
+  1432, 1400, 1280, 1232, 1194), the receiver echoes the size it saw (`PROBE_ACK`), the sender takes the largest answered
+  (at least two rounds of 100 ms, so one lost probe does not cost the jumbo size), announces it (`MTU`, repeated until
+  `MTU_ACK`), and both set `fragment = datagram - 7`. A symbol payload (8208 bytes) is one datagram when the path carries
+  8972; otherwise the fewest fragments that fit. Nothing answered: the old 1187 bytes. All sealed, so the path cannot shrink it.
+- `IP_MTU_DISCOVER = IP_PMTUDISC_DO` (v4/v6) is set on the socket (`forbid_fragmentation`), else a big probe would pass in IP
+  fragments. Not on Linux: only the 1194 rung is probed.
+- With io_uring the probes use a socket of our own (dup of the pool's) with 64 KiB reads, since the pool reads 2 KiB; the
+  pool is stopped first and the receiver keeps answering stray HELLOs meanwhile (its ACK could be cancelled with the pool).
+  Without io_uring the ladder is capped at 2048 (what the pool reads): 1472 on loopback.
+- `UdpConfig.discover_mtu` (default on; off = use `fragment` as given), `UdpConfig.max_datagram` (test: simulates a smaller path),
+  `UdpLink.fragment`, `Assembler::set_fragment` (BytesAssembler implements it; the fountain assembler in the `bitmule`
+  crate must too, when it is written).
+- Loopback, 480 MB: io_uring 520-576 MiB/s (was 270 at 1187 bytes); tokio path about 100 MiB/s either way (the earlier 218 had
+  the pool on io_uring too). Tests: sizes found on loopback / tokio / simulated 1500, 1450, 1300, 1000 paths; 26 lib tests pass.
+- Not done: re-probing when the path changes (the DF flag stays set, sends then fail with EMSGSIZE), IPv6 untested.
+
+## To investigate later: path MTU for WebRTC (2026-10-18)
+- The UDP symbol path gets MTU discovery first (see below). The same probe could serve WebRTC between two native peers:
+  sealed, padded, don't-fragment datagrams over the selected ICE pair through our socket pool, echoed by the receiver; the
+  sender then raises its MTU. Each direction is independent (the sender's MTU only governs what it sends).
+- Needs: a runtime `Rtc::set_mtu` in `vendor/str0m` (today `RtcConfig::set_mtu` is fixed at build; env `BITMULE_MTU` is
+  TEMP-INSTR) and the same for sctp-proto's association MTU. Neither has path-MTU discovery.
+- Browsers keep their own ~1200 byte size, so only native <-> native gains. "One symbol per packet" does not apply (SCTP cuts
+  16 KiB messages into chunks); the gain is fewer, larger datagrams (~1450 on Ethernet, ~8-9 KB on jumbo/loopback).
+- Related open finding: the default io_uring socket pool is slow on loopback (10-17 MiB/s, T3 timeouts) against 46-52 MiB/s
+  with `BITMULE_NO_NET_URING=1`; also slow at `7d2716b`, so not caused by the audit changes.
+
 ## Earlier status (2026-10-18 night)
 
 ## Where things are right now (short)
@@ -43,7 +72,7 @@ Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update al
 - Not possible from this session: anything needing root (no passwordless sudo; the `mcp__agent-invite__sudo_exec` tool was not
   connected). `scripts/nic-loop.sh` (wifi -> router -> cable loop on one machine with ipvlan/macvlan namespaces) was written but the
   user said it did not work and it is not important; it is untested and untracked.
-- Open question for the user: datagram size. 1187 bytes is safe; `UdpConfig.fragment` up to 9000 works on loopback/jumbo frames
+- (Answered by the MTU discovery section above.) Datagram size. 1187 bytes is safe; `UdpConfig.fragment` up to 9000 works on loopback/jumbo frames
   (573-655 MiB/s vs 300-333). Idea: negotiate in HELLO / probe the path MTU, or UDP GSO via the `io-uring` crate.
 
 ## Web client ported to v2 (2026-10-18, uncommitted)
