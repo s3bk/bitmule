@@ -29,9 +29,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-// Minimal Compose UI for the bitmule Android shell.  Two tabs:
-//   Receive — paste URL / arrive via VIEW intent, download, share
-//   Send    — TODO in a follow-up PR; wired to a stub for shape
+// Minimal Compose UI for the bitmule Android shell. One home screen, two sections:
+//   Send    — pick files, get a share link + QR
+//   Receive — scan / paste a URL (or arrive via a VIEW intent), download, share
 //
 // Rust core (bitmule-mobile-ffi) is loaded via UniFFI-generated
 // Kotlin bindings (net.bitmule.uniffi.*) which are emitted by the
@@ -46,22 +46,28 @@ fun BitmuleApp(
     initialUrl: String?,
     onConsumedUrl: () -> Unit,
 ) {
-    var tab by remember { mutableStateOf(if (initialUrl != null) 1 else 0) }
-    // `safeDrawingPadding()` inset shifts the whole tree below the
-    // display cutout / status bar / IME so the TabRow isn't clipped
-    // by the camera notch on phones with a top cutout (where the
-    // tap area was being swallowed by the notch region).
-    Column(modifier = Modifier
-        .fillMaxSize()
-        .safeDrawingPadding()) {
-        TabRow(selectedTabIndex = tab) {
-            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Send") })
-            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Receive") })
-        }
-        when (tab) {
-            0 -> SendPane()
-            else -> ReceivePane(initialUrl = initialUrl, onConsumedUrl = onConsumedUrl)
-        }
+    // Both ways in are on the home screen: no tab to find first.
+    // `safeDrawingPadding()` shifts the tree below the display cutout / status
+    // bar / IME so nothing is clipped by a camera notch.
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(24.dp),
+    ) {
+        Section("Send") { SendPane() }
+        HorizontalDivider()
+        Section("Receive") { ReceivePane(initialUrl = initialUrl, onConsumedUrl = onConsumedUrl) }
+    }
+}
+
+@Composable
+private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(title, style = MaterialTheme.typography.titleLarge)
+        content()
     }
 }
 
@@ -98,13 +104,7 @@ private fun SendPane() {
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Button(
             enabled = status != "sending",
             modifier = Modifier.fillMaxWidth(),
@@ -262,13 +262,7 @@ private fun ReceivePane(
         )
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         OutlinedButton(
             modifier = Modifier.fillMaxWidth(),
             onClick = { scanning = true },
