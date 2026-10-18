@@ -5,18 +5,19 @@
 //! upload worker for all receivers, fountain coded) and a WebRTC data channel
 //! (a worker of its own per receiver, plus one that reads ranges for it).
 
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::{Arc, Mutex}};
 
 use anyhow::{Result, bail, ensure};
 use bitmule_client_common::{blockio::{RangeData, read_blocks, read_ranges}, fountain, transfer::Transfer};
+use bitmule_client_native::crypto::{BulkKey, CommitmentHasher};
 use bitmule_core::{
     ReceiverId, SessionId, Token,
-    protocol::websocket::{Peer2Peer, PeerCaps, TransferManifest},
+    protocol::websocket::{Peer2Peer, PeerCaps, TransferManifest, TransferType},
 };
 use bytes::Bytes;
 use futures_util::stream::FuturesOrdered;
 use futures_util::StreamExt;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{io::{AsyncRead, AsyncReadExt}, sync::{mpsc, watch}, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 
@@ -216,6 +217,15 @@ impl Drop for SendStats {
     }
 }
 
+/// A POST to the relay whose body is whatever is sent into the channel.
+fn open_upload(url: String) -> (mpsc::Sender<Result<Bytes, std::io::Error>>, JoinHandle<reqwest::Result<reqwest::Response>>) {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(UPLOAD_QUEUE);
+    let post = tokio::spawn(
+        bitmule_client_native::nic::http_client().post(url).body(reqwest::Body::wrap_stream(ReceiverStream::new(rx))).send()
+    );
+    (tx, post)
+}
+
 /// Upload the fountain coded transfer, pass after pass, until aborted. The
 /// relay holds the upload back while no receiver is connected.
 ///
@@ -230,10 +240,7 @@ async fn relay_upload(ctx: &Context) -> Result<()> {
         ctx.session_id.as_hex(), ctx.our_id.as_hex(), ctx.relay_token.as_hex(),
     ));
 
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(UPLOAD_QUEUE);
-    let post = tokio::spawn(
-        bitmule_client_native::nic::http_client().post(url).body(reqwest::Body::wrap_stream(ReceiverStream::new(rx))).send()
-    );
+    let (tx, post) = open_upload(url);
 
     // the frames count, repair symbols included, so this is wire bytes
     let mut stats = SendStats::new("relay");
@@ -267,4 +274,272 @@ async fn relay_upload(ctx: &Context) -> Result<()> {
             stats.sent(len);
         }
     }
+}
+
+// ---- streaming transfers ---------------------------------------------------
+//
+// For data whose size and hash are not known until it has all been read. The
+// bulk key exists from the start, so the fountain code sends the data as it is
+// read; only what needs the whole data comes after it: the size, the hash, and
+// with them the manifest. A receiver recognizes a streaming sender by `JoinRelay`
+// arriving before any `Manifest`; the sender then ends the transfer with
+// `Manifest` and `Checksum`. Normal transfers are not touched by any of this.
+//
+// A repair pass needs the data again, so the source must be restartable: it
+// is opened once per pass.
+
+pub type Reader = Box<dyn AsyncRead + Send + Unpin>;
+type OpenFuture = Pin<Box<dyn Future<Output = std::io::Result<Reader>> + Send>>;
+
+/// Where a streaming transfer's data comes from.
+pub enum StreamSource {
+    /// Opened again for every pass: a file that is still growing, an archive
+    /// generated on demand. Every pass has to produce the same bytes.
+    Restartable(Box<dyn Fn() -> OpenFuture + Send + Sync>),
+    /// Can be read once (a pipe). What is read is kept in a temporary file,
+    /// which then serves the later passes.
+    OneShot(Mutex<Option<Reader>>),
+}
+
+impl StreamSource {
+    pub fn restartable<F, Fut>(open: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<Reader>> + Send + 'static,
+    {
+        StreamSource::Restartable(Box::new(move || Box::pin(open())))
+    }
+
+    pub fn one_shot(reader: impl AsyncRead + Send + Unpin + 'static) -> Self {
+        StreamSource::OneShot(Mutex::new(Some(Box::new(reader))))
+    }
+}
+
+/// What the sender knows about a streaming transfer before it starts.
+pub struct StreamInfo {
+    pub typ: TransferType,
+    /// What the receiver saves it as.
+    pub name: Option<String>,
+    /// The size, if the caller has an idea: only for the progress totals
+    /// until the real one is known. The transfer does not depend on it.
+    pub size_hint: Option<u64>,
+}
+
+impl StreamInfo {
+    /// One file (or any single stream) called `name`.
+    pub fn file(name: impl Into<String>) -> Self {
+        StreamInfo { typ: TransferType::SingleFile { compression: None }, name: Some(name.into()), size_hint: None }
+    }
+}
+
+/// What the end of the data adds: the manifest, now with the size, and the checksum.
+pub struct Finished {
+    manifest: TransferManifest,
+    checksum: [u8; 32],
+}
+
+pub struct StreamContext {
+    server: Server,
+    our_id: ReceiverId,
+    session_id: SessionId,
+    relay_token: Token,
+    options: Options,
+    events: OnSendEvent,
+    key: BulkKey,
+    info: StreamInfo,
+    source: StreamSource,
+    /// Backs a one-shot source (kept while the transfer runs).
+    spool: Option<tempfile::NamedTempFile>,
+    finished: watch::Sender<Option<Arc<Finished>>>,
+    /// The upload to the relay, one for all receivers.
+    producer: RelayTask,
+}
+
+impl StreamContext {
+    pub fn new(
+        server: Server,
+        our_id: ReceiverId,
+        session_id: SessionId,
+        relay_token: Token,
+        info: StreamInfo,
+        source: StreamSource,
+        options: Options,
+        events: OnSendEvent,
+    ) -> Result<Self> {
+        let spool = match &source {
+            StreamSource::OneShot(_) => Some(tempfile::NamedTempFile::new()?),
+            StreamSource::Restartable(_) => None,
+        };
+        Ok(StreamContext {
+            server, our_id, session_id, relay_token, options, events, info, source, spool,
+            key: BulkKey::random(),
+            finished: watch::channel(None).0,
+            producer: RelayTask::default(),
+        })
+    }
+
+    /// The size once it is known, else the caller's idea of it, else 0.
+    fn total(&self) -> u64 {
+        match &*self.finished.borrow() {
+            Some(done) => done.manifest.transfer_size,
+            None => self.info.size_hint.unwrap_or(0),
+        }
+    }
+
+    async fn open(&self, pass: u32) -> std::io::Result<Reader> {
+        match &self.source {
+            StreamSource::Restartable(open) => open().await,
+            StreamSource::OneShot(reader) if pass == 0 => reader
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| std::io::Error::other("a one-shot source can only be read once")),
+            StreamSource::OneShot(_) => Ok(Box::new(tokio::fs::File::open(self.spool.as_ref().expect("one-shot sources have a spool").path()).await?)),
+        }
+    }
+}
+
+/// Fill `buf` from `reader`; fewer bytes than `buf` holds only at the end of the data.
+async fn read_full(reader: &mut Reader, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        let m = reader.read(&mut buf[n..]).await?;
+        if m == 0 {
+            break;
+        }
+        n += m;
+    }
+    Ok(n)
+}
+
+/// Serve one receiver of a streaming transfer: tell it to take the data from
+/// the relay at once, and hand it the manifest and checksum when they exist.
+pub async fn serve_stream_peer(ctx: Arc<StreamContext>, id: ReceiverId, peer_caps: PeerCaps, app: PeerLink) -> Result<()> {
+    let PeerLink { tx, mut rx } = app;
+    let receiver = id.as_hex().chars().take(8).collect::<String>();
+    (ctx.events)(SendEvent::Connected { receiver: receiver.clone() });
+    ensure!(
+        ctx.options.relay && peer_caps.contains(PeerCaps::RELAY),
+        "a streaming transfer goes over the relay, and one side does not use it"
+    );
+
+    tx.send(Peer2Peer::JoinRelay).await?;
+    let upload = ctx.clone();
+    ctx.producer.start_once(async move {
+        if let Err(e) = stream_upload(&upload).await {
+            warn!("streaming upload: {e}");
+        }
+    });
+
+    let mut finished = ctx.finished.subscribe();
+    let mut told = false;
+    loop {
+        if !told {
+            let done = finished.borrow_and_update().clone();
+            if let Some(done) = done {
+                tx.send(Peer2Peer::Manifest(done.manifest.clone())).await?;
+                tx.send(Peer2Peer::Checksum(done.checksum)).await?;
+                told = true;
+            }
+        }
+        tokio::select! {
+            changed = finished.changed(), if !told => {
+                ensure!(changed.is_ok(), "the transfer ended");
+            }
+            message = rx.recv() => match message {
+                None => bail!("receiver went away"),
+                Some(Peer2Peer::Complete) => {
+                    (ctx.events)(SendEvent::Done { receiver });
+                    return Ok(());
+                }
+                Some(Peer2Peer::Progress(bytes)) => {
+                    let total = ctx.total();
+                    (ctx.events)(SendEvent::Progress { receiver: receiver.clone(), bytes: if total > 0 { bytes.min(total) } else { bytes }, total });
+                }
+                // signaling and the like: there is no data channel in a streaming transfer
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Read the source, code it and upload it as it comes, then go on with repair
+/// passes until aborted. The first pass also computes the hash and finds the
+/// size; once it is through, `finished` is set.
+async fn stream_upload(ctx: &StreamContext) -> Result<()> {
+    let url = ctx.server.http(&format!(
+        "/session/{}/{}?token={}",
+        ctx.session_id.as_hex(), ctx.our_id.as_hex(), ctx.relay_token.as_hex(),
+    ));
+    let (tx, post) = open_upload(url);
+    let mut stats = SendStats::new("relay");
+    let encoder = Arc::new(fountain::Encoder::new());
+    let parallel = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
+    let spool = match &ctx.spool {
+        Some(file) => Some(Arc::new(file.as_file().try_clone()?)),
+        None => None,
+    };
+
+    let mut hasher = Some(CommitmentHasher::new());
+    let mut size = 0u64;
+    for pass in 0u32.. {
+        let mut reader = ctx.open(pass).await?;
+        let mut encoding = FuturesOrdered::new();
+        let (mut block_nr, mut offset) = (0u32, 0u64);
+        let mut ended = false;
+        loop {
+            // keep the encoders busy, then send what is ready
+            while !ended && encoding.len() < parallel {
+                let mut buf = encoder.block_buffer();
+                let len = read_full(&mut reader, &mut buf[..fountain::BLOCK_PLAIN]).await?;
+                if len == 0 {
+                    ended = true;
+                    break;
+                }
+                ended = len < fountain::BLOCK_PLAIN;
+                if let Some(hasher) = hasher.as_mut() {
+                    hasher.update(&buf[..len]);
+                }
+                let (encoder, key) = (encoder.clone(), ctx.key.clone());
+                let (nr, at) = (block_nr, offset);
+                // the first pass of a one-shot source is what the later passes read back
+                let keep = if pass == 0 { spool.clone() } else { None };
+                encoding.push_back(tokio::task::spawn_blocking(move || -> Result<Vec<Bytes>> {
+                    if let Some(file) = keep {
+                        fountain::write_all_at(&file, &buf[..len], at)?;
+                    }
+                    Ok(encoder.encode_block(&key, nr, buf, len)?.frames(pass))
+                }));
+                block_nr += 1;
+                offset += len as u64;
+            }
+            let Some(frames) = encoding.next().await else { break };
+            for frame in frames?? {
+                let len = frame.len() as u64;
+                if tx.send(Ok(frame)).await.is_err() {
+                    bail!("relay closed the upload: {:?}", post.await?.map(|r| r.status()));
+                }
+                stats.sent(len);
+            }
+        }
+
+        if pass == 0 {
+            size = offset;
+            let checksum = hasher.take().expect("hashed on the first pass").finalize(&ctx.key);
+            let manifest = TransferManifest {
+                transfer_typ: ctx.info.typ.clone(),
+                block_size: fountain::BLOCK_PLAIN as u32,
+                transfer_size: size,
+                bulk_key: ctx.key.clone(),
+                name: ctx.info.name.clone(),
+            };
+            ctx.finished.send_replace(Some(Arc::new(Finished { manifest, checksum })));
+            if size == 0 {
+                return Ok(()); // no blocks, nothing to repair
+            }
+        } else {
+            ensure!(offset == size, "the source gave {offset} bytes on pass {pass}, {size} on the first");
+        }
+    }
+    Ok(())
 }

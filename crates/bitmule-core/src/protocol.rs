@@ -348,6 +348,11 @@ use serde::{Deserialize, Serialize};
 
         // both ways, before a UDP transfer: where this peer can be reached
         UdpHello(UdpHello),
+
+        // sender -> receiver, last message of a streaming transfer, after its
+        // `Manifest`: SHA256(data || bulk_key), the data's commitment. A
+        // normal transfer carries it in the share link instead.
+        Checksum([u8; 32]),
     }
 
     /// The addresses (`ip:port`) a peer's UDP sockets can be reached at: its

@@ -134,7 +134,7 @@ async fn failures_are_tool_errors_not_protocol_errors() {
         ("bitmule_send", json!({})),
         ("bitmule_send", json!({ "paths": [] })),
         ("bitmule_send", json!({ "paths": ["/definitely/not/here"] })),
-        ("bitmule_send", json!({ "paths": ["/tmp"], "mode": "carrier-pigeon" })),
+        ("bitmule_send", json!({ "paths": ["."], "mode": "carrier-pigeon" })),
         ("bitmule_send_status", json!({})),
         ("bitmule_send_status", json!({ "transfer_id": "send-999" })),
         ("bitmule_receive", json!({})),

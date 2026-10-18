@@ -97,15 +97,30 @@ class Server:
 class Cli:
     """The CLI; collects its output and finds the first match of a pattern in it."""
 
-    def __init__(self, server, *args):
+    def __init__(self, server, *args, stdin_data=None, piece=300_000, pause=0.03):
         self.out = ""
         self.proc = subprocess.Popen([CLI_BIN, "--server", server.url, *args],
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                     stdin=subprocess.PIPE if stdin_data is not None else None,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=stdin_data is None)
         threading.Thread(target=self._read, daemon=True).start()
+        if stdin_data is not None:
+            threading.Thread(target=self._feed, args=(stdin_data, piece, pause), daemon=True).start()
+
+    def _feed(self, data, piece, pause):
+        """Feed stdin in pieces, as a producer that is still working."""
+        try:
+            for at in range(0, len(data), piece):
+                self.proc.stdin.write(data[at:at + piece])
+                self.proc.stdin.flush()
+                time.sleep(pause)
+            self.proc.stdin.close()
+        except (BrokenPipeError, ValueError):
+            pass
 
     def _read(self):
         for line in self.proc.stdout:
-            self.out += line
+            self.out += line if isinstance(line, str) else line.decode("utf-8", "replace")
 
     def find(self, pattern, what):
         found = []
@@ -244,6 +259,32 @@ v2.startSend({ server, blob: file, kind: "single", requestKey: requestKey || nul
 return true;
 """
 
+# JS: a streaming send of generated data, the three ways to give a source (restartable
+# function, one stream, blob); the link appears in window.link, the sha256 of the data
+# in window.expectedSha, how often the data was opened in window.opened
+STREAM_SEND = """
+const [server, size, how] = args;
+const all = new Uint8Array(size);
+let x = 123456789;
+for (let i = 0; i < size; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; all[i] = x & 255; }
+window.expectedSha = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", all))).map(b => b.toString(16).padStart(2, "0")).join("");
+window.opened = 0; window.link = null; window.sendResult = null;
+const make = () => {
+  window.opened++;
+  let at = 0;
+  return new ReadableStream({ pull(c) { if (at >= all.length) return c.close(); c.enqueue(all.slice(at, at + 100003)); at += 100003; } });
+};
+const on = {
+  link: (l) => { window.link = l; },
+  done: (m) => { window.sendResult = { sent: m.receivers }; },
+  error: (m) => { window.sendResult = { error: m }; },
+};
+if (how === "restartable") v2.startSend({ server, openStream: async () => make(), size, name: "generated.bin", on });
+else if (how === "once") v2.startSend({ server, stream: make(), size, name: "generated.bin", on });
+else v2.startSend({ server, blob: new File([all], "generated.bin"), streaming: true, on });
+return true;
+"""
+
 # JS: ask for a file; the key appears in window.reqKey, the result in window.reqResult
 REQUEST_AND_RECEIVE = """
 const [server] = args;
@@ -330,6 +371,59 @@ def test_chrome_to_chrome_request():
         assert "error" not in sent, sent
     finally:
         receiver.close(); sender.close()
+
+
+def test_cli_stream_to_chrome(size):
+    """`... | bitmule send -`: the data goes first, the manifest and checksum after it."""
+    data = os.urandom(size)
+    cli = Cli(server, "send", "-", "--name", "piped.bin", "--relay", stdin_data=data)
+    link = cli.find(r"#([A-Za-z0-9_-]{86})", "cli share link")
+    page = Page(server)
+    try:
+        page.open()
+        result = page.run(RECEIVE, server.url, link)
+        assert "error" not in result, f"{result}\n{page.console()}\ncli:\n{cli.out}"
+        assert result["size"] == size and result["sha"] == sha256(data), f"received data differs: {result}"
+        cli.wait()
+        assert "done" in cli.out, cli.out
+    finally:
+        page.close(); cli.kill()
+
+
+def test_chrome_stream_to_cli(how, size):
+    out = Path(tempfile.mkdtemp(dir=tmp))
+    page = Page(server)
+    try:
+        page.open()
+        page.run(STREAM_SEND, server.url, size, how)
+        link = page.wait_eval("window.link", "chrome share link")
+        cli = Cli(server, "recv", "--relay", "--out", str(out), f"{server.url}/#{link}")
+        cli.wait()
+        files = list(out.iterdir())
+        assert len(files) == 1, f"files: {files}"
+        assert files[0].name == "generated.bin", files[0].name
+        assert sha256(files[0].read_bytes()) == page.eval("window.expectedSha"), "received data differs"
+        sent = page.wait_eval("window.sendResult", "chrome finishing")
+        assert "error" not in sent, f"{sent}\n{page.console()}"
+        if how == "restartable":
+            assert page.eval("window.opened") >= 1
+    finally:
+        page.close()
+
+
+def test_chrome_stream_to_chrome(how, size):
+    sender, receiver = Page(server), Page(server)
+    try:
+        sender.open(); receiver.open()
+        sender.run(STREAM_SEND, server.url, size, how)
+        link = sender.wait_eval("window.link", "sender share link")
+        result = receiver.run(RECEIVE, server.url, link)
+        assert "error" not in result, f"{result}\n{receiver.console()}\n{sender.console()}"
+        assert result["size"] == size and result["sha"] == sender.eval("window.expectedSha"), f"received data differs: {result}"
+        sent = sender.wait_eval("window.sendResult", "sender finishing")
+        assert "error" not in sent, f"{sent}\n{sender.console()}"
+    finally:
+        sender.close(); receiver.close()
 
 
 # ---- through the real page (index.html + main.js) ----
@@ -459,6 +553,13 @@ TESTS = {
     "cli -> chrome, webrtc, multi-block": lambda: test_cli_to_chrome(["--webrtc", "--stun", "none"], BLOCK * 2 + 777),
     "chrome -> cli, webrtc, multi-block": lambda: test_chrome_to_cli(["--webrtc", "--stun", "none"], BLOCK * 2 + 777),
     "chrome -> chrome, request link": test_chrome_to_chrome_request,
+    "stream: cli -> chrome, multi-block": lambda: test_cli_stream_to_chrome(BLOCK * 2 + 4321),
+    "stream: cli -> chrome, 1 byte": lambda: test_cli_stream_to_chrome(1),
+    "stream: chrome (openStream) -> cli": lambda: test_chrome_stream_to_cli("restartable", BLOCK * 2 + 12345),
+    "stream: chrome (one stream) -> cli": lambda: test_chrome_stream_to_cli("once", BLOCK * 2 + 12345),
+    "stream: chrome (blob) -> cli": lambda: test_chrome_stream_to_cli("blob", BLOCK * 2 + 12345),
+    "stream: chrome (openStream) -> chrome": lambda: test_chrome_stream_to_chrome("restartable", BLOCK * 2 + 12345),
+    "stream: chrome (one stream) -> chrome": lambda: test_chrome_stream_to_chrome("once", BLOCK + 99),
     "page: receive from cli (relay)": lambda: test_ui_receive(["--relay"]),
     "page: receive from cli (webrtc)": lambda: test_ui_receive(["--webrtc", "--stun", "none"]),
     "page: send to cli": test_ui_send,

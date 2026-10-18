@@ -13,7 +13,7 @@ use bitmule_client_native::{
     websocket::connect_ws,
 };
 use bitmule_core::{
-    ReceiverId, SessionId,
+    ReceiverId, SessionId, Token,
     inner::IdentityKeypair,
     pow,
     protocol::websocket::{ClientToServer, Peer2Peer, ServerToClient, TransferManifest},
@@ -38,15 +38,54 @@ pub async fn send(
     on_link: impl FnOnce(&ShareLink),
     on_event: super::OnSendEvent,
 ) -> Result<()> {
+    let signature = transfer.commitment();
+    let server_owned = server.clone();
+    send_job(server, options, signature, on_link, move |our_id, session_id, relay_token| {
+        Ok(Job::Known(Arc::new(send::Context::new(server_owned, our_id, session_id, relay_token, manifest, transfer, options, on_event))))
+    })
+    .await
+}
+
+/// A transfer whose data is sent as it is read: see `send::StreamSource`. The
+/// link carries no signature (the checksum is not known yet; it follows the
+/// data), so its signature half is all zeros.
+pub async fn send_stream(
+    server: &Server,
+    info: send::StreamInfo,
+    source: send::StreamSource,
+    options: Options,
+    on_link: impl FnOnce(&ShareLink),
+    on_event: super::OnSendEvent,
+) -> Result<()> {
+    ensure!(options.relay, "a streaming transfer goes over the relay, which these options leave out");
+    let server_owned = server.clone();
+    send_job(server, options, [0u8; 32], on_link, move |our_id, session_id, relay_token| {
+        Ok(Job::Stream(Arc::new(send::StreamContext::new(server_owned, our_id, session_id, relay_token, info, source, options, on_event)?)))
+    })
+    .await
+}
+
+/// What serves the receivers of a send.
+enum Job {
+    Known(Arc<send::Context>),
+    Stream(Arc<send::StreamContext>),
+}
+
+async fn send_job(
+    server: &Server,
+    options: Options,
+    signature: [u8; 32],
+    on_link: impl FnOnce(&ShareLink),
+    make_job: impl FnOnce(ReceiverId, SessionId, Token) -> Result<Job>,
+) -> Result<()> {
     let share_key = ShareKey::random();
-    let link = ShareLink::new(share_key.clone(), transfer.commitment());
+    let link = ShareLink::new(share_key.clone(), signature);
     let Created { our_id, identity, session_id, to_server, mut from_server, relay_token, .. } =
         create(server, &share_key, options).await?;
     on_link(&link);
 
     let wire = Arc::new(peer::Wire { identity, session_id, to_server });
-    let ctx = Arc::new(send::Context::new(server.clone(), our_id, session_id, relay_token, manifest, transfer, options, on_event));
-
+    let job = make_job(our_id, session_id, relay_token)?;
     // routes what the server says about a peer to that peer's worker
     let mut peers: HashMap<ReceiverId, mpsc::Sender<ServerToClient>> = HashMap::new();
     let mut workers = JoinSet::new();
@@ -66,8 +105,18 @@ pub async fn send(
                         peers.insert(id, to_peer);
                         let link = peer::spawn(wire.clone(), id, pub_key, peer_from_server);
                         let peer::Demuxed { app, signaling } = peer::demux(link);
-                        let ctx = ctx.clone();
-                        workers.spawn(async move { (id, send::serve_peer(ctx, id, caps, app, signaling).await) });
+                        match &job {
+                            Job::Known(ctx) => {
+                                let ctx = ctx.clone();
+                                workers.spawn(async move { (id, send::serve_peer(ctx, id, caps, app, signaling).await) });
+                            }
+                            Job::Stream(ctx) => {
+                                // no data channel here: the signaling side is not used
+                                drop(signaling);
+                                let ctx = ctx.clone();
+                                workers.spawn(async move { (id, send::serve_stream_peer(ctx, id, caps, app).await) });
+                            }
+                        }
                     }
                     ServerToClient::Text(text) => println!("SERVER: {text:?}"),
                     ServerToClient::PeerMessage1 { from, .. } | ServerToClient::PeerMessage2 { from, .. } => {

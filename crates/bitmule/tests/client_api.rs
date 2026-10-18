@@ -206,3 +206,50 @@ fn the_builder_defaults() {
     let client = Client::builder().server("http://localhost:1").build();
     assert_eq!(client.server(), "http://localhost:1");
 }
+
+#[tokio::test]
+async fn a_stream_arrives_under_its_name() {
+    let client = client().await;
+    let dest = tempfile::tempdir().unwrap();
+    let data = payload(2 * 1024 * 1024 + 5);
+
+    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+    let copy = data.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        writer.write_all(&copy).await.unwrap();
+    });
+    let handle = client.send_reader("piped.bin", reader).start().await.unwrap();
+    assert_eq!(handle.display_name(), "piped.bin");
+    assert_eq!(handle.total_bytes(), 0);
+
+    let outcome = client.recv(handle.share_url()).dest(dest.path()).mode(TransportMode::Relay).start().await.unwrap();
+    let file = outcome.files().next().unwrap();
+    assert_eq!(file.name(), "piped.bin");
+    assert_eq!(file.read_all().await.unwrap(), data);
+    handle.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_restartable_stream_is_opened_again_for_repairs() {
+    let client = client().await;
+    let dest = tempfile::tempdir().unwrap();
+    let data = Arc::new(payload(300_000));
+
+    let source = bitmule::StreamSource::restartable({
+        let data = data.clone();
+        move || {
+            let data = data.clone();
+            async move { Ok(Box::new(std::io::Cursor::new(data.to_vec())) as bitmule::StreamReader) }
+        }
+    });
+    let progress = Arc::new(Mutex::new(0u64));
+    let seen = progress.clone();
+    let handle = client.send_stream("again.bin", source).size_hint(data.len() as u64).on_progress(move |bytes, _| *seen.lock().unwrap() = bytes).start().await.unwrap();
+    assert_eq!(handle.total_bytes(), data.len() as u64);
+
+    let outcome = client.recv(handle.share_url()).dest(dest.path()).start().await.unwrap();
+    assert_eq!(outcome.files().next().unwrap().read_all().await.unwrap(), *data);
+    handle.wait().await.unwrap();
+    assert!(*progress.lock().unwrap() > 0);
+}

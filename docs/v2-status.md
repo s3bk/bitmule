@@ -237,6 +237,32 @@ The old "receiver mints a URL for the sender" flow, redone for v2 without any se
 - Not done: anyone with the request link can be the sender and the first valid link wins (several
   senders to one request are not handled); the web SPA does not know `/send#` links yet.
 
+## Streaming transfers (2026-10-18, uncommitted)
+
+For data that is made while it is sent (a pipe, a BLOB, a generator): no size and no hash up front. Normal transfers are
+unchanged on the wire.
+- Order of messages. Normal: `Manifest` first, then the receiver's `Get`, then `JoinRelay`. Streaming: the sender's first message
+  to a receiver is `JoinRelay`, and `Manifest` + the new last variant `Peer2Peer::Checksum([u8; 32])` follow once the source has
+  been read to its end (real size, bulk key, name). `JoinRelay` before `Manifest` is what tells a receiver it is a stream.
+- The bulk key is made at the start, so the fountain code can encode blocks as they are read. Pass 0 uploads blocks and hashes
+  the data (`CommitmentHasher`: SHA256(data || bulk_key)); later passes re-read the source and send repair symbols until a
+  receiver sends `Complete`. The source must therefore be restartable (`StreamSource::restartable`, the size must not change), or
+  one-shot (`StreamSource::one_shot`: copied to a temp file during pass 0).
+- The share link has an all-zero signature. The receiver checks the Checksum message (and a non-zero link signature if there is
+  one). Relay only: `send_stream` / `run_send_stream` refuse options without `relay`.
+- Receiver (`recv.rs::receive_stream`): spools the relay bytes to a temp file until the Manifest arrives, then opens the output
+  (named from the manifest) and decodes the spool followed by the live stream (the same frame splitter, so a cut frame
+  completes). Progress is `(bytes, 0)` until the size is known.
+- API: `v2::run_send_stream(server, StreamInfo, StreamSource, options, on_link, on_event)`;
+  `bitmule::Client::send_stream(name, source)` / `send_reader(name, reader)` -> `StreamSendBuilder` (`size_hint`, `on_progress`,
+  `start()` -> `SendHandle`); CLI: `bitmule send - [--name N]` streams stdin (forces `--relay`).
+- Web: the wasm `Session` has `setStreamingTransfer`, `transferUpdate`, `transferFinish`, `verifier(checksum)`, `newStream()`
+  (a reconnect starts at a frame). `v2.js startSend({stream | blob | openStream, streaming: true, size?})`; a ReadableStream can
+  be read once, so for repair passes the page gives an `openStream(pass)` function that returns a new one (or the stream is kept
+  in an OPFS spool). The receiver spools in OPFS (`bitmule-recv-spool-*`), then replays it.
+- Tests: `crates/bitmule/tests/v2_stream.rs` (6), `client_api.rs` (2 stream tests), `web/test/browser_test.py` (7 `stream:`
+  tests, Chrome and Firefox). Not done: an MCP tool for streams, a receiver that resumes a stream after a restart.
+
 ## Relay on artisan
 
 - PUBLIC relay (replaced the old server on 2026-10-17): `~/bitmule-relay/start-prod.sh` runs
@@ -291,7 +317,7 @@ app link       -> transfer worker (v2/send.rs per receiver; v2/recv.rs)
 - `v2/mod.rs`: `Server`, `Options {webrtc, relay}` (`from_mode(TransportMode)`), `Transport`,
   `Report`, `run_send`, `run_recv(server, link, std::fs::File /*read+write*/, options)`.
 - `v2/dcproto.rs`: data channel messages (`Get`, `Data`, 16 KiB pieces).
-- Flow: Manifest -> receiver `Get{0,size}` -> sender `JoinRelay` + (if both have WEBRTC) SDP offer.
+- Flow (streaming transfers differ, see "Streaming transfers"): Manifest -> receiver `Get{0,size}` -> sender `JoinRelay` + (if both have WEBRTC) SDP offer.
   Receiver starts the relay download; when the data channel opens the relay download is stopped
   gracefully (it decodes and writes what it already took and reports the finished blocks), and the
   data channel then asks, one range at a time, only for the byte ranges of the blocks still missing.

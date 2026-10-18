@@ -57,6 +57,12 @@ stays responsive; the page only does the UI and WebRTC.
   messages to and from the worker.
 - `main.js` — UI only.
 
+Streaming send: `startSend({ streaming: true, ... })` sends data whose size is not known (a `ReadableStream`, or a
+blob read as it goes). The data goes up first; the manifest and checksum follow, and the receiver checks it then. A
+`ReadableStream` can be read once and repair passes need the data again, so pass `openStream: async (pass) => stream`
+(opened anew for each pass), or just `stream` to have the worker keep a copy in OPFS. Streams go over the relay only.
+The receiver needs no setup: it spools until the manifest arrives.
+
 Limits: the transfer carries no file name (a receiver saves `bitmule-download`
 or `bitmule-files.zip`); several files go as a store-mode zip; no UDP.
 

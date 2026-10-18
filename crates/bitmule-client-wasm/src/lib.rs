@@ -151,6 +151,12 @@ impl ShareLink {
 #[wasm_bindgen]
 pub struct Transfer(data::Outgoing);
 
+/// Plaintext bytes of one block: what a streaming sender cuts its data into.
+#[wasm_bindgen(js_name = blockPlain)]
+pub fn block_plain() -> u32 {
+    bitmule_client_common::fountain::BLOCK_PLAIN as u32
+}
+
 #[wasm_bindgen]
 impl Transfer {
     /// `kind` is "single" (the bytes are the file) or "zip" (the bytes are a zip of files).
@@ -279,6 +285,34 @@ impl Session {
         Ok(())
     }
 
+    /// The data to send as a stream: the link can be made at once, its
+    /// signature is all zeros since the checksum is not known yet. Feed the
+    /// data, in order, to `transferUpdate`; at its end `transferFinish` gives the
+    /// checksum, and the manifest (now with the size) and the checksum go to
+    /// the receivers after the data. Consumes the transfer.
+    #[wasm_bindgen(js_name = setStreamingTransfer)]
+    pub fn set_streaming_transfer(&mut self, transfer: Transfer) -> Result<(), JsError> {
+        if transfer.0.signature().is_some() {
+            return Err(JsError::new("a streaming transfer must not be finished"));
+        }
+        self.signature = Some([0u8; 32]);
+        self.transfer = Some(transfer.0);
+        Ok(())
+    }
+
+    /// The next piece of a streaming transfer's data.
+    #[wasm_bindgen(js_name = transferUpdate)]
+    pub fn transfer_update(&mut self, chunk: &[u8]) -> Result<(), JsError> {
+        self.transfer.as_mut().ok_or_else(|| JsError::new("no transfer set"))?.update(chunk).map_err(js_err)
+    }
+
+    /// All of a streaming transfer's data has been fed: its checksum.
+    #[wasm_bindgen(js_name = transferFinish)]
+    pub fn transfer_finish(&mut self) -> Result<Vec<u8>, JsError> {
+        let transfer = self.transfer.as_mut().ok_or_else(|| JsError::new("no transfer set"))?;
+        transfer.finish().map(|s| s.to_vec()).map_err(js_err)
+    }
+
     /// The share link (base64url fragment) of the transfer.
     #[wasm_bindgen(js_name = linkB64)]
     pub fn link_b64(&self) -> Result<String, JsError> {
@@ -317,10 +351,19 @@ impl Session {
         Ok(RelayDecoder(data::Incoming::new(manifest).map_err(js_err)?))
     }
 
-    /// Checks the received data (fed in order) against the share link's signature.
-    pub fn verifier(&self) -> Result<Verifier, JsError> {
+    /// Checks the received data (fed in order) against the share link's
+    /// signature, or, for a streaming transfer, against the `checksum` the sender
+    /// sent after the data.
+    pub fn verifier(&self, checksum: Option<Vec<u8>>) -> Result<Verifier, JsError> {
         let manifest = self.core.manifest.as_ref().ok_or_else(|| JsError::new("no manifest received yet"))?;
-        let signature = self.signature.ok_or_else(|| JsError::new("the link has no signature"))?;
+        let signature = match checksum {
+            Some(checksum) => array_32(&checksum, "checksum")?,
+            None => self.signature.ok_or_else(|| JsError::new("the link has no signature"))?,
+        };
+        // a link made for a stream has no signature to check against
+        if signature == [0u8; 32] {
+            return Err(JsError::new("there is nothing to check the data against: no signature, no checksum"));
+        }
         Ok(Verifier(Some(data::Verifier::new(manifest, signature))))
     }
 }
@@ -331,6 +374,12 @@ pub struct RelayDecoder(data::Incoming);
 
 #[wasm_bindgen]
 impl RelayDecoder {
+    /// The next bytes come from a new connection: forget a frame that was cut off.
+    #[wasm_bindgen(js_name = newStream)]
+    pub fn new_stream(&mut self) {
+        self.0.new_stream();
+    }
+
     /// Feed bytes of the stream (any chunking). Returns the blocks completed
     /// by them, as `{offset, data}`.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Array, JsError> {
@@ -474,6 +523,10 @@ fn message_to_js(message: &Peer2Peer) -> JsValue {
             ty("UdpHello");
             set(&o, "addrs", addrs.iter().map(|a| JsValue::from_str(a)).collect::<Array>());
         }
+        Peer2Peer::Checksum(sum) => {
+            ty("Checksum");
+            set(&o, "checksum", Uint8Array::from(&sum[..]));
+        }
     }
     o.into()
 }
@@ -519,6 +572,10 @@ fn message_from_js(message: &JsValue) -> Result<Peer2Peer, JsError> {
         "UdpHello" => Peer2Peer::UdpHello(UdpHello {
             addrs: Array::from(&field(message, "addrs")?).iter().filter_map(|a| a.as_string()).collect(),
         }),
+        "Checksum" => {
+            let bytes = Uint8Array::new(&field(message, "checksum")?).to_vec();
+            Peer2Peer::Checksum(bytes.try_into().map_err(|_| JsError::new("a checksum is 32 bytes"))?)
+        }
         other => return Err(JsError::new(&format!("unknown message type {other:?}"))),
     })
 }

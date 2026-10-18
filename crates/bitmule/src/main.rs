@@ -3,7 +3,7 @@
 //! `cargo install bitmule` gets a user the CLI. Same wire protocol as the browser
 //! SPA client (which is `bitmule-client-wasm` compiled from bitmule-core).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use bitmule::v2;
 use bitmule_client_common::transfer::{Storage, TransferBuilder};
 use bitmule_client_native::crypto::{BulkKey, CommitmentHasher, ShareKey, ShareLink};
@@ -81,6 +81,9 @@ enum Command {
         /// link prints) instead of making a share link of our own.
         #[arg(long, value_name = "URL")]
         to: Option<String>,
+        /// What the receiver saves the data as, when sending stdin (`-`).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
     /// Receive a file. With SESSION (a hex or a share URL), connects to
     /// an existing session initiated by a sender. Without SESSION,
@@ -155,7 +158,12 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Command::Send { paths, webrtc, relay, multi, to } => {
+        Command::Send { paths, webrtc, relay, multi, to, name } => {
+            if paths.len() == 1 && paths[0].as_os_str() == "-" {
+                ensure!(to.is_none(), "sending stdin does not work with --to");
+                ensure!(!webrtc, "sending stdin goes over the relay, not WebRTC only");
+                return cmd_send_stdin(&cli.server, name.unwrap_or_else(|| "stdin".into()), resolve_mode(webrtc, relay)).await;
+            }
             cmd_send(&cli.server, paths, resolve_mode(webrtc, relay), multi, to).await
         }
         Command::Recv { session, out, webrtc, relay } => {
@@ -417,26 +425,56 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
         return Ok(());
     }
     let server = parse_server(server);
-    v2::run_send_events(&server, manifest, transfer, v2::Options::from_mode(mode), |link| {
-        let url = server.share_url(link);
-        println!("share:   {url}");
-        if let Ok(qr) = QrCode::new(url.as_bytes()) {
-            println!("{}", qr.render::<unicode::Dense1x2>().build());
-        }
-        println!("waiting for a receiver…");
-    }, std::sync::Arc::new(|event| {
+    v2::run_send_events(&server, manifest, transfer, v2::Options::from_mode(mode), |link| print_link(&server, link), send_events()).await?;
+    Ok(())
+}
+
+/// Send what arrives on stdin, as it arrives: the receiver gets the data while the
+/// sender is still reading it (`tar c dir | bitmule send -`). The size and the checksum
+/// follow the data, so the link has no signature.
+async fn cmd_send_stdin(server: &str, name: String, mode: TransportMode) -> Result<()> {
+    let server = parse_server(server);
+    let mut options = v2::Options::from_mode(mode);
+    options.relay = true; // the only transport a stream has
+    v2::run_send_stream(
+        &server,
+        v2::StreamInfo::file(name),
+        v2::StreamSource::one_shot(tokio::io::stdin()),
+        options,
+        |link| print_link(&server, link),
+        send_events(),
+    )
+    .await
+}
+
+fn print_link(server: &v2::Server, link: &ShareLink) {
+    let url = server.share_url(link);
+    println!("share:   {url}");
+    if let Ok(qr) = QrCode::new(url.as_bytes()) {
+        println!("{}", qr.render::<unicode::Dense1x2>().build());
+    }
+    println!("waiting for a receiver…");
+}
+
+/// What the sender prints about its receivers.
+fn send_events() -> v2::OnSendEvent {
+    std::sync::Arc::new(|event| {
         use std::io::Write;
         match event {
             v2::SendEvent::Connected { receiver } => println!("receiver {receiver} connected"),
-            v2::SendEvent::Progress { receiver, bytes, total } => {
-                let pct = if total > 0 { bytes * 100 / total } else { 100 };
+            v2::SendEvent::Progress { receiver, bytes, total } if total > 0 => {
+                let pct = bytes * 100 / total;
                 print!("\r  {receiver}: {pct:>3}%  {} / {}   ", human_bytes(bytes), human_bytes(total));
+                let _ = std::io::stdout().flush();
+            }
+            v2::SendEvent::Progress { receiver, bytes, .. } => {
+                // streaming and the size is not known yet
+                print!("\r  {receiver}: {} received   ", human_bytes(bytes));
                 let _ = std::io::stdout().flush();
             }
             v2::SendEvent::Done { receiver } => println!("\r  {receiver}: done                                   "),
         }
-    })).await?;
-    Ok(())
+    })
 }
 
 fn human_bytes(n: u64) -> String {

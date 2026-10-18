@@ -24,6 +24,7 @@ mod dcproto;
 mod peer;
 mod recv;
 mod send;
+pub use send::{Reader, StreamInfo, StreamSource};
 mod session;
 
 use anyhow::Result;
@@ -195,6 +196,24 @@ pub async fn run_send(
     on_link: impl FnOnce(&ShareLink),
 ) -> Result<()> {
     run_send_events(server, manifest, transfer, options, on_link, std::sync::Arc::new(|_| {})).await
+}
+
+/// Send data as it is read, when its size and hash are not known until all of
+/// it has been: `info` says what it is, `source` where it comes from (see
+/// [`StreamSource`]: it is read once per pass, which is why it has to be
+/// restartable, or is kept in a temporary file). The share link comes with
+/// no signature (an all-zero one) because the checksum can only follow the
+/// data. Receivers must be streaming-aware, see `recv.rs`: a streaming
+/// transfer goes over the relay only.
+pub async fn run_send_stream(
+    server: &Server,
+    info: StreamInfo,
+    source: StreamSource,
+    options: Options,
+    on_link: impl FnOnce(&ShareLink),
+    on_event: OnSendEvent,
+) -> Result<()> {
+    session::send_stream(server, info, source, options, on_link, on_event).await
 }
 
 /// `run_send`, and `on_event` hears about the receivers: who connected, how

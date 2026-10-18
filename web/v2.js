@@ -7,6 +7,15 @@
 // Jobs:
 //   startSend({ server, blob, kind: "single" | "zip", name?, requestKey?, on })
 //       name defaults to blob.name; it is what the receiver saves the file as
+//   startSend({ server, openStream, size?, name, on })  a streaming send, from a ReadableStream
+//   startSend({ server, blob, streaming: true, on })    ... or from a blob, without the hash pass first
+//       The link is there at once and the data goes first; the size, the checksum and the
+//       manifest come after it. Relay only. `size` is only a hint for progress.
+//       The data is read once per pass (the first pass finds the size and the hash, the next
+//       ones send repair symbols for what a receiver missed), so the source has to be
+//       restartable: `openStream` is a function returning a new ReadableStream (or a promise
+//       of one) with the same bytes every time; a blob can be read again anyway. A `stream`
+//       (one ReadableStream instance) works too, but is then kept in a temporary file as it is read.
 //       on.link(link)      the share link fragment, once the session exists
 //       on.peers([{id, state, via}])
 //       on.done({receivers})
@@ -146,7 +155,11 @@ class Job {
     this.worker.onmessage = (e) => this.fromWorker(e.data);
     this.worker.onerror = (e) => this.fail(e.message || "the transfer worker failed");
     const caps = CAP_RELAY | (webrtcAvailable() ? CAP_WEBRTC : 0);
-    this.toWorker({ type: "start", job: kind, server: this.server, caps, ...extra });
+    // a function can't go to the worker: it asks for a new stream when it needs one
+    const { openStream, ...rest } = extra;
+    this.openStream = openStream || null;
+    // a ReadableStream (the data of a streaming send) is handed over, not copied
+    this.toWorker({ type: "start", job: kind, server: this.server, caps, ...rest, restartable: !!openStream }, rest.stream ? [rest.stream] : []);
   }
 
   toWorker(message, transfer) {
@@ -175,6 +188,16 @@ class Job {
     const on = this.on;
     switch (m.type) {
       case "state": return this.state(m.text);
+      case "openStream": {
+        // the worker needs the data again (another pass): a fresh stream, handed over
+        Promise.resolve()
+          .then(() => this.openStream())
+          .then(
+            (stream) => this.toWorker({ type: "stream", pass: m.pass, stream }, [stream]),
+            (e) => this.fail(`could not open the data again: ${e && e.message || e}`),
+          );
+        return;
+      }
       case "link": return on.link && on.link(m.link);
       case "peers": return on.peers && on.peers(m.peers);
       case "progress": return on.progress && on.progress(m);
@@ -214,8 +237,12 @@ class Job {
   }
 }
 
-export function startSend({ server, blob, kind = "single", name = null, requestKey = null, on }) {
-  return new Job("send", { server, on }, { blob, kind, name: name || blob.name || null, requestKey });
+export function startSend({ server, blob = null, stream = null, openStream = null, size = 0, streaming = false, kind = "single", name = null, requestKey = null, on }) {
+  return new Job("send", { server, on }, {
+    blob, stream, openStream, size,
+    streaming: streaming || !!stream || !!openStream,
+    kind, name: name || (blob && blob.name) || null, requestKey,
+  });
 }
 
 export function startReceive({ server, link, on }) {

@@ -181,6 +181,70 @@ class Store {
   }
 }
 
+/// Bytes kept in arrival order whose length is not known beforehand: the
+/// relay stream of a streaming transfer until its manifest (and key) arrives,
+/// or what a streaming sender has read of a stream it can only read once. OPFS
+/// where there is one, memory otherwise.
+class Spool {
+  static async create() {
+    const spool = new Spool();
+    try {
+      const root = await navigator.storage.getDirectory();
+      // named so that cleanupStaleDownloads takes it too
+      spool.name = `bitmule-recv-spool-${crypto.randomUUID()}`;
+      const file = await root.getFileHandle(spool.name, { create: true });
+      spool.handle = await file.createSyncAccessHandle();
+    } catch {
+      spool.handle = null;
+    }
+    return spool;
+  }
+
+  constructor() {
+    this.length = 0;
+    this.handle = null;
+    this.name = null;
+    this.parts = []; // memory fallback: [offset, bytes]
+  }
+
+  append(bytes) {
+    if (this.handle) {
+      let done = 0;
+      while (done < bytes.length) {
+        const n = this.handle.write(bytes.subarray(done), { at: this.length + done });
+        if (n === 0) throw new Error("could not write the spool");
+        done += n;
+      }
+    } else {
+      this.parts.push([this.length, bytes.slice()]);
+    }
+    this.length += bytes.length;
+  }
+
+  read(at, length) {
+    const out = new Uint8Array(length);
+    if (this.handle) {
+      this.handle.read(out, { at });
+      return out;
+    }
+    for (const [offset, bytes] of this.parts) {
+      const from = Math.max(at, offset);
+      const to = Math.min(at + length, offset + bytes.length);
+      if (from < to) out.set(bytes.subarray(from - offset, to - offset), from - at);
+    }
+    return out;
+  }
+
+  async discard() {
+    if (this.handle) { try { this.handle.close(); } catch {} this.handle = null; }
+    this.parts = [];
+    if (this.name) {
+      try { (await navigator.storage.getDirectory()).removeEntry(this.name); } catch {}
+      this.name = null;
+    }
+  }
+}
+
 // ---- the data channel protocol ------------------------------------------
 // Get: 1 | start u64 LE | end u64 LE        Data: 2 | offset u64 LE | bytes
 
@@ -236,13 +300,20 @@ class Sender {
   async run() {
     const { opts } = this;
     const transfer = new wasm.Transfer(opts.kind, opts.name || undefined);
-    state("reading the file…");
-    await hashBlob(transfer, this.blob, () => this.cancelled);
-    transfer.finish();
-    this.size = this.blob.size;
-
+    // streaming: the data goes first, only the link is made up front; the size
+    // and the checksum follow the data (the manifest comes last)
+    this.streaming = !!(opts.stream || opts.streaming || opts.restartable);
     this.session = wasm.Session.create(opts.caps);
-    this.session.setTransfer(transfer);
+    if (this.streaming) {
+      this.size = this.blob ? this.blob.size : (opts.size || 0);
+      this.session.setStreamingTransfer(transfer);
+    } else {
+      state("reading the file…");
+      await hashBlob(transfer, this.blob, () => this.cancelled);
+      transfer.finish();
+      this.size = this.blob.size;
+      this.session.setTransfer(transfer);
+    }
     this.done = new Promise((resolve, reject) => { this.finish = resolve; this.fail = reject; });
     this.link = new Link(opts.server, this.session, (e) => this.onEvent(e));
     state("connecting…");
@@ -281,7 +352,19 @@ class Sender {
         const peer = this.peers.get(event.id);
         if (!peer) break;
         peer.state = "ready";
-        link.sendPeer(event.id, { type: "Manifest" });
+        if (this.streaming) {
+          // the data starts now; the manifest follows it
+          if (!(this.opts.caps & wasm.CAP_RELAY()) || !(peer.caps & wasm.CAP_RELAY())) {
+            state("a receiver without the relay cannot take a streaming transfer");
+            this.dropPeer(event.id);
+            break;
+          }
+          link.sendPeer(event.id, { type: "JoinRelay" });
+          this.startStreamRelay();
+          if (this.checksum) this.announceTo(event.id);
+        } else {
+          link.sendPeer(event.id, { type: "Manifest" });
+        }
         this.publishPeers();
         break;
       }
@@ -317,6 +400,7 @@ class Sender {
     if (this.peers.size === 0 && this.completed > 0 && !this.finished) {
       this.finished = true;
       this.stopRelay();
+      if (this.spool) this.spool.discard();
       this.link.close().then(() => this.finish({ type: "sent", receivers: this.completed }));
     }
   }
@@ -368,6 +452,121 @@ class Sender {
     }
   }
 
+  // -- streaming: the upload starts with the first receiver, the data is hashed
+  //    as the first pass reads it, and the manifest + checksum follow it --
+
+  announceTo(id) {
+    this.link.sendPeer(id, { type: "Manifest" });
+    this.link.sendPeer(id, { type: "Checksum", checksum: this.checksum });
+  }
+
+  startStreamRelay() {
+    if (this.relayStarted) return;
+    this.relayStarted = true;
+    this.relayAbort = new AbortController();
+    this.relayUploadStream().catch((e) => {
+      if (!this.relayAbort.signal.aborted) this.fail(e);
+    });
+  }
+
+  /// A fresh stream of the data from the page (`openStream` in v2.js), once per pass.
+  requestStream(pass) {
+    return new Promise((resolve) => {
+      this.streamWaiter = resolve;
+      post({ type: "openStream", pass });
+    });
+  }
+
+  /// The chunks of `reader` cut into blocks of `block` bytes, the last one shorter.
+  /// `keep`: also append each block to the spool (a stream that can be read only once).
+  async *cut(reader, block, keep) {
+    let buf = new Uint8Array(block);
+    let fill = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      let rest = value;
+      while (rest.length) {
+        const take = Math.min(block - fill, rest.length);
+        buf.set(rest.subarray(0, take), fill);
+        fill += take;
+        rest = rest.subarray(take);
+        if (fill === block) {
+          if (keep) this.spool.append(buf);
+          yield buf;
+          buf = new Uint8Array(block);
+          fill = 0;
+        }
+      }
+    }
+    if (fill) {
+      const last = buf.subarray(0, fill);
+      if (keep) this.spool.append(last);
+      yield last;
+    }
+  }
+
+  /// The data in blocks of the size the fountain code uses, in order. Every pass
+  /// needs it again, so the source has to be restartable: a blob can be read
+  /// again, `openStream` gives a new stream each time, and a stream that can
+  /// be read only once is kept in a spool as it is read.
+  async *blocksOf(pass, block) {
+    if (this.opts.blob) {
+      for (let at = 0; at < this.blob.size; at += block) {
+        yield new Uint8Array(await this.blob.slice(at, Math.min(at + block, this.blob.size)).arrayBuffer());
+      }
+    } else if (this.opts.restartable) {
+      yield* this.cut((await this.requestStream(pass)).getReader(), block, false);
+    } else if (pass === 0) {
+      yield* this.cut(this.opts.stream.getReader(), block, true);
+    } else {
+      for (let at = 0; at < this.size; at += block) yield this.spool.read(at, Math.min(block, this.size - at));
+    }
+  }
+
+  async relayUploadStream() {
+    const { session, link } = this;
+    const url = `${httpBase(this.opts.server)}/session/${session.sessionIdHex()}/${session.ourIdHex()}?token=${link.relayToken}`;
+    const signal = this.relayAbort.signal;
+    const block = wasm.blockPlain();
+    if (this.opts.stream && !this.opts.restartable) this.spool = await Spool.create();
+    let batch = [];
+    let batchBytes = 0;
+    const flush = async () => {
+      if (!batch.length) return;
+      const body = new Blob(batch);
+      batch = [];
+      batchBytes = 0;
+      const response = await fetch(url, { method: "POST", body, signal });
+      if (!response.ok) throw new Error(`relay refused the upload: ${response.status}`);
+    };
+    for (let pass = 0; !signal.aborted; pass++) {
+      let nr = 0;
+      let offset = 0;
+      for await (const data of this.blocksOf(pass, block)) {
+        if (signal.aborted) return;
+        if (pass === 0) session.transferUpdate(data);
+        const frames = session.encodeBlock(nr, data, pass);
+        batch.push(frames);
+        batchBytes += frames.length;
+        if (batchBytes >= UPLOAD_BATCH) await flush();
+        nr++;
+        offset += data.length;
+      }
+      await flush();
+      if (pass === 0) {
+        // everything has been read once: now the size and the checksum exist
+        this.size = offset;
+        this.checksum = session.transferFinish();
+        for (const [id, peer] of this.peers) if (peer.state !== "connecting") this.announceTo(id);
+        this.publishPeers();
+        if (offset === 0) return;
+      } else if (offset !== this.size) {
+        throw new Error("the data changed between passes");
+      }
+    }
+  }
+
   // -- relay: one upload for all receivers, pass after pass until stopped --
 
   startRelay() {
@@ -416,6 +615,13 @@ class Sender {
   onRtc(message) {
     const peer = this.peers.get(message.peer);
     switch (message.type) {
+      case "stream":
+        // the page's answer to `openStream`
+        if (this.streamWaiter) {
+          this.streamWaiter(message.stream);
+          this.streamWaiter = null;
+        }
+        break;
       case "rtcSignal":
         if (peer) this.link.sendPeer(message.peer, message.message);
         break;
@@ -494,6 +700,7 @@ class Sender {
   cancel() {
     this.cancelled = true;
     this.stopRelay();
+    if (this.spool) this.spool.discard();
     if (this.link) this.link.close();
     if (this.fail) this.fail(new Cancelled());
   }
@@ -523,6 +730,9 @@ class Receiver {
     this.viaRelay = 0;
     this.viaDc = 0;
     this.lastProgress = 0;
+    this.streaming = false;
+    // a streaming sender sends its checksum after the data
+    this.checksumReady = new Promise((resolve) => { this.setChecksum = resolve; });
   }
 
   async run() {
@@ -581,6 +791,7 @@ class Receiver {
         this.size = message.size;
         this.blockSize = message.blockSize;
         this.total = message.size;
+        if (this.streaming) return this.beginStreamDecode();
         this.useRelay = !!(opts.caps & wasm.CAP_RELAY()) && !!(this.senderCaps & wasm.CAP_RELAY());
         this.useRtc = !!(opts.caps & wasm.CAP_WEBRTC()) && !!(this.senderCaps & wasm.CAP_WEBRTC());
         if (!this.useRelay && !this.useRtc) throw new Error("sender and receiver have no transport in common");
@@ -591,6 +802,11 @@ class Receiver {
         break;
       }
       case "JoinRelay":
+        // a sender that streams sends the data first and the manifest last
+        if (!this.manifest) {
+          this.startSpool();
+          break;
+        }
         if (this.useRelay) {
           this.relayOffered = true;
           this.maybeStartRelay();
@@ -606,12 +822,74 @@ class Receiver {
         }
         post({ type: "rtcSignal", peer: this.sender, message });
         break;
+      case "Checksum":
+        this.setChecksum(message.checksum);
+        break;
       case "InlineData":
       case "Progress":
         break;
       default:
         throw new Error(`unexpected message ${message.type} from sender`);
     }
+  }
+
+  // -- streaming: keep the relay stream until the manifest (and so the key) arrives,
+  //    then decode what was kept followed by what still comes --
+
+  startSpool() {
+    if (this.streaming) return;
+    const { opts } = this;
+    if (!(opts.caps & wasm.CAP_RELAY()) || !(this.senderCaps & wasm.CAP_RELAY())) {
+      throw new Error("this is a streaming transfer, which goes over the relay, and one side does not use it");
+    }
+    this.streaming = true;
+    this.spoolTask = this.spoolRelay().catch((e) => {
+      if (!this.spoolStopped && !this.complete) this.fail(e);
+    });
+  }
+
+  async spoolRelay() {
+    const { session } = this;
+    this.spool = await Spool.create();
+    const url = `${httpBase(this.opts.server)}/session/${session.sessionIdHex()}/${session.ourIdHex()}?token=${this.link.relayToken}`;
+    this.spoolAbort = new AbortController();
+    const response = await fetch(url, { signal: this.spoolAbort.signal });
+    if (!response.ok) throw new Error(`relay refused the download: ${response.status}`);
+    const reader = response.body.getReader();
+    try {
+      for (;;) {
+        let chunk;
+        try {
+          chunk = await reader.read();
+        } catch (e) {
+          if (this.spoolStopped) break; // stopped on purpose
+          throw e;
+        }
+        if (chunk.done) break;
+        this.spool.append(chunk.value);
+        // no size yet: the bytes that have come, no total
+        const now = Date.now();
+        if (now - this.lastProgress >= 100) {
+          this.lastProgress = now;
+          post({ type: "progress", bytes: this.spool.length, total: 0, via: "relay" });
+        }
+      }
+    } finally {
+      try { await reader.cancel(); } catch {}
+    }
+  }
+
+  async beginStreamDecode() {
+    this.useRelay = true;
+    this.useRtc = false;
+    this.store = await Store.create(this.size);
+    this.spoolStopped = true;
+    if (this.spoolAbort) this.spoolAbort.abort();
+    await this.spoolTask;
+    if (this.size === 0) return this.complete_();
+    this.relayOffered = true;
+    state("decoding…");
+    this.maybeStartRelay();
   }
 
   maybeStartRelay() {
@@ -655,6 +933,28 @@ class Receiver {
     const reader = response.body.getReader();
     this.relayBytes = 0;
     try {
+      // a streaming transfer: what was kept before the key was known comes first
+      if (this.spool) {
+        const CHUNK = 4 * 1024 * 1024;
+        for (let at = 0; at < this.spool.length; at += CHUNK) {
+          const piece = this.spool.read(at, Math.min(CHUNK, this.spool.length - at));
+          for (const block of incoming.push(piece)) {
+            this.store.write(block.offset, block.data);
+            this.have.add(block.offset / this.blockSize);
+            this.viaRelay += block.data.length;
+          }
+          this.progress(false);
+          if (incoming.isComplete()) break;
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        if (incoming.isComplete()) {
+          this.progress(true);
+          await this.complete_();
+          return;
+        }
+        // what comes now is a new connection: it starts at a frame, however the kept one ended
+        incoming.newStream();
+      }
       while (!this.stopRelayRequested) {
         let chunk;
         try {
@@ -761,12 +1061,13 @@ class Receiver {
     if (this.complete) return;
     this.complete = true;
     state("checking…");
-    const verifier = this.session.verifier();
+    const verifier = this.streaming ? this.session.verifier(await this.checksumReady) : this.session.verifier();
     const CHUNK = 1024 * 1024;
     for (let at = 0; at < this.size; at += CHUNK) {
       verifier.update(this.store.read(at, Math.min(CHUNK, this.size - at)));
     }
-    if (!verifier.finish()) throw new Error("the data does not match the share link's signature");
+    if (!verifier.finish()) throw new Error(this.streaming ? "the data does not match the sender's checksum" : "the data does not match the share link's signature");
+    if (this.spool) await this.spool.discard();
     this.link.sendPeer(this.sender, { type: "Complete" });
     const file = await this.store.file(this.manifest.name || (this.manifest.kind === "zip" ? "bitmule-files.zip" : "bitmule-download"), "application/octet-stream");
     await this.link.close();
@@ -785,6 +1086,9 @@ class Receiver {
     this.complete = true;
     this.stopRelayRequested = true;
     if (this.relayAbort) this.relayAbort.abort();
+    this.spoolStopped = true;
+    if (this.spoolAbort) this.spoolAbort.abort();
+    if (this.spool) this.spool.discard();
     if (this.link) this.link.close();
     if (this.store) this.store.discard();
     if (this.fail) this.fail(new Cancelled());

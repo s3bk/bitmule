@@ -184,6 +184,8 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
     let manifest = loop {
         match rx.recv().await {
             Some(Peer2Peer::Manifest(manifest)) => break manifest,
+            // data first, the manifest at the end: a streaming transfer
+            Some(Peer2Peer::JoinRelay) => return receive_stream(ctx, sender_caps, tx, rx).await,
             Some(Peer2Peer::Progress(_)) => {}
             Some(_) => bail!("expected Manifest"),
             None => bail!("sender went away"),
@@ -329,6 +331,110 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
     Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, relay_time, data_channel_time })
 }
 
+/// A streaming transfer (the sender's first message was `JoinRelay`, not
+/// `Manifest`): the data comes first over the relay, encrypted with a key we
+/// do not have yet, so it is kept as it arrives. The manifest (key, size,
+/// name) and the checksum come when the sender has read all its data. Then
+/// the kept data and what still arrives are decoded into the output file,
+/// which is opened only now, and checked against the checksum.
+async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sender<Peer2Peer>, mut rx: mpsc::Receiver<Peer2Peer>) -> Result<Report> {
+    ensure!(
+        ctx.options.relay && sender_caps.contains(PeerCaps::RELAY),
+        "this is a streaming transfer, which goes over the relay, and one side does not use it"
+    );
+    let progress = ctx.progress.take();
+    let (start_tx, start_rx) = oneshot::channel::<(TransferManifest, Arc<std::fs::File>, Bump)>();
+    let mut start_tx = Some(start_tx);
+    let spool = tempfile::tempfile()?;
+    let mut download = Relay {
+        task: tokio::spawn(relay_download_stream(ctx.relay_url(), spool, start_rx, progress.clone())),
+        stop: None,
+    };
+
+    let mut started: Option<(TransferManifest, Arc<std::fs::File>)> = None;
+    let mut checksum: Option<[u8; 32]> = None;
+    let mut relay_time = Span::default();
+    let mut downloaded = false;
+    while !(downloaded && checksum.is_some()) {
+        tokio::select! {
+            message = rx.recv() => match message {
+                Some(Peer2Peer::Manifest(manifest)) if started.is_none() => {
+                    ensure!(manifest.block_size as usize == fountain::BLOCK_PLAIN, "sender uses an unsupported block size");
+                    let out = Arc::new((ctx.open.take().expect("the output is opened once"))(&manifest)?);
+                    let bump = bump_for(progress.clone(), manifest.transfer_size, tx.clone());
+                    started = Some((manifest.clone(), out.clone()));
+                    let _ = start_tx.take().expect("started once").send((manifest, out, bump));
+                }
+                Some(Peer2Peer::Checksum(sum)) => checksum = Some(sum),
+                Some(Peer2Peer::JoinRelay) | Some(Peer2Peer::Progress(_)) => {}
+                Some(_) => bail!("unexpected message during a streaming transfer"),
+                None => bail!("sender went away"),
+            },
+            result = async { (&mut download.task).await }, if !downloaded => {
+                downloaded = true;
+                match result?? {
+                    RelayEnd::Complete(span) => relay_time = span,
+                    RelayEnd::Stopped(..) => bail!("the download was stopped"),
+                }
+            }
+        }
+    }
+
+    // the download only completes once it has the manifest
+    let (manifest, out) = started.expect("a complete download has its manifest");
+    let (size, key) = (manifest.transfer_size, manifest.bulk_key.clone());
+    let actual = commitment_of(out, size, key).await?;
+    ensure!(Some(actual) == checksum, "data does not match the sender's checksum");
+    // a link that does carry a signature has to agree as well
+    ensure!(
+        ctx.link.signature == [0u8; 32] || actual == ctx.link.signature,
+        "data does not match the share link's signature"
+    );
+    tx.send(Peer2Peer::Complete).await?;
+    Ok(Report { manifest, transport: Transport::Relay, relay_bytes: size, data_channel_bytes: 0, relay_time, data_channel_time: Span::default() })
+}
+
+/// The relay download of a streaming transfer: until the manifest arrives
+/// (`start`) the stream is only written to `spool`, as it is, since there is
+/// no key to decode it with. Then the spool is decoded, followed by the rest
+/// of the stream, as in `relay_download`.
+async fn relay_download_stream(
+    url: String,
+    spool: std::fs::File,
+    mut start: oneshot::Receiver<(TransferManifest, Arc<std::fs::File>, Bump)>,
+    progress: Option<Progress>,
+) -> Result<RelayEnd> {
+    use tokio::io::AsyncWriteExt;
+    let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
+    let mut stream: ByteStream = Box::pin(response.bytes_stream());
+    let mut spool = tokio::fs::File::from_std(spool);
+    let mut spooled = 0u64;
+    let mut stream_over = false;
+    let (manifest, out, bump) = loop {
+        tokio::select! {
+            started = &mut start => {
+                break started.map_err(|_| anyhow::anyhow!("the transfer ended before its manifest arrived"))?;
+            }
+            chunk = stream.next(), if !stream_over => match chunk {
+                Some(chunk) => {
+                    let chunk = chunk?;
+                    spool.write_all(&chunk).await?;
+                    spooled += chunk.len() as u64;
+                    // the size is not known yet: bytes so far, no total
+                    if let Some(progress) = &progress {
+                        progress(spooled, 0);
+                    }
+                }
+                None => stream_over = true,
+            }
+        }
+    };
+    spool.flush().await?;
+    let spool = spool.into_std().await;
+    let (_keep, stop) = oneshot::channel();
+    decode_download(stream, Some((spool, spooled)), manifest, out, stop, bump).await
+}
+
 /// `SHA256(file || bulk_key)`, read back from the finished file.
 async fn commitment_of(file: Arc<std::fs::File>, size: u64, key: BulkKey) -> Result<[u8; 32]> {
     Ok(tokio::task::spawn_blocking(move || -> Result<[u8; 32]> {
@@ -355,7 +461,21 @@ async fn commitment_of(file: Arc<std::fs::File>, size: u64, key: BulkKey) -> Res
 /// that are in `out` are reported.
 async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, stop: oneshot::Receiver<()>, bump: Bump) -> Result<RelayEnd> {
     let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
-    let mut stream = response.bytes_stream();
+    decode_download(Box::pin(response.bytes_stream()), None, manifest, out, stop, bump).await
+}
+
+type ByteStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+/// `relay_download` on a stream that is already open. `prefix`, with its length,
+/// is the start of the stream as it was kept: decoded first.
+async fn decode_download(
+    mut stream: ByteStream,
+    prefix: Option<(std::fs::File, u64)>,
+    manifest: TransferManifest,
+    out: Arc<std::fs::File>,
+    stop: oneshot::Receiver<()>,
+    bump: Bump,
+) -> Result<RelayEnd> {
     let mut splitter = fountain::FrameSplitter::default();
 
     let (tx, mut frames) = mpsc::channel::<Bytes>(DECODE_QUEUE);
@@ -412,6 +532,32 @@ async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::f
     let mut stop = Some(stop);
     let mut stopped = false;
     let mut span = Span::default();
+    if let Some((file, len)) = prefix {
+        // what was kept before the key was known; a frame cut at the end of it
+        // is completed by the stream that follows (same splitter)
+        let file = Arc::new(file);
+        let mut pos = 0u64;
+        'replay: while pos < len {
+            let n = (len - pos).min(1 << 20) as usize;
+            let chunk = {
+                let file = file.clone();
+                tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                    let mut buf = vec![0u8; n];
+                    fountain::read_exact_at(&file, &mut buf, pos)?;
+                    Ok(buf)
+                }).await??
+            };
+            pos += n as u64;
+            for payload in splitter.push(&chunk)? {
+                span.mark();
+                // a closed queue means the decoder is done, or has failed: its result says which
+                if tx.as_ref().unwrap().send(payload).await.is_err() {
+                    tx = None;
+                    break 'replay;
+                }
+            }
+        }
+    }
     loop {
         tokio::select! {
             asked = async { stop.as_mut().unwrap().await }, if stop.is_some() => {

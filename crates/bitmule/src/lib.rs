@@ -37,6 +37,31 @@
 //! # }
 //! ```
 //!
+//! # Send a stream
+//!
+//! Data that is made while it is sent (a pipe, a database BLOB, a
+//! generator) has no size or hash up front. [`Client::send_reader`] and
+//! [`Client::send_stream`] upload it as it is read and send the manifest and
+//! checksum after the data; the receiver checks it then. This goes over the
+//! relay, and the share link carries no signature.
+//!
+//! ```no_run
+//! # #[tokio::main] async fn main() -> bitmule::Result<()> {
+//! use bitmule::{Client, StreamSource};
+//!
+//! let client = Client::new("https://bitmule.qdat.net");
+//! // can only be read once: kept in a temporary file for the repair passes
+//! let handle = client.send_reader("log.txt", tokio::io::stdin()).start().await?;
+//! // or something that can be opened again, which needs no copy
+//! let _ = client.send_stream("big.bin", StreamSource::restartable(|| async {
+//!     Ok(Box::new(tokio::fs::File::open("big.bin").await?) as bitmule::StreamReader)
+//! }));
+//! println!("share {}", handle.share_url());
+//! handle.wait().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Recv
 //!
 //! ```no_run
@@ -68,9 +93,6 @@
 //! # What isn't here yet
 //!
 //! - Identity / contacts API (currently `src/identity.rs`, CLI-only).
-//! - Streaming send from an `AsyncRead` — the transport wants a `Path`
-//!   today. Needed for the synthline-agent handoff where an
-//!   attachment lives in a SQLite BLOB.
 //! - Structured error variants — [`Error::Transport`] wraps
 //!   `anyhow::Error` verbatim.
 
@@ -82,9 +104,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncRead;
-use v2::{Options, SendEvent, Server};
+use v2::{Options, SendEvent, Server, StreamInfo};
 
 pub use native::TransportMode;
+pub use v2::{Reader as StreamReader, StreamSource};
 pub mod v2;
 
 // -----------------------------------------------------------------------
@@ -169,6 +192,22 @@ impl Client {
     /// Like [`Client::send`], saved by the receiver under `name`.
     pub fn send_with_name(&self, path: impl Into<PathBuf>, name: impl Into<String>) -> SendBuilder {
         SendBuilder::new(self.clone()).send_with_name(path, name)
+    }
+
+    /// Send data that is produced while it is sent (a pipe, a growing
+    /// file, a generator), so its size and hash are not known up front.
+    /// The receiver gets it under `name`, and the transfer goes over the
+    /// relay. `source` must be [`StreamSource::restartable`] (it is opened
+    /// again for each repair pass), or [`StreamSource::one_shot`], which is
+    /// kept in a temporary file for them. The share link has no signature:
+    /// the checksum follows the data, and the receiver checks against it.
+    pub fn send_stream(&self, name: impl Into<String>, source: StreamSource) -> StreamSendBuilder {
+        StreamSendBuilder { client: self.clone(), name: name.into(), source, size_hint: None, progress: None }
+    }
+
+    /// [`Client::send_stream`] for a reader that can only be read once.
+    pub fn send_reader(&self, name: impl Into<String>, reader: impl AsyncRead + Send + Unpin + 'static) -> StreamSendBuilder {
+        self.send_stream(name, StreamSource::one_shot(reader))
     }
 
     /// Fluent recv from a share URL. Defaults `dest` to the current
@@ -340,7 +379,7 @@ impl SendBuilder {
         });
 
         let (link_tx, link_rx) = tokio::sync::oneshot::channel::<(String, String)>();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             let mut link_tx = Some(link_tx);
             let for_url = server.clone();
             v2::run_send_events(&server, manifest, transfer, options, move |link| {
@@ -349,23 +388,98 @@ impl SendBuilder {
                 }
             }, on_event).await
         });
-        let (share_url, session_hex) = match link_rx.await {
-            Ok(v) => v,
-            // the task ended before there was a link: its error is the reason
-            Err(_) => {
-                return Err(match task.await {
-                    Ok(Err(e)) => Error::Transport(e),
-                    Ok(Ok(())) => Error::Transport(anyhow::anyhow!("send ended before a share link was made")),
-                    Err(e) => Error::Transport(anyhow::anyhow!("send task panicked: {e}")),
-                });
-            }
-        };
+        let (share_url, session_hex) = wait_for_link(link_rx, &mut task).await?;
 
         Ok(SendHandle {
             share_url,
             session_hex,
             display_name,
             total_bytes,
+            task,
+        })
+    }
+}
+
+/// The share URL and session id of a send task, or why it ended before there was one.
+async fn wait_for_link(
+    link_rx: tokio::sync::oneshot::Receiver<(String, String)>,
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> Result<(String, String)> {
+    match link_rx.await {
+        Ok(v) => Ok(v),
+        // the task ended before there was a link: its error is the reason
+        Err(_) => Err(match task.await {
+            Ok(Err(e)) => Error::Transport(e),
+            Ok(Ok(())) => Error::Transport(anyhow::anyhow!("send ended before a share link was made")),
+            Err(e) => Error::Transport(anyhow::anyhow!("send task panicked: {e}")),
+        }),
+    }
+}
+
+/// Fluent configuration of a send whose data is read as it goes, see
+/// [`Client::send_stream`].
+pub struct StreamSendBuilder {
+    client: Client,
+    name: String,
+    source: StreamSource,
+    size_hint: Option<u64>,
+    progress: Option<Box<dyn FnMut(u64, u64) + Send>>,
+}
+
+impl StreamSendBuilder {
+    /// The size, if known: only so progress has a total to show. The
+    /// transfer does not depend on it.
+    pub fn size_hint(mut self, bytes: u64) -> Self {
+        self.size_hint = Some(bytes);
+        self
+    }
+
+    /// Progress callback: `(bytes_received, total_bytes)`. The total is 0
+    /// until the data has been read to its end, unless there is a
+    /// [`size_hint`](Self::size_hint).
+    pub fn on_progress<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(u64, u64) + Send + 'static,
+    {
+        self.progress = Some(Box::new(f));
+        self
+    }
+
+    /// Open the session and start uploading as soon as a receiver joins.
+    /// The returned handle's `total_bytes` is the hint, or 0.
+    pub async fn start(self) -> Result<SendHandle> {
+        let server = Server::parse(&self.client.server);
+        // the data is not known up front, so there is nothing for a peer
+        // connection to ask for: it goes over the relay
+        let options = Options { webrtc: false, relay: true };
+        let progress = Mutex::new(self.progress);
+        let on_event: v2::OnSendEvent = Arc::new(move |event| {
+            if let SendEvent::Progress { bytes, total, .. } = event {
+                if let Some(callback) = progress.lock().unwrap().as_mut() {
+                    callback(bytes, total);
+                }
+            }
+        });
+        let mut info = StreamInfo::file(self.name.clone());
+        info.size_hint = self.size_hint;
+        let source = self.source;
+
+        let (link_tx, link_rx) = tokio::sync::oneshot::channel::<(String, String)>();
+        let mut task = tokio::spawn(async move {
+            let mut link_tx = Some(link_tx);
+            let for_url = server.clone();
+            v2::run_send_stream(&server, info, source, options, move |link| {
+                if let Some(tx) = link_tx.take() {
+                    let _ = tx.send((for_url.share_url(link), link.share_key.session_id_hex()));
+                }
+            }, on_event).await
+        });
+        let (share_url, session_hex) = wait_for_link(link_rx, &mut task).await?;
+        Ok(SendHandle {
+            share_url,
+            session_hex,
+            display_name: self.name,
+            total_bytes: self.size_hint.unwrap_or(0),
             task,
         })
     }

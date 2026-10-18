@@ -309,8 +309,10 @@ function receiveLink(link, ui, isCurrent) {
       state: (text) => { if (isCurrent()) ui.state.textContent = text; },
       progress: ({ bytes, total, via }) => {
         if (!isCurrent()) return;
-        const pct = total > 0 ? Math.floor((bytes / total) * 100) : 100;
-        ui.state.textContent = `receiving (${via}): ${pct}% (${fmtSize(bytes)} / ${fmtSize(total)})`;
+        // a streaming sender's size is only known at the end
+        ui.state.textContent = total > 0
+          ? `receiving (${via}): ${Math.floor((bytes / total) * 100)}% (${fmtSize(bytes)} / ${fmtSize(total)})`
+          : `receiving (${via}): ${fmtSize(bytes)}`;
         ui.state.classList.add("transferring");
       },
       done: (d) => {

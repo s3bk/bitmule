@@ -100,8 +100,15 @@ impl Outgoing {
     /// fresh repair symbols). The frames are in the relay's wire format, so
     /// they can be appended to an upload as they are.
     pub fn encode_block(&self, block_nr: u32, data: &[u8], pass: u32) -> Result<Vec<u8>> {
-        let (_, len) = self.block_span(block_nr);
-        ensure!(data.len() == len, "block {block_nr} has {len} bytes, not {}", data.len());
+        let len = data.len();
+        if self.signature.is_some() {
+            // the size is final: the block has to be the one the layout says
+            let (_, expected) = self.block_span(block_nr);
+            ensure!(len == expected, "block {block_nr} has {expected} bytes, not {len}");
+        } else {
+            // still streaming: the size is not known yet, a block is just not too big
+            ensure!(len <= fountain::BLOCK_PLAIN, "block {block_nr} has {len} bytes, more than a block holds");
+        }
         let mut buf = self.encoder.block_buffer();
         buf[..len].copy_from_slice(data);
         let frames = self.encoder.encode_block(&self.key, block_nr, buf, len)?.frames(pass);
@@ -146,6 +153,12 @@ impl Incoming {
             fountain::symbol_pool(),
         );
         Ok(Incoming { splitter: Default::default(), decoder, dropped_symbols: 0 })
+    }
+
+    /// The bytes that follow are a new relay stream (a new connection): drop a
+    /// frame the previous one was cut in the middle of. What was decoded stays.
+    pub fn new_stream(&mut self) {
+        self.splitter = Default::default();
     }
 
     /// Feed bytes of the relay stream; returns the blocks they completed.
@@ -240,6 +253,64 @@ mod tests {
             verifier.update(chunk);
         }
         assert!(verifier.finish());
+    }
+
+    #[test]
+    fn blocks_can_be_encoded_before_the_size_is_known() {
+        let size = fountain::BLOCK_PLAIN + 4321;
+        let data: Vec<u8> = (0..size as u32).map(|i| i.wrapping_mul(2654435761) as u8).collect();
+
+        // streaming: the blocks are cut as the data comes, hashed along the way
+        let mut out = Outgoing::new(Kind::Single, Some("s.bin".into()));
+        let mut frames = Vec::new();
+        for (nr, block) in data.chunks(fountain::BLOCK_PLAIN).enumerate() {
+            out.update(block).unwrap();
+            frames.push(out.encode_block(nr as u32, block, 0).unwrap());
+        }
+        // a block bigger than a block is refused even now
+        assert!(out.encode_block(9, &vec![0; fountain::BLOCK_PLAIN + 1], 0).is_err());
+        let checksum = out.finish().unwrap();
+        let manifest = out.manifest();
+        assert_eq!(manifest.transfer_size, size as u64);
+
+        // the receiver keeps the stream, then decodes it with the manifest
+        let mut incoming = Incoming::new(&manifest).unwrap();
+        let mut file = vec![0u8; size];
+        for frames in &frames {
+            for block in incoming.push(frames).unwrap() {
+                file[block.offset as usize..][..block.data.len()].copy_from_slice(&block.data);
+            }
+        }
+        assert!(incoming.is_complete());
+        assert_eq!(file, data);
+        let mut verifier = Verifier::new(&manifest, checksum);
+        verifier.update(&file);
+        assert!(verifier.finish());
+        // once the size is final, the layout is enforced again
+        assert!(out.encode_block(0, &data[..100], 1).is_err());
+    }
+
+    #[test]
+    fn a_new_stream_starts_at_a_frame_boundary() {
+        let data = payload_for_test(fountain::BLOCK_PLAIN);
+        let mut out = Outgoing::new(Kind::Single, None);
+        out.update(&data).unwrap();
+        out.finish().unwrap();
+        let manifest = out.manifest();
+        let frames = out.encode_block(0, &data, 0).unwrap();
+
+        let mut incoming = Incoming::new(&manifest).unwrap();
+        // the first connection ends in the middle of a frame ...
+        assert!(incoming.push(&frames[..frames.len() / 3 + 7]).unwrap().is_empty());
+        // ... the second starts with a whole one: without the reset the two would be mixed up
+        incoming.new_stream();
+        let blocks = incoming.push(&frames).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].data, data);
+    }
+
+    fn payload_for_test(len: usize) -> Vec<u8> {
+        (0..len as u32).map(|i| i.wrapping_mul(2654435761) as u8).collect()
     }
 
     #[test]
