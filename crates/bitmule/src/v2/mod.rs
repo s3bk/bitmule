@@ -21,6 +21,7 @@
 //! - `dcproto`: what goes over the data channel.
 
 mod dcproto;
+mod need;
 mod peer;
 mod recv;
 mod send;

@@ -291,20 +291,29 @@ impl EncodedBlock {
     /// = 15% of `N_SYMBOLS`, the receiver rebuilds the block from the first
     /// pass alone as long as under about 13% of the symbols are lost.
     pub fn frames_with(self, pass: u32, first_repair: u32, later_repair: u32) -> Vec<Bytes> {
-        let EncodedBlock { block_nr, hash, encoder, ciphertext, frames } = self;
-        let mut out = Vec::with_capacity(N_SYMBOLS + first_repair as usize);
+        if pass == 0 {
+            self.frames_range(true, 0, first_repair)
+        } else {
+            self.frames_range(false, first_repair + (pass - 1) * later_repair, later_repair)
+        }
+    }
 
-        let (start, count) = if pass == 0 {
+    /// `count` repair symbols from number `start` on (the numbers never repeat a
+    /// symbol), after all the source symbols if `with_source`. A sender that
+    /// keeps count of what it sent of a block uses this to send exactly what a
+    /// receiver says it still needs.
+    pub fn frames_range(self, with_source: bool, start: u32, count: u32) -> Vec<Bytes> {
+        let EncodedBlock { block_nr, hash, encoder, ciphertext, frames } = self;
+        let mut out = Vec::with_capacity(if with_source { N_SYMBOLS } else { 0 } + count as usize);
+
+        if with_source {
             // source symbols are the ciphertext itself
             for (i, symbol) in ciphertext.chunks_exact(SYMBOL_SIZE).enumerate() {
                 let mut frame = frames.get();
                 frame[SYMBOL_OFFSET..].copy_from_slice(symbol);
                 out.push(finish_frame(frame, block_nr, hash, PayloadId::new(SBN, i as u32)));
             }
-            (0, first_repair)
-        } else {
-            (first_repair + (pass - 1) * later_repair, later_repair)
-        };
+        }
         drop(ciphertext);
 
         let repair = encoder.repair_packets_with(start, count, |_| SymbolSlot(frames.get()));

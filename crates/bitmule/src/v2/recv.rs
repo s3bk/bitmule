@@ -11,7 +11,7 @@
 //! transfer is finished when either has delivered everything. The result is
 //! checked against the signature in the share link in any case.
 
-use std::{collections::{HashSet, VecDeque}, sync::Arc};
+use std::{collections::{HashMap, HashSet, VecDeque}, sync::Arc};
 
 use anyhow::{Result, bail, ensure};
 use bitmule_client_common::{
@@ -32,7 +32,7 @@ use futures_util::StreamExt;
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle};
 use tracing::warn;
 
-use super::{Options, Report, Server, Span, Transport, VerifyFailed, dcproto, peer::PeerLink, send::AbortOnDrop};
+use super::{Options, Report, Server, Span, Transport, VerifyFailed, dcproto, need, peer::PeerLink, send::AbortOnDrop};
 
 /// No symbol over UDP for this long: the path did not work out, or died.
 const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -734,14 +734,37 @@ async fn udp_download(
         }, BytesAssembler::new(),
     ).await?;
     let size = manifest.transfer_size;
-    let (tx, mut decode) = spawn_decoder(&manifest, out, bump, Some(udp.block_done.clone()))?;
+    // the decoder reports finished blocks here; they go on to the sender, and out of the counts
+    let (finished_tx, mut finished) = mpsc::unbounded_channel::<u32>();
+    let (tx, mut decode) = spawn_decoder(&manifest, out, bump, Some(finished_tx))?;
     let mut tx = Some(tx);
     let mut span = Span::default();
+    // symbols received per block still being worked on, for the sender to see what is missing
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut complete: HashSet<u32> = HashSet::new();
+    let mut report_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     loop {
         tokio::select! {
+            Some(block) = finished.recv() => {
+                counts.remove(&block);
+                complete.insert(block);
+                let _ = udp.block_done.send(block);
+            }
+            _ = report_tick.tick() => {
+                let needs = counts.iter()
+                    .map(|(&block, &have)| (block, (fountain::N_SYMBOLS as u32 + need::OVERHEAD).saturating_sub(have)))
+                    .collect();
+                *udp.report.lock().unwrap() = need::encode(&needs);
+            }
             payload = tokio::time::timeout(UDP_IDLE, udp.payloads_in.recv()), if tx.is_some() => match payload {
                 Ok(Some(payload)) => {
                     span.mark();
+                    // every payload starts with its block number
+                    if let Some(block) = payload.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) {
+                        if !complete.contains(&block) {
+                            *counts.entry(block).or_insert(0) += 1;
+                        }
+                    }
                     // a full queue holds the reader back; the datagrams then queue up in the socket
                     if tx.as_ref().unwrap().send(payload).await.is_err() {
                         tx = None; // the decoder is done, or has failed: its result says which

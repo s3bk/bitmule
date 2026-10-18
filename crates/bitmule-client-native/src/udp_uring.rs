@@ -55,9 +55,10 @@ pub(super) async fn start_receiver<A: Assembler>(
     assembler: A,
     payloads: mpsc::Sender<A::Item>,
     block_done: mpsc::UnboundedReceiver<u32>,
+    report: Report,
 ) -> std::io::Result<Stop> {
     connect_to(&socket, remote)?;
-    spawn("udp-uring-recv", move || receiver(socket, key, remote, cfg, assembler, payloads, block_done)).await
+    spawn("udp-uring-recv", move || receiver(socket, key, remote, cfg, assembler, payloads, block_done, report)).await
 }
 
 async fn sender(
@@ -155,10 +156,11 @@ async fn receiver<A: Assembler>(
     assembler: A,
     payloads: mpsc::Sender<A::Item>,
     mut block_done: mpsc::UnboundedReceiver<u32>,
+    report: Report,
 ) {
     let socket = Rc::new(UdpSocket::from_std(socket));
     let key = Rc::new(key);
-    let state = Rc::new(RefCell::new(ReceiveState::new(&cfg, assembler)));
+    let state = Rc::new(RefCell::new(ReceiveState::new(&cfg, assembler, report)));
     let buffers = match Buffers::new(DATA_HEADER + cfg.fragment, RECV_INFLIGHT) {
         Ok(buffers) => Rc::new(buffers),
         Err(e) => {

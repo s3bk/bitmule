@@ -100,6 +100,8 @@ const SEAL_DOMAIN: u64 = 1 << 63;
 
 /// Blocks reported per feedback packet, from the first not yet done.
 const FEEDBACK_WINDOW: usize = 256;
+/// The fixed part of a feedback packet: base, bitmap, symbols seen, symbols received.
+const FEEDBACK_FIXED: usize = 4 + FEEDBACK_WINDOW / 8 + 8;
 const FEEDBACK_EVERY: Duration = Duration::from_millis(50);
 /// Incomplete symbols kept while waiting for their other fragments.
 const REASSEMBLY_WINDOW: usize = 512;
@@ -168,7 +170,18 @@ pub struct DoneBlocks {
     /// Every block below this is done.
     below: AtomicU32,
     above: Mutex<HashSet<u32>>,
+    /// What the receiver's application put in its feedback last.
+    report: Mutex<Bytes>,
+    /// The loss the path usually has, in millionths (see `RateControl`).
+    loss_ppm: AtomicU32,
 }
+
+/// Bytes the receiver's application wants the sender's to see with every
+/// feedback packet (which blocks need how many symbols, say). The latest wins.
+pub type Report = Arc<Mutex<Bytes>>;
+
+/// The most a report may hold; it shares a datagram with the feedback.
+pub const REPORT_MAX: usize = 800;
 
 impl DoneBlocks {
     pub fn contains(&self, block: u32) -> bool {
@@ -178,6 +191,17 @@ impl DoneBlocks {
     /// Are all of the first `total` blocks done?
     pub fn all(&self, total: u32) -> bool {
         self.below.load(Ordering::Relaxed) >= total
+    }
+
+    /// The share of data datagrams the path usually loses, 0.0 to 1.0: a
+    /// sender sends that much more than the receiver needs.
+    pub fn loss(&self) -> f64 {
+        self.loss_ppm.load(Ordering::Relaxed) as f64 / 1e6
+    }
+
+    /// The application data the receiver sent with its latest feedback.
+    pub fn report(&self) -> Bytes {
+        self.report.lock().unwrap().clone()
     }
 
     fn apply(&self, base: u32, bitmap: &[u8]) {
@@ -203,6 +227,8 @@ pub struct UdpLink<T> {
     pub block_done: mpsc::UnboundedSender<u32>,
     /// Sender: what the receiver has told us is complete.
     pub done: Arc<DoneBlocks>,
+    /// Receiver: put what the sender should see with the feedback here (up to `REPORT_MAX` bytes).
+    pub report: Report,
     /// Symbol bytes per datagram, as found or configured.
     pub fragment: usize,
     worker: Worker,
@@ -324,6 +350,7 @@ pub async fn connect<A: Assembler>(
     let (in_tx, payloads_in) = mpsc::channel(2048);
     let (block_done, done_rx) = mpsc::unbounded_channel();
     let done = Arc::new(DoneBlocks::default());
+    let report: Report = Arc::new(Mutex::new(Bytes::new()));
     let path = Path { local, remote };
 
     #[cfg(target_os = "linux")]
@@ -332,18 +359,18 @@ pub async fn connect<A: Assembler>(
         let socket = pool.dup_socket(local.ip())?;
         let stop = match role {
             Role::Sender => uring::start_sender(socket, key, remote, cfg, out_rx, done.clone()).await,
-            Role::Receiver => uring::start_receiver(socket, key, remote, cfg, assembler, in_tx, done_rx).await,
+            Role::Receiver => uring::start_receiver(socket, key, remote, cfg, assembler, in_tx, done_rx, report.clone()).await,
         }?;
         pool.stop_receiving();
         debug!("udp data phase on io_uring");
-        return Ok(UdpLink { payloads_out, payloads_in, block_done, done, fragment: cfg.fragment, worker: Worker::Uring(stop) });
+        return Ok(UdpLink { payloads_out, payloads_in, block_done, done, report, fragment: cfg.fragment, worker: Worker::Uring(stop) });
     }
 
     let task = match role {
         Role::Sender => tokio::spawn(sender(pool, key, path, cfg, out_rx, done.clone())),
-        Role::Receiver => tokio::spawn(receiver(pool, key, path, cfg, assembler, in_tx, done_rx)),
+        Role::Receiver => tokio::spawn(receiver(pool, key, path, cfg, assembler, in_tx, done_rx, report.clone())),
     };
-    Ok(UdpLink { payloads_out, payloads_in, block_done, done, fragment: cfg.fragment, worker: Worker::Task(task) })
+    Ok(UdpLink { payloads_out, payloads_in, block_done, done, report, fragment: cfg.fragment, worker: Worker::Task(task) })
 }
 
 // ---- path MTU -----------------------------------------------------------------
@@ -628,6 +655,7 @@ impl RateControl {
             // a quartile, not the minimum: a single lucky report must not set the baseline
             let floor = if sorted.len() < 10 { raw } else { sorted[sorted.len() / 4] };
             let loss = (raw - floor).max(0.0);
+            done.loss_ppm.store((floor.clamp(0.0, 1.0) * 1e6) as u32, Ordering::Relaxed);
             if self.slow_start && loss < 0.02 {
                 self.rate = (self.rate * 2.0).min(self.max);
             } else {
@@ -642,8 +670,9 @@ impl RateControl {
 /// What a packet that reached the sender asks for.
 fn sender_packet(key: &BulkKey, remote: SocketAddr, rate: &mut RateControl, done: &DoneBlocks, source: SocketAddr, bytes: &[u8]) -> Option<Bytes> {
     match open(key, bytes)? {
-        (KIND_FEEDBACK, data) if data.len() == 4 + FEEDBACK_WINDOW / 8 + 8 && source == remote => {
+        (KIND_FEEDBACK, data) if data.len() >= FEEDBACK_FIXED && data.len() <= FEEDBACK_FIXED + REPORT_MAX && source == remote => {
             rate.feedback(&data, done);
+            *done.report.lock().unwrap() = Bytes::copy_from_slice(&data[FEEDBACK_FIXED..]);
             None
         }
         // the receiver is still looking for us
@@ -887,11 +916,12 @@ struct ReceiveState<A> {
     seen: u32,
     received: u32,
     dropper: Dropper,
+    report: Report,
 }
 
 impl<A: Assembler> ReceiveState<A> {
-    fn new(cfg: &UdpConfig, assembler: A) -> Self {
-        ReceiveState { assembler, tracker: DoneTracker::default(), seen: 0, received: 0, dropper: Dropper::new(cfg.drop) }
+    fn new(cfg: &UdpConfig, assembler: A, report: Report) -> Self {
+        ReceiveState { assembler, tracker: DoneTracker::default(), seen: 0, received: 0, dropper: Dropper::new(cfg.drop), report }
     }
 
     fn packet(&mut self, key: &BulkKey, remote: SocketAddr, source: SocketAddr, bytes: &[u8]) -> Incoming<A::Item> {
@@ -927,6 +957,10 @@ impl<A: Assembler> ReceiveState<A> {
         data.extend_from_slice(&self.tracker.bitmap());
         data.extend_from_slice(&self.seen.to_le_bytes());
         data.extend_from_slice(&self.received.to_le_bytes());
+        {
+            let report = self.report.lock().unwrap();
+            data.extend_from_slice(&report[..report.len().min(REPORT_MAX)]);
+        }
         seal(key, KIND_FEEDBACK, &data)
     }
 }
@@ -939,8 +973,9 @@ async fn receiver<A: Assembler>(
     assembler: A,
     payloads: mpsc::Sender<A::Item>,
     mut block_done: mpsc::UnboundedReceiver<u32>,
+    report: Report,
 ) {
-    let mut state = ReceiveState::new(&cfg, assembler);
+    let mut state = ReceiveState::new(&cfg, assembler, report);
     let mut tick = interval(FEEDBACK_EVERY);
 
     loop {
