@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use bitmule::v2::{Options, Server, Transport, run_recv, run_send};
+use bitmule::v2::{Options, Server, Transport, run_recv, run_request, run_send, run_send_to};
 use bitmule_client_common::{
     fountain::BLOCK_PLAIN,
     transfer::{Storage, TransferBuilder},
@@ -175,4 +175,70 @@ async fn one_sender_three_receivers_over_webrtc() {
 #[tokio::test(flavor = "multi_thread")]
 async fn starts_on_the_relay_and_moves_to_the_data_channel() {
     roundtrip(BLOCK_PLAIN * 12 + 5, Options::default()).await;
+}
+
+/// The receiver makes the request link; the sender answers it. The transfer
+/// then runs as any other, signature check included.
+async fn requested(len: usize, options: Options) -> Transport {
+    let server = start_server().await;
+    let data = payload(len);
+
+    let (key_tx, key_rx) = oneshot::channel();
+    let requester = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            run_request(&server, options, |key| { let _ = key_tx.send(key.clone()); }).await
+        })
+    };
+    let key = key_rx.await.unwrap();
+
+    let mut builder = TransferBuilder::new();
+    builder.add_file(Storage::Bytes(data.clone().into()), Some("payload.bin".into()));
+    let (manifest, transfer) = builder.commit_async().await.unwrap();
+    let sender = {
+        let server = server.clone();
+        tokio::spawn(async move { run_send_to(&server, &key, manifest, transfer, options, |_| {}).await })
+    };
+
+    let link = tokio::time::timeout(std::time::Duration::from_secs(60), requester).await
+        .expect("no share link from the sender").unwrap().unwrap();
+    let (out, file) = output();
+    let report = run_recv(&server, &link, file, options).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), sender).await
+        .expect("sender did not finish").unwrap().unwrap();
+    assert_eq!(std::fs::read(out.path()).unwrap(), data);
+    report.transport
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn receiver_initiated_over_the_relay() {
+    assert_eq!(requested(BLOCK_PLAIN + 99, RELAY).await, Transport::Relay);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn receiver_initiated_over_webrtc() {
+    assert_eq!(requested(BLOCK_PLAIN + 99, WEBRTC).await, Transport::WebRtc);
+}
+
+/// A sender that does not know the request key cannot join the rendezvous.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_link_needs_the_right_key() {
+    let server = start_server().await;
+    let (key_tx, key_rx) = oneshot::channel();
+    let requester = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            run_request(&server, RELAY, |key| { let _ = key_tx.send(key.clone()); }).await
+        })
+    };
+    let mut key = key_rx.await.unwrap();
+
+    // same session id is not guessable from another key, so a wrong key finds no session
+    key.0[0] ^= 1;
+    let mut builder = TransferBuilder::new();
+    builder.add_file(Storage::Bytes(payload(10).into()), Some("payload.bin".into()));
+    let (manifest, transfer) = builder.commit_async().await.unwrap();
+    assert!(run_send_to(&server, &key, manifest, transfer, RELAY, |_| {}).await.is_err());
+    assert!(!requester.is_finished(), "the requester keeps waiting");
+    requester.abort();
 }

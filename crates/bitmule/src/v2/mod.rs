@@ -28,7 +28,7 @@ mod session;
 
 use anyhow::Result;
 use bitmule_client_common::transfer::Transfer;
-use bitmule_client_native::{TransportMode, crypto::ShareLink};
+use bitmule_client_native::{TransportMode, crypto::{ShareKey, ShareLink}};
 use bitmule_core::protocol::websocket::{PeerCaps, TransferManifest};
 
 /// A bitmule server, as reached by this client.
@@ -67,6 +67,11 @@ impl Server {
 
     pub fn http(&self, path: &str) -> String {
         format!("{}://{}{path}", if self.tls { "https" } else { "http" }, self.host)
+    }
+
+    /// The link a receiver hands to a sender to ask for a transfer.
+    pub fn request_url(&self, key: &ShareKey) -> String {
+        format!("{}/send#{}", self.http(""), key.to_hex())
     }
 
     pub fn ws(&self, path: &str) -> String {
@@ -136,6 +141,29 @@ pub async fn run_send(
     on_link: impl FnOnce(&ShareLink),
 ) -> Result<()> {
     session::send(server, manifest, transfer, options, on_link).await
+}
+
+/// Receiver-initiated transfers: `on_request` gets the key to put in the link
+/// for the sender (see `Server::request_url`); returns the share link the
+/// sender made, to be received with `run_recv`.
+pub async fn run_request(
+    server: &Server,
+    options: Options,
+    on_request: impl FnOnce(&ShareKey),
+) -> Result<ShareLink> {
+    session::request(server, options, on_request).await
+}
+
+/// Send `transfer` to the receiver that made the request link with `request`.
+pub async fn run_send_to(
+    server: &Server,
+    request: &ShareKey,
+    manifest: TransferManifest,
+    transfer: Transfer,
+    options: Options,
+    on_link: impl FnOnce(&ShareLink),
+) -> Result<()> {
+    session::send_to_request(server, request, manifest, transfer, options, on_link).await
 }
 
 /// Receive the transfer behind `link` into `out` (which must be readable and

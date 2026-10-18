@@ -339,6 +339,10 @@ use serde::{Deserialize, Serialize};
         Progress(u64),
         // receiver has completed the transfer (and will exit)
         Complete,
+
+        // sender -> requester (receiver-initiated flow): the share link
+        // (base64url) of the session the sender created for the transfer
+        ShareLink(String),
     }
     /// WebRTC session description, offer half. Wire form is the standard
     /// SDP text blob (RFC 8866). The offer/answer distinction is carried

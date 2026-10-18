@@ -77,6 +77,10 @@ enum Command {
         /// Without --webrtc or --relay, defaults to WebRTC-multi.
         #[arg(long)]
         multi: bool,
+        /// Answer a receiver's request link (what `bitmule recv` without a
+        /// link prints) instead of making a share link of our own.
+        #[arg(long, value_name = "URL")]
+        to: Option<String>,
     },
     /// Receive a file. With SESSION (a hex or a share URL), connects to
     /// an existing session initiated by a sender. Without SESSION,
@@ -159,8 +163,8 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Command::Send { paths, webrtc, relay, multi } => {
-            cmd_send(&cli.server, paths, resolve_mode(webrtc, relay), multi).await
+        Command::Send { paths, webrtc, relay, multi, to } => {
+            cmd_send(&cli.server, paths, resolve_mode(webrtc, relay), multi, to).await
         }
         Command::Recv { session, out, webrtc, relay } => {
             // Infer the server from the share URL when possible so the
@@ -400,7 +404,7 @@ fn resolve_mode(webrtc: bool, relay: bool) -> TransportMode {
     }
 }
 
-async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi: bool) -> Result<()> {
+async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi: bool, to: Option<String>) -> Result<()> {
     let mut transfer = TransferBuilder::new();
     for path in paths {
         if path.is_file() {
@@ -412,6 +416,14 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
         }
     }
     let (manifest, transfer) = transfer.commit_async().await?;
+    if let Some(to) = to {
+        let frag = extract_link_fragment(&to).ok_or_else(|| anyhow!("couldn't extract the request key from {to:?}"))?;
+        let request = ShareKey::from_hex(&frag).map_err(|e| anyhow!("{to:?} is not a request link: {e}"))?;
+        let server = parse_server(&extract_server_from_url(&to).unwrap_or_else(|| server.to_string()));
+        println!("sending to the receiver that made {to}");
+        v2::run_send_to(&server, &request, manifest, transfer, v2::Options::from_mode(mode), |_| {}).await?;
+        return Ok(());
+    }
     let server = parse_server(server);
     v2::run_send(&server, manifest, transfer, v2::Options::from_mode(mode), |link| {
         let url = server.share_url(link);
@@ -430,18 +442,35 @@ async fn cmd_recv(
     out: PathBuf,
     mode: TransportMode,
 ) -> Result<()> {
-    let raw = session_arg.ok_or_else(|| anyhow!("v2 receive needs the share link from the sender"))?;
-    let frag = extract_link_fragment(&raw)
-        .ok_or_else(|| anyhow!("couldn't extract share fragment from {raw:?}"))?;
-    let link = ShareLink::from_b64_url(&frag)
-        .map_err(|e| anyhow!("share fragment {frag:?} is not a share link: {e}"))?;
-    let server = parse_server(&extract_server_from_url(&raw).unwrap_or_else(|| server.to_string()));
+    let options = v2::Options::from_mode(mode);
+    let (link, server) = match session_arg {
+        Some(raw) => {
+            let frag = extract_link_fragment(&raw)
+                .ok_or_else(|| anyhow!("couldn't extract share fragment from {raw:?}"))?;
+            let link = ShareLink::from_b64_url(&frag)
+                .map_err(|e| anyhow!("share fragment {frag:?} is not a share link: {e}"))?;
+            (link, parse_server(&extract_server_from_url(&raw).unwrap_or_else(|| server.to_string())))
+        }
+        None => {
+            // receiver-initiated: hand out a link, the sender answers with its share link
+            let server = parse_server(server);
+            let link = v2::run_request(&server, options, |key| {
+                let url = server.request_url(key);
+                println!("send:    {url}   (bitmule send --to URL FILE)");
+                if let Ok(qr) = QrCode::new(url.as_bytes()) {
+                    println!("{}", qr.render::<unicode::Dense1x2>().build());
+                }
+                println!("waiting for a sender…");
+            }).await?;
+            (link, server)
+        }
+    };
 
     // `out` is the file to write; the manifest carries no name yet
     let dest = if out.is_dir() { out.join("bitmule-download") } else { out };
     let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&dest)?;
     println!("receiving into {}", dest.display());
-    let report = v2::run_recv(&server, &link, file, v2::Options::from_mode(mode)).await?;
+    let report = v2::run_recv(&server, &link, file, options).await?;
     println!("done, over {:?} ({} bytes via relay, {} via data channel)", report.transport, report.relay_bytes, report.data_channel_bytes);
     Ok(())
 }
