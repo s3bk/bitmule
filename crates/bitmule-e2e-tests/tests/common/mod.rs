@@ -39,13 +39,14 @@ impl Env {
     /// - BITMULE_WEBDRIVER (e.g. `http://127.0.0.1:9515`) — skip auto-start
     ///   of chromedriver.
     pub async fn bring_up() -> Result<Self> {
-        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../web");
+        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
         let data_dir = TempDir::new()?;
         let (server_url, server_child) = match std::env::var("BITMULE_SERVER").ok() {
             Some(url) => (url, None),
             None => {
-                let child = spawn_server(DEFAULT_SERVER_ADDR, data_dir.path(), &web_dir).await.context("spawn_server")?;
-                (format!("http://{}", DEFAULT_SERVER_ADDR), Some(child))
+                let addr = free_addr()?;
+                let child = spawn_server(&addr, data_dir.path(), &web_dir).await.context("spawn_server")?;
+                (format!("http://{addr}"), Some(child))
             }
         };
 
@@ -73,13 +74,14 @@ impl Env {
     /// default sentinel string but MUST NOT be used.
     /// Kenna 2026-09-13.
     pub async fn bring_up_server_only() -> Result<Self> {
-        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../web");
+        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
         let data_dir = TempDir::new()?;
         let (server_url, server_child) = match std::env::var("BITMULE_SERVER").ok() {
             Some(url) => (url, None),
             None => {
-                let child = spawn_server(DEFAULT_SERVER_ADDR, data_dir.path(), &web_dir).await.context("spawn_server")?;
-                (format!("http://{}", DEFAULT_SERVER_ADDR), Some(child))
+                let addr = free_addr()?;
+                let child = spawn_server(&addr, data_dir.path(), &web_dir).await.context("spawn_server")?;
+                (format!("http://{addr}"), Some(child))
             }
         };
         Ok(Env {
@@ -92,7 +94,13 @@ impl Env {
     }
 }
 
-async fn spawn_server(bind: &str, data_dir: &Path, web_dir: &Path) -> Result<Child> {
+/// A loopback address nothing listens on right now, so tests don't collide on a fixed port.
+fn free_addr() -> Result<String> {
+    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(l.local_addr()?.to_string())
+}
+
+async fn spawn_server(bind: &str, _data_dir: &Path, web_dir: &Path) -> Result<Child> {
     // Build+run against the workspace binary. `cargo run -p bitmule-server`
     // is the portable form that works from any CWD when this test is run
     // via `cargo test -p bitmule-e2e-tests`.
@@ -100,9 +108,9 @@ async fn spawn_server(bind: &str, data_dir: &Path, web_dir: &Path) -> Result<Chi
     cmd.args([
         "run", "--quiet", "-p", "bitmule-server", "--",
         "--bind", bind,
-        "--data-dir"
-    ]).arg(data_dir)
-    .arg("--web-dir")
+        "--no-stun",
+        "--web-dir"
+    ])
     .arg(web_dir)
     .stdout(Stdio::null())
     .stderr(Stdio::inherit())
@@ -198,7 +206,7 @@ pub fn spawn_cli_with_stderr(server_url: &str, args: &[&str], capture_stderr: bo
     };
     let mut cmd = Command::new(program);
     cmd.args(&prefix)
-        .arg("--server").arg(server_url)
+        .arg("--unsafe").arg("--server").arg(server_url)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
@@ -288,6 +296,32 @@ pub async fn read_stdout_for_hex(child: &mut Child, timeout: Duration) -> Result
             Ok(Ok(None)) => bail!("CLI stdout closed before printing a session URL"),
             Ok(Err(e)) => bail!("CLI stdout read: {e}"),
             Err(_) => bail!("timed out waiting for session URL on CLI stdout"),
+        }
+    }
+}
+
+/// Read the CLI's stdout until a share link (`#` + 86 url-safe characters) appears; the
+/// rest of the output is drained in the background so the child never blocks on a full pipe.
+pub async fn read_stdout_for_link(child: &mut Child, timeout: Duration) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no piped stdout"))?;
+    let mut lines = BufReader::new(stdout).lines();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, lines.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                if let Some((_, frag)) = line.split_once('#') {
+                    let key: String = frag.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+                    if key.len() == 86 {
+                        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+                        return Ok(key);
+                    }
+                }
+            }
+            Ok(Ok(None)) => bail!("CLI stdout closed before printing a share link"),
+            Ok(Err(e)) => bail!("CLI stdout read: {e}"),
+            Err(_) => bail!("timed out waiting for a share link on CLI stdout"),
         }
     }
 }
