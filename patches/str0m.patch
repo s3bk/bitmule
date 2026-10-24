@@ -1,0 +1,529 @@
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' str0m-0.23.1/Cargo.toml str0m-bitmule/Cargo.toml
+--- str0m-0.23.1/Cargo.toml	2006-07-24 01:21:28.000000000 +0000
++++ str0m-bitmule/Cargo.toml	2026-10-23 01:01:01.755336091 +0000
+@@ -340,6 +340,9 @@
+ [dependencies.arrayvec]
+ version = "0.7.6"
+ 
++[dependencies.bytes]
++version = "1"
++
+ [dependencies.base64ct]
+ version = "1"
+ 
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' str0m-0.23.1/src/channel.rs str0m-bitmule/src/channel.rs
+--- str0m-0.23.1/src/channel.rs	2006-07-24 01:21:28.000000000 +0000
++++ str0m-bitmule/src/channel.rs	2026-10-18 12:03:04.184631865 +0000
+@@ -35,6 +35,31 @@
+     pub data: Vec<u8>,
+ }
+ 
++/// How incoming data channel messages are delivered.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum Delivery {
++    /// [`Event::ChannelData`][crate::Event::ChannelData], the message in a `Vec`.
++    #[default]
++    Vec,
++    /// [`Event::ChannelMessage`][crate::Event::ChannelMessage], one part: the chunks
++    /// copied together into one pooled buffer.
++    Merged,
++    /// [`Event::ChannelMessage`][crate::Event::ChannelMessage], one part per SCTP chunk:
++    /// slices of the decrypted packets, nothing copied.
++    Segments,
++}
++
++/// A data channel message as the memory it arrived in.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ChannelMessage {
++    /// The channel the message arrived on.
++    pub id: ChannelId,
++    /// Whether it was sent as binary or text.
++    pub binary: bool,
++    /// The message is these concatenated (none if it is empty).
++    pub parts: Vec<bytes::Bytes>,
++}
++
+ /// Channel for sending data to the remote peer.
+ ///
+ /// Get this handle from [`Rtc::channel()`][crate::Rtc::channel()].
+@@ -74,6 +99,21 @@
+ 
+         Ok(true)
+     }
++
++    /// Like `write`, but takes the data over: SCTP sends slices of it, so it is not copied.
++    #[must_use = "Whether the buffer was accepted by the write()"]
++    pub fn write_bytes(&mut self, binary: bool, buf: bytes::Bytes) -> Result<bool, RtcError> {
++        let available = self.rtc.sctp.available();
++        if buf.len() > available {
++            return Ok(false);
++        }
++
++        let len = buf.len();
++        let written = self.rtc.sctp.write_bytes(self.sctp_stream_id, binary, buf)?;
++        assert_eq!(written, len, "Data channel write_bytes() less than entire buffer");
++
++        Ok(true)
++    }
+ 
+     /// Get the amount of buffered data.
+     ///
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' str0m-0.23.1/src/config.rs str0m-bitmule/src/config.rs
+--- str0m-0.23.1/src/config.rs	2006-07-24 01:21:28.000000000 +0000
++++ str0m-bitmule/src/config.rs	2026-10-18 12:03:04.183879785 +0000
+@@ -53,6 +53,7 @@
+     pub(crate) dtls_version: DtlsVersion,
+     pub(crate) vp9_packetizer_mode: Vp9PacketizerMode,
+     pub(crate) snap_enabled: bool,
++    pub(crate) channel_delivery: crate::channel::Delivery,
+     pub(crate) mtu: RangeInclusive<usize>,
+ }
+ 
+@@ -630,6 +631,12 @@
+         self
+     }
+ 
++    /// How incoming data channel messages are delivered (default: in a `Vec`).
++    pub fn set_channel_delivery(mut self, delivery: crate::channel::Delivery) -> Self {
++        self.channel_delivery = delivery;
++        self
++    }
++
+     /// Enable SNAP (SCTP Negotiation Acceleration Protocol).
+     ///
+     /// When enabled, the `a=sctp-init` attribute is included in outgoing SDP
+@@ -775,6 +782,7 @@
+             dtls_version: DtlsVersion::Dtls12,
+             vp9_packetizer_mode: Vp9PacketizerMode::default(),
+             snap_enabled: false,
++            channel_delivery: crate::channel::Delivery::default(),
+             mtu: DATAGRAM_MTU_TARGET..=DATAGRAM_MTU_WARN,
+         }
+     }
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' str0m-0.23.1/src/lib.rs str0m-bitmule/src/lib.rs
+--- str0m-0.23.1/src/lib.rs	2006-07-24 01:21:28.000000000 +0000
++++ str0m-bitmule/src/lib.rs	2026-10-23 01:01:01.755336091 +0000
+@@ -827,6 +827,8 @@
+ use format::CodecConfig;
+ 
+ pub mod channel;
++mod rxbuf;
++pub use rxbuf::{RxBuf, RxPool, set_rx_pool};
+ use channel::{Channel, ChannelData, ChannelHandler, ChannelId};
+ 
+ pub mod media;
+@@ -905,7 +907,6 @@
+     ice: IceAgent,
+     dtls: Dtls,
+     dtls_connected: bool,
+-    dtls_buf: Vec<u8>,
+     next_dtls_timeout: Option<Instant>,
+     sctp: RtcSctp,
+     chan: ChannelHandler,
+@@ -920,6 +921,11 @@
+     peer_bytes_tx: u64,
+     change_counter: usize,
+     last_timeout_reason: Reason,
++
++    /// Set by `do_poll_output_once` to ask `do_poll_output` to run it again.
++    /// Looping instead of recursing keeps the stack flat however many SCTP
++    /// packets are queued.
++    repoll: bool,
+     crypto_provider: Arc<crate::crypto::CryptoProvider>,
+     fingerprint_verification: bool,
+     close_dtls_started: bool,
+@@ -990,6 +996,10 @@
+     /// Incoming data channel data from the remote peer.
+     ChannelData(ChannelData),
+ 
++    /// Incoming data channel data as the memory it arrived in, when the
++    /// config asks for it ([`RtcConfig::set_channel_delivery`]).
++    ChannelMessage(channel::ChannelMessage),
++
+     /// A data channel has been closed.
+     ChannelClose(ChannelId),
+ 
+@@ -1256,6 +1266,7 @@
+         if config.snap_enabled {
+             sctp.enable_snap();
+         }
++        sctp.set_delivery(config.channel_delivery);
+ 
+         Ok(Rtc {
+             state: RtcState::Alive,
+@@ -1270,7 +1281,6 @@
+             )
+             .expect("DTLS to init without problem"),
+             dtls_connected: false,
+-            dtls_buf: vec![0; 2000],
+             next_dtls_timeout: None,
+             session,
+             sctp,
+@@ -1285,6 +1295,7 @@
+             peer_bytes_tx: 0,
+             change_counter: 0,
+             last_timeout_reason: Reason::NotHappening,
++            repoll: false,
+             crypto_provider,
+             fingerprint_verification: config.fingerprint_verification,
+             close_dtls_started: false,
+@@ -1551,6 +1562,7 @@
+         match &o {
+             Output::Event(e) => match e {
+                 Event::ChannelData(_)
++                | Event::ChannelMessage(_)
+                 | Event::MediaData(_)
+                 | Event::RtpPacket(_)
+                 | Event::SenderFeedback(_)
+@@ -1575,6 +1587,16 @@
+     }
+ 
+     fn do_poll_output(&mut self) -> Result<Output, RtcError> {
++        loop {
++            self.repoll = false;
++            let output = self.do_poll_output_once();
++            if !self.repoll {
++                return output;
++            }
++        }
++    }
++
++    fn do_poll_output_once(&mut self) -> Result<Output, RtcError> {
+         if self.state == RtcState::Closed {
+             self.last_timeout_reason = Reason::NotHappening;
+             return Ok(Output::Timeout(not_happening()));
+@@ -1634,7 +1656,8 @@
+         // Poll DTLS output - collect packets, handle events
+         let mut just_connected = false;
+         loop {
+-            match self.dtls.poll_output(&mut self.dtls_buf) {
++            let mut packet = rxbuf::get(rxbuf::PACKET);
++            match self.dtls.poll_output(&mut packet.spare()[..rxbuf::PACKET]) {
+                 DtlsOutput::Packet(_) => {
+                     unreachable!("We don't expect DTLS packets here since we use poll_packet");
+                 }
+@@ -1678,7 +1701,9 @@
+                     }
+                 }
+                 DtlsOutput::ApplicationData(data) => {
+-                    self.sctp.handle_input(self.last_now, data);
++                    // the decrypted packet stays where it is; SCTP keeps slices of it
++                    let len = data.len();
++                    self.sctp.handle_input_bytes(self.last_now, packet.into_bytes(len));
+                 }
+                 DtlsOutput::Timeout(t) => {
+                     self.next_dtls_timeout = Some(t);
+@@ -1716,7 +1741,8 @@
+                                 if !packets.is_empty() {
+                                     self.sctp.push_back_transmit(packets);
+                                 }
+-                                return self.do_poll_output();
++                                self.repoll = true;
++                                return Ok(Output::Timeout(not_happening()));
+                             } else {
+                                 return Err(e.into());
+                             }
+@@ -1731,7 +1757,8 @@
+ 
+                         // Run again since this would feed the DTLS subsystem
+                         // to produce a packet now.
+-                        return self.do_poll_output();
++                        self.repoll = true;
++                                return Ok(Output::Timeout(not_happening()));
+                     }
+                 }
+                 SctpEvent::Open { id, label } => {
+@@ -1770,6 +1797,14 @@
+                     let cd = ChannelData { id, binary, data };
+                     return Ok(Output::Event(Event::ChannelData(cd)));
+                 }
++                SctpEvent::Message { id, binary, parts } => {
++                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
++                        warn!("Drop ChannelMessage event for id: {:?}", id);
++                        continue;
++                    };
++                    let message = channel::ChannelMessage { id, binary, parts };
++                    return Ok(Output::Event(Event::ChannelMessage(message)));
++                }
+                 SctpEvent::BufferedAmountLow { id } => {
+                     let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                         warn!("Drop BufferedAmountLow for id: {:?}", id);
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' str0m-0.23.1/src/rxbuf.rs str0m-bitmule/src/rxbuf.rs
+--- str0m-0.23.1/src/rxbuf.rs	1970-01-01 00:00:00.000000000 +0000
++++ str0m-bitmule/src/rxbuf.rs	2026-10-23 01:01:01.755336091 +0000
+@@ -0,0 +1,60 @@
++//! Buffers for what arrives over the data channel. By default they are plain
++//! `Vec`s; an application can plug in a pool with `set_rx_pool`, so the
++//! decrypted packet is handed to SCTP as `Bytes` of pooled memory, and a
++//! message merged from its chunks (`Delivery::Merged`) is one pooled buffer.
++
++use std::sync::{Arc, OnceLock};
++
++use bytes::Bytes;
++
++/// A decrypted SCTP packet (a DTLS record is at most an MTU).
++pub(crate) const PACKET: usize = 2048;
++/// A merged message; larger ones get a buffer of their own.
++pub(crate) const MESSAGE: usize = 17 * 1024;
++
++/// A source of receive buffers.
++pub trait RxPool: Send + Sync + 'static {
++    /// A buffer of at least `min` bytes, whose contents are unspecified; `None`
++    /// if the pool has none that large (a `Vec` is used then).
++    fn get(&self, min: usize) -> Option<Box<dyn RxBuf>>;
++}
++
++/// A buffer on loan from an `RxPool`.
++pub trait RxBuf: Send {
++    /// The whole buffer, to write into.
++    fn spare(&mut self) -> &mut [u8];
++    /// The first `len` bytes as `Bytes`, without a copy where the pool can.
++    /// The memory goes back to the pool when the last clone is dropped.
++    fn into_bytes(self: Box<Self>, len: usize) -> Bytes;
++}
++
++struct VecBuf(Vec<u8>);
++
++impl VecBuf {
++    fn new(min: usize) -> Box<dyn RxBuf> {
++        Box::new(VecBuf(vec![0; min]))
++    }
++}
++
++impl RxBuf for VecBuf {
++    fn spare(&mut self) -> &mut [u8] {
++        &mut self.0
++    }
++
++    fn into_bytes(mut self: Box<Self>, len: usize) -> Bytes {
++        self.0.truncate(len);
++        Bytes::from(self.0)
++    }
++}
++
++static POOL: OnceLock<Arc<dyn RxPool>> = OnceLock::new();
++
++/// Use `pool` for receive buffers, from now on and for every `Rtc`. Only the
++/// first call has an effect; returns whether it was this one.
++pub fn set_rx_pool(pool: Arc<dyn RxPool>) -> bool {
++    POOL.set(pool).is_ok()
++}
++
++pub(crate) fn get(min: usize) -> Box<dyn RxBuf> {
++    POOL.get().and_then(|pool| pool.get(min)).unwrap_or_else(|| VecBuf::new(min))
++}
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' str0m-0.23.1/src/sctp/mod.rs str0m-bitmule/src/sctp/mod.rs
+--- str0m-0.23.1/src/sctp/mod.rs	2006-07-24 01:21:28.000000000 +0000
++++ str0m-bitmule/src/sctp/mod.rs	2026-10-23 01:42:49.144947736 +0000
+@@ -26,7 +26,7 @@
+ mod error;
+ pub use error::SctpError;
+ 
+-/// Bytes that can be buffered inside str0m across all streams.
++/// Bytes that can be buffered inside str0m across all streams (upstream's 128 KiB: the fork's 1 MiB was slower, see FORKS.md).
+ const MAX_BUFFERED_ACROSS_STREAMS: usize = 128 * 1024;
+ 
+ /// Maximum message size we advertise in SDP (what we can receive)
+@@ -55,6 +55,7 @@
+     client: bool,
+     remote_max_message_size: u32,
+     snap_enabled: bool,
++    delivery: crate::channel::Delivery,
+     snap_init: Option<SctpInitData>,
+     #[cfg(test)]
+     max_payload_size: usize,
+@@ -153,6 +154,11 @@
+         binary: bool,
+         data: Vec<u8>,
+     },
++    Message {
++        id: u16,
++        binary: bool,
++        parts: Vec<bytes::Bytes>,
++    },
+     BufferedAmountLow {
+         id: u16,
+     },
+@@ -312,6 +318,7 @@
+             client: false,
+             remote_max_message_size: DEFAULT_REMOTE_MAX_MESSAGE_SIZE,
+             snap_enabled: false,
++            delivery: crate::channel::Delivery::default(),
+             snap_init: None,
+             #[cfg(test)]
+             max_payload_size,
+@@ -642,6 +649,39 @@
+         Ok(stream.write_with_ppi(buf, ppi)?)
+     }
+ 
++    /// Like `write`, but takes the data over instead of copying it.
++    pub fn write_bytes(&mut self, id: u16, binary: bool, buf: bytes::Bytes) -> Result<usize, SctpError> {
++        if self.state != RtcSctpState::Established || self.is_closing() || self.is_closed() {
++            return Err(SctpError::WriteBeforeEstablished);
++        }
++
++        let assoc = self
++            .assoc
++            .as_mut()
++            .ok_or(SctpError::WriteBeforeEstablished)?;
++
++        let rec = entry_by_id(&self.entries, id).expect("stream entry for write");
++
++        if rec.state != StreamEntryState::Open {
++            return Err(SctpError::WriteBeforeEstablished);
++        }
++
++        let mut stream = assoc.stream(id)?;
++
++        let ppi = match (binary, buf.is_empty()) {
++            (true, true) => PayloadProtocolIdentifier::BinaryEmpty,
++            (true, false) => PayloadProtocolIdentifier::Binary,
++            (false, true) => PayloadProtocolIdentifier::StringEmpty,
++            (false, false) => PayloadProtocolIdentifier::String,
++        };
++
++        Ok(stream.write_owned_with_ppi(buf, ppi)?)
++    }
++
++    pub fn set_delivery(&mut self, delivery: crate::channel::Delivery) {
++        self.delivery = delivery;
++    }
++
+     pub fn buffered_amount(&mut self, id: u16) -> usize {
+         let Some(assoc) = self.assoc.as_mut() else {
+             return 0;
+@@ -663,10 +703,12 @@
+     }
+ 
+     pub fn handle_input(&mut self, now: Instant, data: &[u8]) {
+-        trace!("Handle input: {}", data.len());
++        self.handle_input_bytes(now, data.to_vec().into());
++    }
+ 
+-        // TODO, remove Bytes in sctp and just use &[u8].
+-        let data = data.to_vec().into();
++    /// The packet as memory SCTP may keep slices of: nothing is copied.
++    pub fn handle_input_bytes(&mut self, now: Instant, data: bytes::Bytes) {
++        trace!("Handle input: {}", data.len());
+         let r = self.endpoint.handle(now, self.fake_addr, None, None, data);
+ 
+         let Some((handle, event)) = r else {
+@@ -1013,22 +1055,36 @@
+ 
+                     entry.buffered_threshold = BufferedThresholdConfig::Configured(x);
+                 }
+-                match stream_read_data(&mut stream) {
+-                    Ok(Some((buf, ppi))) => {
++                match stream_read_data(&mut stream, self.delivery) {
++                    Ok(Some((read, ppi))) => {
+                         if ppi != PayloadProtocolIdentifier::Dcep {
+                             // This is the normal path for incoming data.
+-                            let buf = ppi_adjust_buf(buf, ppi);
+                             let binary = matches!(
+                                 ppi,
+                                 PayloadProtocolIdentifier::Binary
+                                     | PayloadProtocolIdentifier::BinaryEmpty
+                             );
+-                            return Some(SctpEvent::Data {
+-                                id: entry.id,
+-                                binary,
+-                                data: buf,
+-                            });
++                            match read {
++                                Read::Vec(buf) => {
++                                    let buf = ppi_adjust_buf(buf, ppi);
++                                    return Some(SctpEvent::Data {
++                                        id: entry.id,
++                                        binary,
++                                        data: buf,
++                                    });
++                                }
++                                Read::Parts(parts) => {
++                                    return Some(SctpEvent::Message {
++                                        id: entry.id,
++                                        binary,
++                                        parts,
++                                    });
++                                }
++                            }
+                         }
++                        let Read::Vec(buf) = read else {
++                            unreachable!("DCEP is always read into a Vec")
++                        };
+ 
+                         // It's Dcep, either a DcepOpen or DcepAck.
+                         match entry.state {
+@@ -1255,14 +1311,50 @@
+     &mut entries[idx]
+ }
+ 
++/// A message read from a stream.
++enum Read {
++    Vec(Vec<u8>),
++    /// The message is these concatenated.
++    Parts(Vec<bytes::Bytes>),
++}
++
+ fn stream_read_data(
+     stream: &mut Stream,
+-) -> Result<Option<(Vec<u8>, PayloadProtocolIdentifier)>, SctpError> {
++    delivery: crate::channel::Delivery,
++) -> Result<Option<(Read, PayloadProtocolIdentifier)>, SctpError> {
++    use crate::channel::Delivery;
++
+     let Some(chunks) = stream.read()? else {
+         return Ok(None);
+     };
+ 
+     let n = chunks.len();
++
++    if delivery != Delivery::Vec {
++        match chunks.ppi {
++            PayloadProtocolIdentifier::String | PayloadProtocolIdentifier::Binary => {
++                let parts = if delivery == Delivery::Segments {
++                    chunks.chunks.iter().map(|c| c.user_data.clone()).collect()
++                } else if n <= crate::rxbuf::MESSAGE {
++                    let mut message = crate::rxbuf::get(n);
++                    let l = chunks.read(&mut message.spare()[..n])?;
++                    assert!(l == n);
++                    vec![message.into_bytes(n)]
++                } else {
++                    let mut buf = vec![0; n];
++                    let l = chunks.read(&mut buf)?;
++                    assert!(l == n);
++                    vec![bytes::Bytes::from(buf)]
++                };
++                return Ok(Some((Read::Parts(parts), chunks.ppi)));
++            }
++            PayloadProtocolIdentifier::StringEmpty | PayloadProtocolIdentifier::BinaryEmpty => {
++                return Ok(Some((Read::Parts(Vec::new()), chunks.ppi)));
++            }
++            _ => {} // DCEP and the unknown: as before
++        }
++    }
++
+     let mut buf = vec![0; n];
+ 
+     let l = chunks.read(&mut buf)?;
+@@ -1279,7 +1371,7 @@
+         }
+     }
+ 
+-    Ok(Some((buf, chunks.ppi)))
++    Ok(Some((Read::Vec(buf), chunks.ppi)))
+ }
+ 
+ fn ppi_adjust_buf(mut buf: Vec<u8>, ppi: PayloadProtocolIdentifier) -> Vec<u8> {
+@@ -1313,6 +1405,12 @@
+                 .debug_struct("StreamResetComplete")
+                 .field("id", id)
+                 .finish(),
++            Self::Message { id, binary, parts } => f
++                .debug_struct("Message")
++                .field("id", id)
++                .field("binary", binary)
++                .field("parts", &parts.len())
++                .finish(),
+             Self::Data { id, binary, data } => f
+                 .debug_struct("Data")
+                 .field("id", id)

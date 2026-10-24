@@ -85,9 +85,21 @@ postcard = "1.1.3"
 debug = 1
 lto = "thin"
 
-# local forks: str0m (data channel send buffer 1 MiB, not 128 KiB: vendor/str0m/src/sctp/mod.rs) and
-# sctp-proto (Fx hashing in the payload queue, SACK delay settable: vendor/sctp-proto)
+# Android .so files: `cargo ndk -t aarch64-linux-android ... build --profile android`.
+# Fat LTO, one codegen unit and opt-level "s" make the stripped arm64 library
+# 8.9 MB instead of 12.9 MB. Unwinding stays on (the FFI catches panics).
+[profile.android]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+strip = "symbols"
+debug = 0
+
+# The four forks (what they change and why: FORKS.md). The crates depend on the
+# crates.io versions; this swaps in the fork tags, transitive uses included.
 [patch.crates-io]
-str0m = { git = "https://github.com/s3bk/str0m", branch = "bitmule-vendored" }
-sctp-proto = { git = "https://github.com/s3bk/sctp-proto", branch = "bitmule" }
-tokio-uring = { git = "https://github.com/s3bk/tokio-uring", branch = "bitmule" }
+str0m = { git = "https://github.com/s3bk/str0m", tag = "bitmule-v0.23.1" }
+sctp-proto = { git = "https://github.com/s3bk/sctp-proto", tag = "bitmule-v0.10.4" }
+tokio-uring = { git = "https://github.com/s3bk/tokio-uring", tag = "bitmule-v0.5.0" }
+dimpl = { git = "https://github.com/s3bk/dimpl", tag = "bitmule-v0.7.6" }

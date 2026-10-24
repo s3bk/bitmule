@@ -1,0 +1,103 @@
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' sctp-proto-0.10.4/src/association/mod.rs sctp-proto-bitmule/src/association/mod.rs
+--- sctp-proto-0.10.4/src/association/mod.rs	2006-07-24 01:21:28.000000000 +0000
++++ sctp-proto-bitmule/src/association/mod.rs	2026-10-23 01:42:49.152039119 +0000
+@@ -2957,8 +2957,8 @@
+         &mut self,
+         d: &ChunkSelectiveAck,
+         now: Instant,
+-    ) -> Result<(HashMap<u16, i64>, u32)> {
+-        let mut bytes_acked_per_stream = HashMap::new();
++    ) -> Result<(FxHashMap<u16, i64>, u32)> {
++        let mut bytes_acked_per_stream = FxHashMap::default();
+ 
+         // New ack point, so pop all ACKed packets from inflight_queue
+         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
+@@ -4039,7 +4039,7 @@
+     /// This method is called when use_forward_tsn is set to true.
+     fn create_forward_tsn(&self) -> ChunkForwardTsn {
+         // RFC 3758 Sec 3.5 C4
+-        let mut stream_map: HashMap<u16, u16> = HashMap::new(); // to report only once per SI
++        let mut stream_map: FxHashMap<u16, u16> = FxHashMap::default(); // to report only once per SI
+         let mut i = self.cumulative_tsn_ack_point + 1;
+         while sna32lte(i, self.advanced_peer_tsn_ack_point) {
+             if let Some(c) = self.inflight_queue.get(i) {
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' sctp-proto-0.10.4/src/association/stream.rs sctp-proto-bitmule/src/association/stream.rs
+--- sctp-proto-0.10.4/src/association/stream.rs	2006-07-24 01:21:28.000000000 +0000
++++ sctp-proto-bitmule/src/association/stream.rs	2026-10-18 11:49:44.291490473 +0000
+@@ -192,6 +192,14 @@
+         self.write_source(&mut ByteSlice::from_slice(data), ppi)
+     }
+ 
++    /// Send `data` with a specific payload protocol, taking it over: the
++    /// chunks sent are slices of it, so it is not copied.
++    ///
++    /// Returns the number of bytes successfully written.
++    pub fn write_owned_with_ppi(&mut self, data: Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
++        self.write_source(&mut crate::util::OwnedBytes(data), ppi)
++    }
++
+     /// write writes len(p) bytes from p with the default Payload Protocol Identifier
+     pub fn write_chunk(&mut self, p: &Bytes) -> Result<usize> {
+         self.write_source(
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' sctp-proto-0.10.4/src/chunk/chunk_payload_data.rs sctp-proto-bitmule/src/chunk/chunk_payload_data.rs
+--- sctp-proto-0.10.4/src/chunk/chunk_payload_data.rs	2006-07-24 01:21:28.000000000 +0000
++++ sctp-proto-bitmule/src/chunk/chunk_payload_data.rs	2026-10-18 12:02:34.168984361 +0000
+@@ -96,7 +96,7 @@
+     pub(crate) stream_identifier: u16,
+     pub(crate) stream_sequence_number: u16,
+     pub(crate) payload_type: PayloadProtocolIdentifier,
+-    pub(crate) user_data: Bytes,
++    pub user_data: Bytes,
+ 
+     /// Whether this data chunk was acknowledged (received by peer)
+     pub(crate) acked: bool,
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' sctp-proto-0.10.4/src/queue/payload_queue.rs sctp-proto-bitmule/src/queue/payload_queue.rs
+--- sctp-proto-0.10.4/src/queue/payload_queue.rs	2006-07-24 01:21:28.000000000 +0000
++++ sctp-proto-bitmule/src/queue/payload_queue.rs	2026-10-18 01:28:57.522791439 +0000
+@@ -4,12 +4,12 @@
+ 
+ use alloc::string::String;
+ use alloc::vec::Vec;
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ 
+ #[derive(Default, Debug)]
+ pub(crate) struct PayloadQueue {
+     // length: usize,
+-    chunk_map: HashMap<u32, ChunkPayloadData>,
++    chunk_map: FxHashMap<u32, ChunkPayloadData>,
+     pub(crate) sorted: Vec<u32>,
+     dup_tsn: Vec<u32>,
+     n_bytes: usize,
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' sctp-proto-0.10.4/src/util.rs sctp-proto-bitmule/src/util.rs
+--- sctp-proto-0.10.4/src/util.rs	2006-07-24 01:21:28.000000000 +0000
++++ sctp-proto-bitmule/src/util.rs	2026-10-18 11:49:44.290671084 +0000
+@@ -196,6 +196,28 @@
+     }
+ }
+ 
++/// One `Bytes` as a source: the chunks are slices of it, nothing is copied.
++pub struct OwnedBytes(pub Bytes);
++
++impl BytesSource for OwnedBytes {
++    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
++        let limit = limit.min(self.0.len());
++        if limit == 0 {
++            return (Bytes::new(), 0);
++        }
++        let chunk = self.0.split_to(limit);
++        (chunk, usize::from(self.0.is_empty()))
++    }
++
++    fn has_remaining(&self) -> bool {
++        !self.0.is_empty()
++    }
++
++    fn remaining(&self) -> usize {
++        self.0.len()
++    }
++}
++
+ /// A source of one or more buffers which can be converted into `Bytes` buffers on demand
+ ///
+ /// The purpose of this data type is to defer conversion as long as possible,
