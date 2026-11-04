@@ -10,7 +10,7 @@ use anyhow::{Result, bail, ensure};
 use bitmule_client_common::transfer::Transfer;
 use bitmule_client_native::{
     crypto::{IdentityRole, ShareKey, ShareLink},
-    websocket::connect_ws,
+    websocket::{Owner, connect_ws, connect_ws_owner},
 };
 use bitmule_core::{
     ReceiverId, SessionId, Token,
@@ -97,6 +97,14 @@ async fn send_job(
                 let Some(message) = message else { bail!("connection to the server closed") };
                 match message {
                     ServerToClient::PeerJoined { id, pub_key, mac, caps } => {
+                        // After our own reconnect the server replays the
+                        // receivers that joined meanwhile. Those already have
+                        // a worker, and the channels did not change: nothing
+                        // to do (and a second worker would duplicate the
+                        // upload).
+                        if peers.contains_key(&id) {
+                            continue;
+                        }
                         if !peer_checks_out(&share_key, IdentityRole::Joiner, &session_id, &id, &pub_key, &mac, &wire.identity.public_key()) {
                             warn!("Bad MAC from {id:?}");
                             continue;
@@ -132,7 +140,9 @@ async fn send_job(
                     }
                     ServerToClient::PeerFull { id } => warn!("peer {id:?} is not keeping up"),
                     ServerToClient::SessionJoined { .. } => bail!("unexpected SessionJoined"),
-                    ServerToClient::SessionCreated { .. } => bail!("unexpected SessionCreated"),
+                    // We came back after a dropped socket: the server readds
+                    // us with the tokens we already have, which do not change.
+                    ServerToClient::SessionCreated { .. } => {}
                 }
             }
             Some(done) = workers.join_next() => {
@@ -192,14 +202,15 @@ struct Created {
     session_id: SessionId,
     to_server: mpsc::Sender<ClientToServer>,
     from_server: mpsc::Receiver<ServerToClient>,
-    /// pass as `&token=` to /ws/create to regain our id (not used yet)
-    #[allow(dead_code)]
-    reconnect_token: bitmule_core::Token,
     /// authorizes the relay POST
     relay_token: bitmule_core::Token,
 }
 
 /// Create the session of `share_key`: proof of work, websocket, registration.
+/// The websocket worker redials with the reconnect token from
+/// `SessionCreated` if the connection drops, so the session survives a
+/// network hiccup without a new proof of work (and without the receivers
+/// losing their sender).
 async fn create(server: &Server, share_key: &ShareKey, options: Options) -> Result<Created> {
     let our_id = ReceiverId::random();
     let identity = IdentityKeypair::generate();
@@ -207,23 +218,23 @@ async fn create(server: &Server, share_key: &ShareKey, options: Options) -> Resu
 
     let challenge: PowChallenge = bitmule_client_native::nic::http_client().get(server.http("/pow")).send().await?.json().await?;
     let nonce = pow::solve_c(&session_id.0, challenge.magic, challenge.difficulty);
-    let url = server.ws(&format!("/ws/create?sid={}&magic={}&pow={nonce}", session_id.as_hex(), challenge.magic));
-    let (to_server, mut from_server, _ws_worker) = connect_ws(&url).await?;
+    // `enablePing`: the server pings a quiet connection, so a proxy is less
+    // likely to drop it in the first place.
+    let base = server.ws(&format!("/ws/create?sid={}&enablePing", session_id.as_hex()));
+    let first = format!("{base}&magic={}&pow={nonce}", challenge.magic);
+    let pub_key = identity.public_key();
+    let mac = share_key.mac_identity(IdentityRole::Owner, &session_id.0, &our_id.0, &pub_key);
+    let join_check = share_key.join_check();
+    let caps = options.caps();
+    let hello = move || ClientToServer::CreateSession { id: our_id, capabilities: caps, pub_key, mac, join_check };
+    let (to_server, mut from_server, _ws_worker) = connect_ws_owner(&first, Owner { url: base, hello: Box::new(hello) }).await?;
 
-    to_server.send(ClientToServer::CreateSession {
-        id: our_id,
-        capabilities: options.caps(),
-        pub_key: identity.public_key(),
-        mac: share_key.mac_identity(IdentityRole::Owner, &session_id.0, &our_id.0, &identity.public_key()),
-        join_check: share_key.join_check(),
-    }).await?;
-
-    let (reconnect_token, relay_token) = match from_server.recv().await {
-        Some(ServerToClient::SessionCreated { reconnect_token, relay_token }) => (reconnect_token, relay_token),
+    let relay_token = match from_server.recv().await {
+        Some(ServerToClient::SessionCreated { relay_token, .. }) => relay_token,
         Some(ServerToClient::Text(reason)) => bail!("server refused session: {reason}"),
         _ => bail!("expected SessionCreated"),
     };
-    Ok(Created { our_id, identity, session_id, to_server, from_server, reconnect_token, relay_token })
+    Ok(Created { our_id, identity, session_id, to_server, from_server, relay_token })
 }
 
 /// A session we joined, with its owner.
@@ -246,7 +257,7 @@ async fn join(server: &Server, share_key: &ShareKey, options: Options) -> Result
     let identity = IdentityKeypair::generate();
     let session_id = SessionId(share_key.session_id());
 
-    let (to_server, mut from_server, ws_worker) = connect_ws(&server.ws(&format!("/ws/join?sid={}", session_id.as_hex()))).await?;
+    let (to_server, mut from_server, ws_worker) = connect_ws(&server.ws(&format!("/ws/join?sid={}&enablePing", session_id.as_hex()))).await?;
     to_server.send(ClientToServer::JoinSession {
         id: our_id,
         capabilities: options.caps(),
@@ -288,6 +299,10 @@ pub async fn request(server: &Server, options: Options, on_request: impl FnOnce(
                 let Some(message) = message else { bail!("connection to the server closed") };
                 match message {
                     ServerToClient::PeerJoined { id, pub_key, mac, .. } => {
+                        // replayed after our own reconnect: already here
+                        if peers.contains_key(&id) {
+                            continue;
+                        }
                         if !peer_checks_out(&share_key, IdentityRole::Joiner, &session_id, &id, &pub_key, &mac, &wire.identity.public_key()) {
                             warn!("Bad MAC from {id:?}");
                             continue;
