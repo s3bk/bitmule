@@ -199,44 +199,105 @@ impl Drop for ShareKey {
     fn drop(&mut self) { self.0.zeroize(); }
 }
 
-/// URL-fragment payload: 32-byte `share_key` (URL secret, drives session_id
-/// + KEX MAC) followed by 32-byte `signature` (data commitment = SHA256(data
-/// || bulk_key)). Encoded as base64url (no padding) in the URL fragment.
+/// URL-fragment payload of a transfer link.
 ///
-/// Layout is `share_key || signature`, decoded by taking the first 32 bytes
-/// as share_key and the remainder as signature — share_key size is fixed so
-/// no length prefix is needed.
+/// Current layout: 32-byte `share_key` (URL secret, drives session_id and KEX
+/// MAC), 32-byte `signature` (data commitment = SHA256(data || bulk_key)), and
+/// a 3-byte checksum over those 64 bytes. Base64url without padding: 67 bytes
+/// become 90 characters.
+///
+/// Legacy layout, still accepted so old links keep working: `share_key ||
+/// signature` with no checksum, 64 bytes, 86 characters.
+///
+/// The length alone tells the two apart, so no version byte is needed and all
+/// three spare bytes go to the checksum: a link that was cut short in a chat,
+/// wrapped badly, or has one character changed is now diagnosed at parse time
+/// ("truncated", "checksum mismatch") instead of surfacing later as an opaque
+/// KEX or commitment failure. 24 bits catch a random corruption with
+/// probability 1 - 2^-24.
 #[derive(Clone)]
 pub struct ShareLink {
     pub share_key: ShareKey,
     pub signature: [u8; 32],
 }
 
+/// Encoded length (chars) of the current link format.
+pub const SHARE_LINK_CHARS: usize = 90;
+/// Encoded length (chars) of the pre-checksum link format.
+pub const SHARE_LINK_CHARS_LEGACY: usize = 86;
+
 impl ShareLink {
     pub fn new(share_key: ShareKey, signature: [u8; 32]) -> Self {
         Self { share_key, signature }
     }
 
-    /// Base64url-no-pad encoding of `share_key || signature` (64 bytes → 86 chars).
-    pub fn to_b64_url(&self) -> String {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    fn raw(&self) -> [u8; 64] {
         let mut buf = [0u8; 64];
         buf[..32].copy_from_slice(&self.share_key.0);
         buf[32..].copy_from_slice(&self.signature);
+        buf
+    }
+
+    /// Base64url-no-pad `share_key || signature || checksum` (67 bytes → 90 chars).
+    pub fn to_b64_url(&self) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let raw = self.raw();
+        let mut buf = [0u8; 67];
+        buf[..64].copy_from_slice(&raw);
+        buf[64..].copy_from_slice(&checksum_of(&raw));
         URL_SAFE_NO_PAD.encode(buf)
     }
 
+    /// The pre-checksum 86-char form, for talking to builds that predate it.
+    /// The current decoder accepts it; nothing in this tree emits it.
+    pub fn to_b64_url_legacy(&self) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        URL_SAFE_NO_PAD.encode(self.raw())
+    }
+
+    /// Parse either link format. Whitespace and zero-width characters (what
+    /// chat clients, terminal wrapping and copy buttons add) are ignored, so a
+    /// link that was broken across lines still parses.
     pub fn from_b64_url(s: &str) -> Result<Self> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        let raw = URL_SAFE_NO_PAD.decode(s.as_bytes())
-            .context("share link is not valid base64url")?;
-        if raw.len() != 64 {
-            bail!("share link must decode to 64 bytes, got {}", raw.len());
-        }
+        let cleaned: String = s.chars().filter(|c| !is_link_noise(*c)).collect();
+        let n = cleaned.chars().count();
+        let raw = if n == SHARE_LINK_CHARS || n == SHARE_LINK_CHARS_LEGACY {
+            URL_SAFE_NO_PAD.decode(cleaned.as_bytes())
+                .context("share link is not valid base64url")?
+        } else {
+            // A wrong char count is the most common real failure (a chat cut,
+            // a partial selection), so name it instead of "not base64url".
+            bail!(
+                "share link is {n} characters, expected {SHARE_LINK_CHARS} \
+                 (or {SHARE_LINK_CHARS_LEGACY} for the pre-checksum format) — \
+                 it was probably cut short or has stray characters; copy the whole link"
+            )
+        };
+        let body: [u8; 64] = match (n, raw.len()) {
+            (SHARE_LINK_CHARS, 67) => {
+                let mut body = [0u8; 64];
+                body.copy_from_slice(&raw[..64]);
+                if !checksum_eq(&checksum_of(&body), &raw[64..]) {
+                    bail!("share link checksum mismatch — a character was changed, \
+                           or the link was cut and glued back together; ask for it again");
+                }
+                body
+            }
+            (SHARE_LINK_CHARS_LEGACY, 64) => {
+                let mut body = [0u8; 64];
+                body.copy_from_slice(&raw);
+                body
+            }
+            _ => bail!(
+                "share link decodes to {} bytes, expected 67 ({SHARE_LINK_CHARS} chars) \
+                 or 64 ({SHARE_LINK_CHARS_LEGACY} chars)", raw.len()
+            ),
+        };
         let mut sk = [0u8; 32];
         let mut sig = [0u8; 32];
-        sk.copy_from_slice(&raw[..32]);
-        sig.copy_from_slice(&raw[32..]);
+        sk.copy_from_slice(&body[..32]);
+        sig.copy_from_slice(&body[32..]);
         Ok(Self { share_key: ShareKey(sk), signature: sig })
     }
 
@@ -249,6 +310,31 @@ impl ShareLink {
         let computed: [u8; 32] = hasher.finalize().into();
         constant_time_eq(&self.signature, &computed)
     }
+}
+
+/// The 3-byte checksum embedded in a share link: the 3 spare bytes of the
+/// 67-byte payload. Domain-tagged so it can never be mistaken for any other
+/// hash in this module.
+fn checksum_of(body: &[u8; 64]) -> [u8; 3] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bitmule v2 share link checksum");
+    hasher.update(body);
+    let digest: [u8; 32] = hasher.finalize().into();
+    [digest[0], digest[1], digest[2]]
+}
+
+fn checksum_eq(want: &[u8; 3], got: &[u8]) -> bool {
+    if got.len() != want.len() { return false; }
+    let mut diff = 0u8;
+    for (a, b) in want.iter().zip(got) { diff |= a ^ b; }
+    diff == 0
+}
+
+/// Characters that carry no information in a base64url link but that a chat
+/// client, terminal wrap or copy button adds: whitespace and zero-width marks.
+fn is_link_noise(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}')
 }
 
 /// Streaming SHA256(data || bulk_key.0) — for sender-side commitment
@@ -745,25 +831,82 @@ mod tests {
         assert_ne!(w.0, m.0);
     }
 
-    #[test]
-    fn share_link_b64_roundtrip() {
-        let sk = ShareKey::random();
+    fn some_link() -> ShareLink {
         let sig = { let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b };
-        let link = ShareLink::new(sk.clone(), sig);
-        let s = link.to_b64_url();
-        assert_eq!(s.len(), 86); // base64url-no-pad of 64 bytes
-        let link2 = ShareLink::from_b64_url(&s).unwrap();
-        assert_eq!(link2.share_key.0, sk.0);
-        assert_eq!(link2.signature, sig);
+        ShareLink::new(ShareKey::random(), sig)
     }
 
     #[test]
-    fn share_link_bad_length_rejects() {
-        // 63 raw bytes → decodes but wrong length
-        let short = "A".repeat(84);
-        assert!(ShareLink::from_b64_url(&short).is_err());
-        // garbage
+    fn share_link_b64_roundtrip() {
+        let link = some_link();
+        let s = link.to_b64_url();
+        assert_eq!(s.len(), SHARE_LINK_CHARS); // base64url-no-pad of 67 bytes
+        assert_eq!(s.len(), 90);
+        let link2 = ShareLink::from_b64_url(&s).unwrap();
+        assert_eq!(link2.share_key.0, link.share_key.0);
+        assert_eq!(link2.signature, link.signature);
+        // the checksum is deterministic for the same link
+        assert_eq!(s, link.to_b64_url());
+    }
+
+    #[test]
+    fn share_link_legacy_86_chars_still_parses() {
+        let link = some_link();
+        let legacy = link.to_b64_url_legacy();
+        assert_eq!(legacy.len(), SHARE_LINK_CHARS_LEGACY);
+        let parsed = ShareLink::from_b64_url(&legacy).unwrap();
+        assert_eq!(parsed.share_key.0, link.share_key.0);
+        assert_eq!(parsed.signature, link.signature);
+    }
+
+    #[test]
+    fn share_link_tolerates_wrapping_and_zero_width() {
+        let link = some_link();
+        let s = link.to_b64_url();
+        // what a chat bubble does: a line break in the middle, a zero-width
+        // space from a copy button, and padding around the whole thing
+        let messy = format!(" {}\n{}\u{200b}\u{feff} ", &s[..45], &s[45..]);
+        let parsed = ShareLink::from_b64_url(&messy).unwrap();
+        assert_eq!(parsed.share_key.0, link.share_key.0);
+        assert_eq!(parsed.signature, link.signature);
+    }
+
+    #[test]
+    fn share_link_truncation_is_named() {
+        let link = some_link();
+        let s = link.to_b64_url();
+        // 89 chars: the exact failure seen when a link gets cut in a chat
+        let err = ShareLink::from_b64_url(&s[..89]).err().expect("89 chars must fail").to_string();
+        assert!(err.contains("89 characters"), "unexpected error: {err}");
+        for cut in [1usize, 2, 3, 5, 10, 20] {
+            assert!(ShareLink::from_b64_url(&s[..s.len() - cut]).is_err());
+        }
+        // garbage / empty
         assert!(ShareLink::from_b64_url("!!!").is_err());
+        assert!(ShareLink::from_b64_url("").is_err());
+    }
+
+    #[test]
+    fn share_link_changed_character_is_caught() {
+        let link = some_link();
+        let s = link.to_b64_url();
+        for at in [0usize, 10, 40, 70] {
+            let mut chars: Vec<char> = s.chars().collect();
+            chars[at] = if chars[at] == 'A' { 'B' } else { 'A' };
+            let bad: String = chars.into_iter().collect();
+            let err = ShareLink::from_b64_url(&bad).err().expect("changed char must fail").to_string();
+            assert!(err.contains("checksum"), "at {at}, unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn share_link_legacy_link_has_no_checksum() {
+        // the legacy form of the same link must still yield the same session,
+        // i.e. the checksum is not part of the key material
+        let link = some_link();
+        let now = ShareLink::from_b64_url(&link.to_b64_url()).unwrap();
+        let old = ShareLink::from_b64_url(&link.to_b64_url_legacy()).unwrap();
+        assert_eq!(now.share_key.session_id_hex(), old.share_key.session_id_hex());
     }
 
     #[test]

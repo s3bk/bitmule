@@ -300,7 +300,8 @@ pub async fn read_stdout_for_hex(child: &mut Child, timeout: Duration) -> Result
     }
 }
 
-/// Read the CLI's stdout until a share link (`#` + 86 url-safe characters) appears; the
+/// Read the CLI's stdout until a share link (`#` + 90 url-safe characters, or 86
+/// from a pre-checksum build) appears; the
 /// rest of the output is drained in the background so the child never blocks on a full pipe.
 pub async fn read_stdout_for_link(child: &mut Child, timeout: Duration) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -313,7 +314,7 @@ pub async fn read_stdout_for_link(child: &mut Child, timeout: Duration) -> Resul
             Ok(Ok(Some(line))) => {
                 if let Some((_, frag)) = line.split_once('#') {
                     let key: String = frag.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
-                    if key.len() == 86 {
+                    if key.len() == 90 || key.len() == 86 {
                         tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
                         return Ok(key);
                     }
