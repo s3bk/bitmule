@@ -1,6 +1,12 @@
 //! Relay for the bulk data stream: one sender POSTs frames, any number of
 //! receivers GET them.
 //!
+//! Two lifecycle rules keep a broken transfer from looking like a slow one:
+//! a sender that stops delivering frames for `SENDER_IDLE_TIMEOUT` ends the
+//! session, and a sender that ends at all — cleanly, with an error, or by
+//! being replaced — ends the receivers' bodies, so their GET streams close and
+//! the client can report "interrupted" instead of waiting for ever.
+//!
 //! The data is fountain coded, so receivers are interchangeable. Every
 //! frame is offered to all connected receivers; a receiver whose queue is
 //! full misses that frame. The sender is only held back while *no* receiver
@@ -16,7 +22,7 @@
 //! Data (type 1) is the only frame type. Frames are relayed whole, header
 //! included, so a receiver can split the byte stream back into frames.
 
-use std::{borrow::Cow, collections::HashMap, convert::Infallible, io, pin::Pin, sync::{Arc, Mutex as StdMutex, atomic::{AtomicU64, Ordering}}, task::{Context, Poll}};
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, io, pin::Pin, sync::{Arc, Mutex as StdMutex, atomic::{AtomicU64, Ordering}}, task::{Context, Poll}, time::Duration};
 
 use axum::{body::{Body, BodyDataStream}, extract::{Path, Query, State}, response::IntoResponse};
 use bytes::{Buf, Bytes, BytesMut};
@@ -28,8 +34,23 @@ use bitmule_core::{ReceiverId, SessionId, Token, protocol::relay_frame::*};
 
 use crate::{AppState, state::SessionState};
 
-/// Frames queued per receiver before it starts missing frames.
-const RECEIVER_QUEUE_DEPTH: usize = 8;
+/// Frames queued per receiver before it starts missing frames. The sender is
+/// only held back while *no* receiver can take a frame, so a receiver that
+/// falls behind this far misses frames (the fountain code recovers them, at a
+/// cost in transfer time). 8 was too shallow: one scheduling hiccup on the
+/// receiver side dropped frames, which lengthened the transfer and looked like
+/// a stall. 64 frames ≈ 4 MiB of worst-case buffering per receiver.
+const RECEIVER_QUEUE_DEPTH: usize = 64;
+
+/// A sender that delivers no frame for this long is dead — crashed client, dead
+/// TCP, a proxy that swallowed the connection. End the session so the receivers
+/// get a closed body instead of waiting for frames that never come.
+const SENDER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the sender waits for *some* receiver to drain its full queue before
+/// concluding that receiver is stuck and dropping it. The transfer continues for
+/// the others; a dropped receiver reconnects with its own GET.
+const RECEIVER_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct FrameDecoder;
 
@@ -61,6 +82,7 @@ pub enum Error {
     Io(io::Error),
     InvalidFrameType(u8),
     Closed,
+    IdleTimeout,
 }
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
@@ -74,6 +96,7 @@ impl IntoResponse for Error {
             Error::Io(_e) => (StatusCode::BAD_REQUEST, "Io Error".into()),
             Error::InvalidFrameType(t) => (StatusCode::BAD_REQUEST, format!("invalid frame type: {t}").into()),
             Error::Closed => (StatusCode::SERVICE_UNAVAILABLE, "session closed".into()),
+            Error::IdleTimeout => (StatusCode::GATEWAY_TIMEOUT, "sender went idle".into()),
             Error::BadSessionId => (StatusCode::BAD_REQUEST, "Invalid Session ID".into()),
             Error::BadReceiverId => (StatusCode::BAD_REQUEST, "Invalid Receiver ID".into()),
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "Invalid relay token".into()),
@@ -137,13 +160,62 @@ impl MulticastSession {
                 select! {
                     _ = changed => {}
                     _ = room => {}
+                    _ = tokio::time::sleep(RECEIVER_STALL_TIMEOUT) => {
+                        // Every queue is full and none drained for a minute:
+                        // these receivers are gone or stuck. Dropping their
+                        // senders ends their streams so the sender is not held
+                        // hostage by them.
+                        self.drop_stalled();
+                    }
                 }
             }
         }
     }
+
+    /// Drop the receivers whose queue has not drained at all: a client that is
+    /// not reading its body, or one so far behind that it will never catch up.
+    fn drop_stalled(&self) {
+        let mut receivers = self.receivers.lock().unwrap();
+        let before = receivers.len();
+        receivers.retain(|_, (_, tx)| tx.capacity() > 0);
+        let dropped = before - receivers.len();
+        drop(receivers);
+        if dropped > 0 {
+            tracing::warn!(dropped, "relay2: dropped stalled receivers");
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// The sender for `generation` produced its last frame: finished, failed, or
+    /// was replaced. Close the receivers' bodies by dropping the sender half of
+    /// their queues — after the frames already queued drain, their stream ends.
+    ///
+    /// This is the only "end of transfer" signal a receiver has. Without it the
+    /// bodies stay open for ever when the sender dies mid-upload, which is what
+    /// a receiver experiences as a hang with no error text.
+    ///
+    /// A receiver that wants to resume in the same session opens a new GET; a
+    /// *resumed* upload is also a new GET, so nothing is lost by clearing here.
+    fn end_sender(&self, generation: u64) {
+        if self.sender_generation.load(Ordering::Acquire) != generation {
+            return; // a newer upload already took over; its receivers are not ours
+        }
+        let mut receivers = self.receivers.lock().unwrap();
+        let n = receivers.len();
+        receivers.clear();
+        drop(receivers);
+        if n > 0 {
+            tracing::info!(receivers = n, "relay2: sender stream ended, closing receivers");
+        }
+        self.changed.notify_waiters();
+    }
 }
 
 pub async fn run_session(state: Arc<SessionState>, stream: BodyDataStream) -> Result<(), Error> {
+    run_session_with_idle_timeout(state, stream, SENDER_IDLE_TIMEOUT).await
+}
+
+async fn run_session_with_idle_timeout(state: Arc<SessionState>, stream: BodyDataStream, idle: Duration) -> Result<(), Error> {
     let session = state.multicast();
     let generation = session.sender_generation.fetch_add(1, Ordering::AcqRel) + 1;
     // kick the previous sender out of its wait
@@ -153,20 +225,30 @@ pub async fn run_session(state: Arc<SessionState>, stream: BodyDataStream) -> Re
     let stream = FramedRead::new(reader, FrameDecoder);
     pin!(stream);
 
-    while let Some(next) = stream.next().await {
+    let result = loop {
+        // A dead sender stops sending frames but rarely closes the TCP stream
+        // promptly (NAT, mobile networks, a killed client behind a proxy), so
+        // silence — not EOF — has to be what ends the session.
+        let next = match tokio::time::timeout(idle, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => break Err(Error::IdleTimeout),
+        };
+        let Some(next) = next else { break Ok(()) };
         let (frame_type, data) = next?;
 
         match frame_type {
             F_DATA => {
                 if !session.broadcast(&data, generation).await {
-                    return Err(Error::Closed);
+                    break Err(Error::Closed);
                 }
             }
-            _ => return Err(Error::InvalidFrameType(frame_type)),
+            _ => break Err(Error::InvalidFrameType(frame_type)),
         }
-    }
+    };
 
-    Ok(())
+    // Whatever ended the upload, the receivers must learn about it.
+    session.end_sender(generation);
+    result
 }
 
 pub async fn add_receiver(state: Arc<SessionState>, reciever_id: ReceiverId) -> Body {
@@ -367,5 +449,54 @@ mod tests {
         let new = tokio::spawn(run_session(s.clone(), stream(vec![])));
         assert!(matches!(old.await.unwrap(), Err(Error::Closed)));
         new.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sender_finishing_ends_the_receiver_body() {
+        // The regression that hid every failed transfer: a receiver whose GET
+        // stream never ends waits for ever, so the client shows neither error
+        // nor completion. The sender's stream ending must close it.
+        let s = session(ReceiverId::random());
+        let mut body = add_receiver(s.clone(), ReceiverId::random()).await;
+
+        run_session(s.clone(), stream(vec![data_frame(b"one"), data_frame(b"two")]))
+            .await
+            .unwrap();
+
+        assert_eq!(&next(&mut body).await.unwrap()[3..], b"one");
+        // queued frames are still delivered ...
+        let second = next(&mut body).await;
+        assert_eq!(second.as_ref().map(|f| &f[3..]), Some(&b"two"[..]));
+        // ... and then the stream ends instead of hanging
+        assert!(next(&mut body).await.is_none());
+        assert!(s.multicast().receivers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sender_erroring_ends_the_receiver_body() {
+        let s = session(ReceiverId::random());
+        let mut body = add_receiver(s.clone(), ReceiverId::random()).await;
+
+        // a frame header that claims a length the stream never delivers is not
+        // invalid at the framed level; an unknown frame type is
+        let mut f = (3u16).to_le_bytes().to_vec();
+        f.push(0x7f);
+        f.extend_from_slice(b"bad");
+        let result = run_session(s.clone(), stream(vec![Bytes::from(f)])).await;
+        assert!(matches!(result, Err(Error::InvalidFrameType(0x7f))));
+        assert!(next(&mut body).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_sender_times_out_and_closes_receivers() {
+        let s = session(ReceiverId::random());
+        let mut body = add_receiver(s.clone(), ReceiverId::random()).await;
+
+        // a stream that never yields a frame: a dead sender behind a NAT
+        let silent = Body::from_stream(futures::stream::pending::<Result<Bytes, Infallible>>())
+            .into_data_stream();
+        let result = run_session_with_idle_timeout(s.clone(), silent, Duration::from_millis(50)).await;
+        assert!(matches!(result, Err(Error::IdleTimeout)));
+        assert!(next(&mut body).await.is_none());
     }
 }
