@@ -1,0 +1,45 @@
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' dimpl-0.7.6/Cargo.toml dimpl-bitmule/Cargo.toml
+--- dimpl-0.7.6/Cargo.toml	2006-07-24 01:21:28.000000000 +0000
++++ dimpl-bitmule/Cargo.toml	2026-10-21 18:53:03.197125583 +0000
+@@ -56,10 +56,7 @@
+     "aws-lc-rs",
+     "rcgen",
+ ]
+-rcgen = [
+-    "dep:rcgen",
+-    "aws-lc-rs",
+-]
++rcgen = ["dep:rcgen", "dep:sha2"]
+ rust-crypto = [
+     "dep:aes-gcm",
+     "dep:chacha20poly1305",
+@@ -190,7 +187,7 @@
+ 
+ [dependencies.rcgen]
+ version = "0.14.7"
+-features = ["aws_lc_rs"]
++features = ["ring"]
+ optional = true
+ default-features = false
+ 
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' dimpl-0.7.6/src/certificate.rs dimpl-bitmule/src/certificate.rs
+--- dimpl-0.7.6/src/certificate.rs	2006-07-24 01:21:28.000000000 +0000
++++ dimpl-bitmule/src/certificate.rs	2026-10-21 18:53:03.202781273 +0000
+@@ -3,7 +3,7 @@
+ //! This module provides helpers to generate self-signed certificates suitable for DTLS,
+ //! compute fingerprints, and format them for display.
+ 
+-use aws_lc_rs::digest;
++use sha2::{Digest, Sha256};
+ use rand::random;
+ use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+ use std::fmt;
+@@ -89,7 +89,7 @@
+ /// This function requires the `rcgen` feature to be enabled.
+ pub fn calculate_fingerprint(cert_der: &[u8]) -> Vec<u8> {
+     // Use SHA-256 to calculate the fingerprint
+-    digest::digest(&digest::SHA256, cert_der).as_ref().to_vec()
++    Sha256::digest(cert_der).to_vec()
+ }
+ 
+ /// Format a fingerprint as a colon-separated hex string

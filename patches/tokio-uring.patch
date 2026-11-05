@@ -1,0 +1,17 @@
+diff -ruN '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=Cargo.toml.orig' '--exclude=Cargo.lock' tokio-uring-0.5.0/src/runtime/driver/mod.rs tokio-uring-bitmule/src/runtime/driver/mod.rs
+--- tokio-uring-0.5.0/src/runtime/driver/mod.rs	2006-07-24 01:21:28.000000000 +0000
++++ tokio-uring-bitmule/src/runtime/driver/mod.rs	2026-10-18 13:22:12.137407361 +0000
+@@ -391,6 +391,13 @@
+                     *cycle = lc;
+                 }
+ 
++                // bitmule: the dropped op's data (buffer, msghdr, address) is still
++                // owned by the kernel until the cancel completes. Replacing it
++                // freed it too early (a use-after-free the kernel wrote into).
++                lc @ Lifecycle::Ignored(_) => {
++                    *cycle = lc;
++                }
++
+                 Lifecycle::CompletionList(indices) => {
+                     let mut list = indices.clone().into_list(&mut self.ops.completions);
+                     if !io_uring::cqueue::more(list.peek_end().unwrap().flags) {

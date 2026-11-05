@@ -85,12 +85,21 @@ postcard = "1.1.3"
 debug = 1
 lto = "thin"
 
-# patch.crates-io
-# The git branches are not usable: s3bk/str0m@bitmule-vendored (commit 1716db11)
-# depends on `bitmule-buf`, which is not published, so cargo fails with
-# "no matching package named `bitmule-buf` found". Patch to vendor/ instead —
-# the same code, tracked in this repo, and it needs no network.
+# Android .so files: `cargo ndk -t aarch64-linux-android ... build --profile android`.
+# Fat LTO, one codegen unit and opt-level "s" make the stripped arm64 library
+# 8.9 MB instead of 12.9 MB. Unwinding stays on (the FFI catches panics).
+[profile.android]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+strip = "symbols"
+debug = 0
+
+# The four forks (what they change and why: FORKS.md). The crates depend on the
+# crates.io versions; this swaps in the fork tags, transitive uses included.
 [patch.crates-io]
-str0m = { path = "vendor/str0m" }
-sctp-proto = { path = "vendor/sctp-proto" }
-tokio-uring = { path = "vendor/tokio-uring" }
+str0m = { git = "https://github.com/s3bk/str0m", tag = "bitmule-v0.23.1" }
+sctp-proto = { git = "https://github.com/s3bk/sctp-proto", tag = "bitmule-v0.10.4" }
+tokio-uring = { git = "https://github.com/s3bk/tokio-uring", tag = "bitmule-v0.5.0" }
+dimpl = { git = "https://github.com/s3bk/dimpl", tag = "bitmule-v0.7.6" }
