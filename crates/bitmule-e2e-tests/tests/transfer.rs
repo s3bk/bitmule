@@ -2,10 +2,15 @@
 //!
 //! The browser is driven with thirtyfour against `web/test/page.html`, which loads the same
 //! `v2.js` the real pages use; the CLI is the built `bitmule` binary. The server is started by
-//! the test (on a free port) unless BITMULE_SERVER is set.
+//! the test (on a free port) unless BITMULE_SERVER is set, and chromedriver unless
+//! BITMULE_WEBDRIVER is set. Every temp dir (source, destination, server data) is removed on
+//! success, on an early `Err` and on panic; every child process is killed by process group.
 //!
 //!     cargo build -p bitmule -p bitmule-server
-//!     cargo test -p bitmule-e2e-tests --test transfer -- --ignored --test-threads=1
+//!     cargo test -p bitmule-e2e-tests --test transfer
+//!
+//! The browser cases need chromedriver on PATH (or BITMULE_CHROMEDRIVER); without it they fail
+//! in `spawn_chromedriver` and the CLI-only cases still run.
 
 mod common;
 
@@ -14,7 +19,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use common::*;
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use thirtyfour::prelude::*;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -148,11 +152,17 @@ fn only_file(dir: &std::path::Path) -> Result<std::path::PathBuf> {
 
 async fn cli_to_cli(transport: &str) -> Result<()> {
     let env = Env::bring_up_server_only().await?;
-    let (src, dst) = (TempDir::new()?, TempDir::new()?);
+    let (src, dst) = (Scratch::new("files")?, Scratch::new("files")?);
     let (file, want) = make_random_file(src.path(), random_size_bytes())?;
 
-    let mut sender = spawn_cli(&env.server_url, &["send", transport, file.to_str().unwrap()])?;
-    let key = read_stdout_for_link(&mut sender, TIMEOUT).await?;
+    let mut sender = spawn_cli_with_stderr(&env.server_url, &["send", transport, file.to_str().unwrap()], true)?;
+    let key = match read_stdout_for_link(&mut sender, TIMEOUT).await {
+        Ok(k) => k,
+        Err(e) => {
+            let se = drain_stderr(&mut sender).await;
+            bail!("no link from sender: {e:#}\n--- sender stderr ---\n{}", se.trim_end());
+        }
+    };
     let link = format!("{}/#{key}", env.server_url);
     let mut receiver = spawn_cli(&env.server_url, &["recv", transport, "--out", dst.path().to_str().unwrap(), &link])?;
 
@@ -164,8 +174,11 @@ async fn cli_to_cli(transport: &str) -> Result<()> {
 }
 
 async fn web_to_cli(transport: &str) -> Result<()> {
+    if !need_browser("web_to_cli")? {
+        return Ok(());
+    }
     let env = Env::bring_up().await?;
-    let (src, dst) = (TempDir::new()?, TempDir::new()?);
+    let (src, dst) = (Scratch::new("files")?, Scratch::new("files")?);
     let (file, want) = make_random_file(src.path(), random_size_bytes())?;
 
     let page = Page::open(&env).await?;
@@ -184,8 +197,11 @@ async fn web_to_cli(transport: &str) -> Result<()> {
 }
 
 async fn cli_to_web(transport: &str) -> Result<()> {
+    if !need_browser("cli_to_web")? {
+        return Ok(());
+    }
     let env = Env::bring_up().await?;
-    let src = TempDir::new()?;
+    let src = Scratch::new("files")?;
     let (file, want) = make_random_file(src.path(), random_size_bytes())?;
 
     let mut sender = spawn_cli(&env.server_url, &["send", transport, file.to_str().unwrap()])?;
@@ -201,8 +217,11 @@ async fn cli_to_web(transport: &str) -> Result<()> {
 
 /// Browsers cannot force a transport (auto mode: a small file may finish over the relay first).
 async fn web_pair(_: ()) -> Result<()> {
+    if !need_browser("web_to_web")? {
+        return Ok(());
+    }
     let env = Env::bring_up().await?;
-    let src = TempDir::new()?;
+    let src = Scratch::new("files")?;
     let (file, want) = make_random_file(src.path(), random_size_bytes())?;
 
     let (sender, receiver) = (Page::open(&env).await?, Page::open(&env).await?);
@@ -220,8 +239,11 @@ async fn web_pair(_: ()) -> Result<()> {
 
 /// The receiver asks first (the request key), the sender answers it.
 async fn web_to_web_request() -> Result<()> {
+    if !need_browser("web_to_web_requested")? {
+        return Ok(());
+    }
     let env = Env::bring_up().await?;
-    let src = TempDir::new()?;
+    let src = Scratch::new("files")?;
     let (file, want) = make_random_file(src.path(), random_size_bytes())?;
 
     let (receiver, sender) = (Page::open(&env).await?, Page::open(&env).await?);
@@ -241,7 +263,6 @@ async fn web_to_web_request() -> Result<()> {
 macro_rules! combos {
     ($($name:ident => $f:ident($t:expr);)*) => {$(
         #[tokio::test]
-        #[ignore = "needs chromedriver + built bitmule and bitmule-server"]
         async fn $name() -> Result<()> { $f($t).await }
     )*};
 }
@@ -257,5 +278,4 @@ combos! {
 }
 
 #[tokio::test]
-#[ignore = "needs chromedriver + built bitmule and bitmule-server"]
 async fn web_to_web_requested() -> Result<()> { web_to_web_request().await }

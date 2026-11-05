@@ -85,9 +85,12 @@ postcard = "1.1.3"
 debug = 1
 lto = "thin"
 
-# local forks: str0m (data channel send buffer 1 MiB, not 128 KiB: vendor/str0m/src/sctp/mod.rs) and
-# sctp-proto (Fx hashing in the payload queue, SACK delay settable: vendor/sctp-proto)
+# patch.crates-io
+# The git branches are not usable: s3bk/str0m@bitmule-vendored (commit 1716db11)
+# depends on `bitmule-buf`, which is not published, so cargo fails with
+# "no matching package named `bitmule-buf` found". Patch to vendor/ instead —
+# the same code, tracked in this repo, and it needs no network.
 [patch.crates-io]
-str0m = { git = "https://github.com/s3bk/str0m", branch = "bitmule-vendored" }
-sctp-proto = { git = "https://github.com/s3bk/sctp-proto", branch = "bitmule" }
-tokio-uring = { git = "https://github.com/s3bk/tokio-uring", branch = "bitmule" }
+str0m = { path = "vendor/str0m" }
+sctp-proto = { path = "vendor/sctp-proto" }
+tokio-uring = { path = "vendor/tokio-uring" }

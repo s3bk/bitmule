@@ -1,15 +1,25 @@
 # Forks
 
-`[patch.crates-io]` in `Cargo.toml` points at three forks. A `[patch]` section only applies in the workspace root, so a project that depends on bitmule must repeat these lines in its own `Cargo.toml`:
+`[patch.crates-io]` in `Cargo.toml` points at three forks, by path — the code is in `vendor/` in this repo:
 
 ```toml
 [patch.crates-io]
-str0m = { git = "https://github.com/s3bk/str0m", branch = "bitmule-vendored" }
-sctp-proto = { git = "https://github.com/s3bk/sctp-proto", branch = "bitmule" }
-tokio-uring = { git = "https://github.com/s3bk/tokio-uring", branch = "bitmule" }
+str0m = { path = "vendor/str0m" }
+sctp-proto = { path = "vendor/sctp-proto" }
+tokio-uring = { path = "vendor/tokio-uring" }
 ```
 
-The same code is also in `vendor/` in this repo.
+A `[patch]` section only applies in the workspace root, so a project that depends on bitmule must repeat these lines in its own `Cargo.toml`.
+
+The path form is not cosmetic. The git branches cannot be used: `s3bk/str0m@bitmule-vendored`
+(commit `1716db11`) depends on `bitmule-buf`, which is not published, so `cargo` fails with
+`no matching package named bitmule-buf found`. Patching to `vendor/` is the same code, tracked
+here, and needs no network.
+
+The patched version must match the requirement, or the patch is silently unused: `str0m = "0.23"`
+resolves to 0.23.0 on crates.io and does **not** match the 0.23.1 fork, so the build used upstream
+str0m and lost `Delivery`, `write_bytes` and `set_channel_delivery` (fixed 2026-11-05:
+`bitmule-client-native` requires `0.23.1`).
 
 | Crate | Fork | Branch | Upstream | Vendored version |
 |---|---|---|---|---|

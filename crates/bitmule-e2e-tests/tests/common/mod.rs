@@ -4,11 +4,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
-use tempfile::TempDir;
 use std::{
     net::TcpStream,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tokio::process::{Child, Command};
@@ -25,11 +26,14 @@ pub const DEFAULT_WEBDRIVER_URL: &str = "http://127.0.0.1:9515";
 pub struct Env {
     pub server_url: String,
     pub webdriver_url: String,
-    // Child processes we spawned — dropped => killed on test end. Order
-    // matters for graceful shutdown: webdriver first, then the server.
-    pub _webdriver: Option<Child>,
-    pub _server: Option<Child>,
-    pub _data_dir: TempDir,
+    // Child processes we spawned, each in its own process group. Fields drop
+    // in declaration order, so the webdriver goes first, then the server, then
+    // the data dir — and each [`GroupChild`] kill takes the whole tree, which
+    // matters because a `cargo run` fallback puts the real binary one level
+    // down. No orphan survives a test that passes, fails or panics.
+    pub _webdriver: Option<GroupChild>,
+    pub _server: Option<GroupChild>,
+    pub _data_dir: Scratch,
 }
 
 impl Env {
@@ -40,7 +44,7 @@ impl Env {
     ///   of chromedriver.
     pub async fn bring_up() -> Result<Self> {
         let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
-        let data_dir = TempDir::new()?;
+        let data_dir = Scratch::new("server")?;
         let (server_url, server_child) = match std::env::var("BITMULE_SERVER").ok() {
             Some(url) => (url, None),
             None => {
@@ -75,7 +79,7 @@ impl Env {
     /// Kenna 2026-09-13.
     pub async fn bring_up_server_only() -> Result<Self> {
         let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
-        let data_dir = TempDir::new()?;
+        let data_dir = Scratch::new("server")?;
         let (server_url, server_child) = match std::env::var("BITMULE_SERVER").ok() {
             Some(url) => (url, None),
             None => {
@@ -94,44 +98,213 @@ impl Env {
     }
 }
 
+/// A temp directory that is removed on every exit path: success, an early
+/// `?`, and unwinding from a failed assertion. Removal is retried, because a
+/// child that was just killed may still be closing files written into it, and
+/// a failure is reported instead of silently leaving the tree behind (which is
+/// what `TempDir` does when `remove_dir_all` fails).
+pub struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    pub fn new(tag: &str) -> Result<Self> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("bitmule-e2e-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
+        Ok(Scratch { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Err(e) = remove_tree(&self.path) {
+            eprintln!("[e2e] left behind {}: {e:#}", self.path.display());
+        }
+    }
+}
+
+/// `remove_dir_all` with a few retries; `Ok(())` once the tree is gone.
+/// `NotFound` counts as gone, so Drop is safe to run twice.
+pub fn remove_tree(path: &Path) -> Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..5u64 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+            }
+        }
+    }
+    match last {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
+/// SIGKILL a child's whole process group. Children are spawned with
+/// `process_group(0)`, i.e. as their own group leader, so `-pid` also reaches
+/// the binary that `cargo run` started as its child.
+fn kill_group(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        // Safety: `kill` is async-signal-safe and the pid is our own child.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL)
+        };
+    }
+    let _ = child.start_kill();
+}
+
+/// A built workspace binary, so the test kills exactly the process it started.
+/// `override_var` (e.g. BITMULE_CLI) wins; then target/debug, target/release.
+pub fn bin_path(name: &str, override_var: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(override_var) {
+        return Some(PathBuf::from(p));
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Honour CARGO_TARGET_DIR: with a shared target dir the binaries are not
+    // under <workspace>/target, and falling back to `cargo run` there would
+    // rebuild (slow) and hand the test a process it cannot kill cleanly.
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => root.join("target"),
+    };
+    ["debug", "release"]
+        .iter()
+        .map(|profile| target.join(profile).join(name))
+        .find(|p| p.is_file())
+}
+
+/// A child process in its own process group. Derefs to [`Child`], so callers
+/// use it like one. Drop kills the group and reaps it: a test that ends early
+/// (an `Err`, a failed assertion, a panic) must not leave a `bitmule send`
+/// holding a share open, or a `bitmule-server` writing into a data dir that is
+/// about to be removed.
+pub struct GroupChild(Child);
+
+/// The CLI child — same guard, named for what it is at the call site.
+pub type Cli = GroupChild;
+
+impl Deref for GroupChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for GroupChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        kill_group(&mut self.0);
+        // Reap: no zombie, and the child is really gone before the temp dir
+        // that it may have been writing into is removed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match self.0.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
+/// Whether a browser can be driven: an explicit webdriver URL, an explicit
+/// `chromedriver` path, or `chromedriver` on `PATH`.
+pub fn browser_available() -> bool {
+    if std::env::var_os("BITMULE_WEBDRIVER").is_some()
+        || std::env::var_os("BITMULE_CHROMEDRIVER").is_some()
+    {
+        return true;
+    }
+    std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("chromedriver"))
+                .any(|p| p.is_file())
+        })
+        .unwrap_or(false)
+}
+
+/// Guard for the browser-driven cases: `Ok(false)` means "skip, no browser on
+/// this box", so a CLI-only machine can still run the suite. Set
+/// BITMULE_REQUIRE_BROWSER=1 to turn a missing browser into a failure.
+pub fn need_browser(case: &str) -> Result<bool> {
+    if browser_available() {
+        return Ok(true);
+    }
+    if std::env::var_os("BITMULE_REQUIRE_BROWSER").is_some() {
+        bail!("{case} needs a browser: install chromedriver, or set BITMULE_CHROMEDRIVER / \
+               BITMULE_WEBDRIVER (BITMULE_REQUIRE_BROWSER is set, so this is not skipped)");
+    }
+    eprintln!(
+        "[e2e] skipping {case}: no chromedriver on PATH \
+         (set BITMULE_CHROMEDRIVER or BITMULE_WEBDRIVER to run it)"
+    );
+    Ok(false)
+}
+
 /// A loopback address nothing listens on right now, so tests don't collide on a fixed port.
 fn free_addr() -> Result<String> {
     let l = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.to_string())
 }
 
-async fn spawn_server(bind: &str, _data_dir: &Path, web_dir: &Path) -> Result<Child> {
-    // Build+run against the workspace binary. `cargo run -p bitmule-server`
-    // is the portable form that works from any CWD when this test is run
-    // via `cargo test -p bitmule-e2e-tests`.
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.args([
-        "run", "--quiet", "-p", "bitmule-server", "--",
-        "--bind", bind,
-        "--no-stun",
-        "--web-dir"
-    ])
-    .arg(web_dir)
-    .stdout(Stdio::null())
-    .stderr(Stdio::inherit())
-    .kill_on_drop(true);
+async fn spawn_server(bind: &str, _data_dir: &Path, web_dir: &Path) -> Result<GroupChild> {
+    // Prefer the built binary: the test then owns the server process itself,
+    // instead of a `cargo run` that would leave the real server orphaned when
+    // the test's child is killed. Falls back to `cargo run`, which is the
+    // portable form that works from any CWD.
+    let mut cmd = match bin_path("bitmule-server", "BITMULE_SERVER_BIN") {
+        Some(bin) => {
+            let mut c = Command::new(bin);
+            c.arg("--bind").arg(bind).arg("--no-stun").arg("--web-dir").arg(web_dir);
+            c
+        }
+        None => {
+            let mut c = Command::new(env!("CARGO"));
+            c.args(["run", "--quiet", "-p", "bitmule-server", "--"])
+                .arg("--bind").arg(bind).arg("--no-stun").arg("--web-dir").arg(web_dir);
+            c
+        }
+    };
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        // Own process group, so Env::drop can take the whole tree down.
+        .process_group(0);
     let child = cmd.spawn().context("spawn bitmule-server")?;
     wait_for_tcp(bind, Duration::from_secs(30)).await?;
-    Ok(child)
+    Ok(GroupChild(child))
 }
 
-async fn spawn_chromedriver(port: u16) -> Result<Child> {
+async fn spawn_chromedriver(port: u16) -> Result<GroupChild> {
     let bin = std::env::var("BITMULE_CHROMEDRIVER").unwrap_or_else(|_| "chromedriver".into());
     let mut cmd = Command::new(&bin);
     cmd.arg(format!("--port={port}"))
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        // chromedriver forks Chrome; a group kill takes both.
+        .process_group(0);
     let child = cmd.spawn()
         .with_context(|| format!("spawn {bin} — install chromedriver or set BITMULE_CHROMEDRIVER"))?;
     let addr = format!("127.0.0.1:{port}");
     wait_for_tcp(&addr, Duration::from_secs(10)).await?;
-    Ok(child)
+    Ok(GroupChild(child))
 }
 
 async fn wait_for_tcp(addr: &str, timeout: Duration) -> Result<()> {
@@ -178,18 +351,17 @@ fn hex_short(hash: &[u8; 32]) -> String {
 /// Locate the cargo-built bitmule CLI binary. Prefers a debug build; falls
 /// back to `cargo run`. Set BITMULE_CLI to override.
 pub fn cli_bin() -> String {
-    if let Ok(p) = std::env::var("BITMULE_CLI") { return p; }
-    // Assume `cargo test -p bitmule-e2e-tests` has already built the workspace.
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let candidate = PathBuf::from(manifest).join("../../target/debug/bitmule");
-    if candidate.exists() { return candidate.to_string_lossy().into_owned(); }
-    "cargo".into() // caller handles the `run -p bitmule --` prefix
+    match bin_path("bitmule", "BITMULE_CLI") {
+        Some(p) => p.to_string_lossy().into_owned(),
+        // caller handles the `run -p bitmule --` prefix
+        None => "cargo".into(),
+    }
 }
 
 /// Spawn the CLI as a subprocess with piped stdout. Caller reads stdout
 /// (typically to capture the share URL that send/recv print on start-up
 /// before blocking on the transfer) and then awaits the child.
-pub fn spawn_cli(server_url: &str, args: &[&str]) -> Result<Child> {
+pub fn spawn_cli(server_url: &str, args: &[&str]) -> Result<Cli> {
     spawn_cli_with_stderr(server_url, args, /*capture_stderr=*/false)
 }
 
@@ -197,7 +369,7 @@ pub fn spawn_cli(server_url: &str, args: &[&str]) -> Result<Child> {
 /// so a failing test can display the child's error output. When
 /// `false`, stderr inherits into the test harness so cargo test's
 /// `--nocapture` can show it live.
-pub fn spawn_cli_with_stderr(server_url: &str, args: &[&str], capture_stderr: bool) -> Result<Child> {
+pub fn spawn_cli_with_stderr(server_url: &str, args: &[&str], capture_stderr: bool) -> Result<Cli> {
     let bin = cli_bin();
     let (program, prefix): (&str, Vec<&str>) = if bin.ends_with("cargo") || bin == "cargo" {
         ("cargo", vec!["run", "--quiet", "-p", "bitmule", "--"])
@@ -215,8 +387,9 @@ pub fn spawn_cli_with_stderr(server_url: &str, args: &[&str], capture_stderr: bo
     } else {
         cmd.stderr(Stdio::inherit());
     }
-    cmd.kill_on_drop(true);
-    cmd.spawn().context("spawn bitmule cli")
+    cmd.kill_on_drop(true).process_group(0);
+    let child = cmd.spawn().context("spawn bitmule cli")?;
+    Ok(GroupChild(child))
 }
 
 /// Drain a child's already-piped stderr into a String. Caller must

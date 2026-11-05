@@ -1,4 +1,37 @@
-# v2 status (updated 2026-10-18, security audit fixes)
+# v2 status (updated 2026-11-05, end-to-end run)
+
+## End-to-end run (2026-11-05)
+
+Ran both suites in `crates/bitmule-e2e-tests` against the release binaries on the build box
+(loopback, server auto-started per test with `--no-stun` on a free port).
+
+- `transport_matrix` (9 CLI sender-mode × receiver-mode pairs): **7 pass, 2 time out.** auto, relay
+  and webrtc as sender all reach an auto or relay receiver; webrtc→webrtc passes. The failures are
+  `relay_send → webrtc_recv` and `webrtc_send → relay_recv`, both hanging until the 45 s per-case
+  deadline. A sender pinned to the data channel waits for a channel the relay-pinned receiver never
+  opens, and neither side gives up or falls back — this is a product bug, not a test problem: a
+  combination with no common transport should fail fast ("no common transport") instead of hanging.
+- `transfer.rs`: `cli_to_cli_relay` passes (~7 s) and `cli_to_cli_webrtc` passes. The CLI↔browser and
+  browser↔browser cases cannot run on this host — no `chromedriver`, and no way to install one.
+  `web/test/browser_test.py` is still not run (open since 2026-10-18).
+- The tree did not build at `f2fc0bb`: `bitmule-client-native` required `str0m = "0.23"`, which
+  resolves to 0.23.0 on crates.io, while `[patch.crates-io]` carried the 0.23.1 fork — so the patch
+  was `[[patch.unused]]` and the build silently used upstream str0m and lost `Delivery`,
+  `write_bytes` and `set_channel_delivery`. client-native now requires `0.23.1`. The git patch is
+  unusable as well (`s3bk/str0m@bitmule-vendored` depends on the unpublished `bitmule-buf`), so
+  `[patch.crates-io]` points at `vendor/`: same code, tracked in this repo, no network needed.
+- Test hygiene: temp dirs are a `Scratch` guard, removed on success, on an early `Err` and while
+  unwinding from a failed assertion, with a retry and a message if removal fails. Every child
+  (server, CLI, chromedriver) is spawned in its own process group as a `GroupChild`; on drop the
+  group is killed and reaped, so a failed test leaves no `bitmule`/`bitmule-server` running and no
+  files behind. `/tmp` held no `bitmule-e2e-*` directory after a passing and after a failing run.
+- Binaries are looked up in `$CARGO_TARGET_DIR/{debug,release}` first (`BITMULE_CLI`,
+  `BITMULE_SERVER_BIN`, `BITMULE_CHROMEDRIVER` override), so the tests run against the release build
+  without a nested `cargo run`; the fallback to `cargo run` is still there and takes ~30 s of build
+  time on a cold debug tree, which is why the 30 s share-link timeout used to fail on the first run.
+- Cross-host testing was not possible from the agent container: it has file access to `synthline`
+  (no bitmule checkout, no shell) and no usable access to `tuliphost`. A two-host CLI↔CLI run still
+  needs a shell on both ends.
 
 ## Security audit fixes (2026-10-18, committed)
 Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update all clients (including the wasm bundle).**
@@ -279,8 +312,9 @@ Tests that passed when last run (2026-10-17/18):
 - `cargo test -p bitmule-client-common --lib` (fountain codec, spill, block I/O; also run with
   `BITMULE_NO_IO_URING=1` to exercise the blocking fallback; not re-run since the last change)
 - `cargo test -p bitmule-client-native --lib` (WebRTC worker, STUN client)
-- Tests clean up after themselves (all `tempfile`, `kill_on_drop`); checked by diffing /tmp, the repo,
-  ~/.config and processes before/after a run.
+- Tests clean up after themselves: temp dirs are `Scratch` guards (removed with a retry on every exit
+  path, including panic), child processes are `GroupChild` (own process group, killed and reaped on
+  drop); checked by diffing /tmp, the repo, ~/.config and processes before/after a run.
 - `cargo check --workspace --all-targets --exclude bitmule-server-signal-ws` was clean.
   `bitmule-server-signal-ws` is dead v1 code that no longer compiles; drop it from the workspace.
   `bitmule-e2e-tests` was not run.
@@ -386,6 +420,9 @@ interface; Linux), `--stun HOST:PORT|none`. Server: `--bind`, `--web-dir`, `--st
    scratch (blocks the data channel already delivered are fetched again).
 9. Receiver-initiated: one sender per request link, first link wins; no timeout while waiting.
 10. Web SPA on the public host is the old one; the browser client needs porting to v2.
+11. A forced transport on one side and the other on the other side (`--relay` ↔ `--webrtc`) never
+    completes and never errors — `transport_matrix` times out on both such pairs (2026-11-05).
+    Detect the mismatch in the handshake and fail with "no common transport".
 
 ## Architecture (user's rules: separate tokio tasks, talk only through channels, no spaghetti;
 ## the WebRTC code must not know about the websocket)
