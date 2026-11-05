@@ -45,7 +45,7 @@ lost: the receiver tells the sender how many more symbols each block needs, the 
 
 ## Other things learned today (also in `docs/v2-status.md`)
 
-- `tokio-uring` 0.5.0 use-after-free on runtime drop: fixed in `vendor/tokio-uring`.
+- `tokio-uring` 0.5.0 use-after-free on runtime drop: fixed in the `tokio-uring` fork (`patches/tokio-uring.patch`).
 - A big DF probe can make the kernel cache a bogus path MTU (552 seen on sudfa): probing and data use `IP_PMTUDISC_PROBE`.
 - Still to do from before: the StackOverflow comparison report (SCTP receive window 1 MiB vs 4, UDP buffers capped by
   `rmem_max`, message size), WebRTC MTU discovery, redeploy of the relay on artisan, wasm bundle rebuild, removing TEMP-INSTR code.

@@ -17,9 +17,15 @@ Ran both suites in `crates/bitmule-e2e-tests` against the release binaries on th
 - The tree did not build at `f2fc0bb`: `bitmule-client-native` required `str0m = "0.23"`, which
   resolves to 0.23.0 on crates.io, while `[patch.crates-io]` carried the 0.23.1 fork — so the patch
   was `[[patch.unused]]` and the build silently used upstream str0m and lost `Delivery`,
-  `write_bytes` and `set_channel_delivery`. client-native now requires `0.23.1`. The git patch is
-  unusable as well (`s3bk/str0m@bitmule-vendored` depends on the unpublished `bitmule-buf`), so
-  `[patch.crates-io]` points at `vendor/`: same code, tracked in this repo, no network needed.
+  `write_bytes` and `set_channel_delivery`. client-native now requires `0.23.1`, which is exactly what
+  the fork tag provides. The fork *branch* `s3bk/str0m@bitmule-vendored` is unusable (it depends on
+  the unpublished `bitmule-buf`), but the four fork *tags* resolve: `[patch.crates-io]` points at
+  `str0m` `bitmule-v0.23.1`, `sctp-proto` `bitmule-v0.10.4`, `tokio-uring` `bitmule-v0.5.0` and
+  `dimpl` `bitmule-v0.7.6`, with the diffs in `patches/` and the reasoning in FORKS.md. The `vendor/`
+  trees an earlier intermediate state of this branch carried were dropped in the merge of `ee59310`.
+- `cargo check` per package is clean with the fork tags (`-p bitmule`, `-p bitmule-server`,
+  `-p bitmule-e2e-tests`). A workspace-wide `cargo check` still stops in the GUI crate: `gobject-sys` /
+  `glib-sys` want `gobject-2.0.pc` / `glib-2.0.pc`, which this host does not have.
 - Test hygiene: temp dirs are a `Scratch` guard, removed on success, on an early `Err` and while
   unwinding from a failed assertion, with a retry and a message if removal fails. Every child
   (server, CLI, chromedriver) is spawned in its own process group as a `GroupChild`; on drop the
@@ -52,7 +58,8 @@ Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update al
   transitive (RustCrypto 0.10 generation, tungstenite 0.24 via axum 0.7, zstd 0.13 via zip, rand 0.8/0.9/0.10).
 - Docs: `docs/crypto.md` rewritten for v2 with the trust model (old text kept as `docs/crypto-v1.md`), over-claims removed from
   `docs/user-features.md` and `README.md`.
-- Fixed the `v2_transfer` abort (it failed in about half the runs, also on the previous commit): `vendor/str0m`
+- Fixed the `v2_transfer` abort (it failed in about half the runs, also on the previous commit): the str0m fork
+  (`patches/str0m.patch`)
   `Rtc::do_poll_output` called itself once per queued SCTP packet, so a busy data channel overflowed the 2 MiB tokio worker stack
   (lldb: hundreds of `do_poll_output` frames at `lib.rs:1734`). Now a loop (`repoll` flag). 0 failures in 14 runs. Not the buffer
   pools: `bitmule-buf` and `fountain::Pool` already allocate with `Box::new_zeroed`. Worth sending upstream to str0m.
@@ -62,14 +69,14 @@ Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update al
 
 ## Zero-copy WebRTC data channel (2026-10-18, in progress)
 Goal (user): send = one copy, done by the encryption step, from the dcproto message into the io_uring send buffer; receive = one
-copy, into a slab-allocated `ChannelData` buffer. Today (traced in `vendor/`): send has about six copies per byte
+copy, into a slab-allocated `ChannelData` buffer. Today (traced in the str0m fork): send has about six copies per byte
 (dcproto message, `ByteSlice::pop_chunk` `to_owned`, SCTP `marshal_to`, dimpl fragment buffer, dimpl queue_tx record, `poll_output`
 into buf, `DatagramSend` `to_vec`, then the pooled `Buf` for io_uring); receive: pooled recv buf -> dimpl input buffer -> decrypt
 in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData.data`.
 - DONE (stage 1): `Channel::write_bytes(Bytes)` -> `Sctp::write_bytes` -> `Stream::write_owned_with_ppi` with `OwnedBytes`
   (slices, no `to_owned`); used by `rtc.rs`. One copy fewer; throughput unchanged (copies are not the bottleneck: 64 MB memcpy
   is a few ms against 1.5 s).
-- DONE (receive experiment, `BITMULE_RX_MODE`): the decrypted packet is now a slab buffer (`vendor/str0m/src/rxbuf.rs`, polled straight
+- DONE (receive experiment, `BITMULE_RX_MODE`): the decrypted packet is now a slab buffer (`str0m/src/rxbuf.rs` in the fork, polled straight
   into it, handed to SCTP as `Bytes`: no `to_vec`). `RtcConfig::set_channel_delivery(Delivery)`:
   `Vec` (old `Event::ChannelData`), `Merged` (the chunks copied into ONE slab buffer, `Event::ChannelMessage`, default in bitmule)
   and `Segments` (one part per SCTP chunk, slices of the decrypted packets; the receiver writes them with one `writev_at_all`,
@@ -108,7 +115,7 @@ in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData
 - The UDP symbol path gets MTU discovery first (see below). The same probe could serve WebRTC between two native peers:
   sealed, padded, don't-fragment datagrams over the selected ICE pair through our socket pool, echoed by the receiver; the
   sender then raises its MTU. Each direction is independent (the sender's MTU only governs what it sends).
-- Needs: a runtime `Rtc::set_mtu` in `vendor/str0m` (today `RtcConfig::set_mtu` is fixed at build; env `BITMULE_MTU` is
+- Needs: a runtime `Rtc::set_mtu` in the str0m fork (today `RtcConfig::set_mtu` is fixed at build; env `BITMULE_MTU` is
   TEMP-INSTR) and the same for sctp-proto's association MTU. Neither has path-MTU discovery.
 - Browsers keep their own ~1200 byte size, so only native <-> native gains. "One symbol per packet" does not apply (SCTP cuts
   16 KiB messages into chunks); the gain is fewer, larger datagrams (~1450 on Ethernet, ~8-9 KB on jumbo/loopback).
@@ -119,7 +126,7 @@ in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData
 
 ## Where things are right now (short)
 - Everything below from this evening is UNCOMMITTED (about 30 modified files plus the new `bitmule-buf` crate, `udp.rs`,
-  `udp_uring.rs`, `uring.rs`, `pool_uring.rs`, `vendor/`, `scripts/nic-loop.sh`). Tests last run green: `cargo test -p bitmule`
+  `udp_uring.rs`, `uring.rs`, `pool_uring.rs`, `patches/`, `scripts/nic-loop.sh`). Tests last run green: `cargo test -p bitmule`
   (13 integration), `bitmule-client-native --lib` (22), `bitmule-buf` (9). NOT re-run since the last changes: `bitmule-server`,
   `bitmule-client-common` (also with `BITMULE_NO_IO_URING=1`).
 - Done this evening: data channel loss fixes; UDP symbol transport with io_uring (pacer fix, slow start, queue depths 1024-4096,
@@ -177,9 +184,9 @@ in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData
 - `fountain.rs`: `EncodedBlock::frames_with(pass, first_repair, later_repair)`, `frame_payload`,
   `Decoder::push_symbol(header, Symbol)` (takes a ready symbol, no copy), `SymbolPacket`,
   `SYMBOL_HEADER`. 13 client-common tests pass.
-- Local forks in `vendor/` with `[patch.crates-io]` in the workspace `Cargo.toml`:
-  `vendor/str0m` (data channel send buffer 1 MiB, was 128 KiB; made no difference once loss was fixed,
-  can go back) and `vendor/sctp-proto` (Fx hashing in `PayloadQueue` and two per-SACK maps; SACK delay
+- Fork tags in `[patch.crates-io]` in the workspace `Cargo.toml` (`patches/` holds the diffs, FORKS.md the why):
+  `str0m` `bitmule-v0.23.1` (data channel send buffer 1 MiB, was 128 KiB; made no difference once loss was fixed,
+  can go back) and `sctp-proto` `bitmule-v0.10.4` (Fx hashing in `PayloadQueue` and two per-SACK maps; SACK delay
   settable). The `fxhash` crate is not in the local registry; `rustc-hash` (same algorithm) already was.
 - `bitmule-core::protocol`: `PeerCaps::UDP = 4`, `Peer2Peer::UdpHello(UdpHello { addrs })` (last
   variant). **The server must be rebuilt and redeployed** (see Relay on artisan) before UDP is used.
@@ -244,8 +251,8 @@ in place -> `poll_output` copy -> SCTP parse -> reassembly `Vec` -> `ChannelData
   Test `--nic` against a second machine, not against another interface of the same one.
 
 ### TEMPORARY instrumentation (marked `TEMP-INSTR`, harmless when the variables are unset; remove when done)
-- Env: `BITMULE_MTU` (str0m_client.rs), `BITMULE_SCTP_BUF` KiB (vendor/str0m), `BITMULE_ACK_MS` and
-  `BITMULE_SCTP_TRACE` (vendor/sctp-proto: prints T3 timeouts), `BITMULE_MEMOUT` (recv.rs: data
+- Env: `BITMULE_MTU` (str0m_client.rs), `BITMULE_SCTP_BUF` KiB (str0m fork), `BITMULE_ACK_MS` and
+  `BITMULE_SCTP_TRACE` (sctp-proto fork: prints T3 timeouts), `BITMULE_MEMOUT` (recv.rs: data
   channel output into memory), `BITMULE_UDS` (rtc.rs: data over a Unix socket after the channel
   opens; path must be under 108 bytes), `PacketCounts` printed on drop of the rtc driver (rtc.rs).
 - `Cargo.toml` of client-native has `net`, `io-util` added to tokio for the Unix socket test.
@@ -506,7 +513,7 @@ app link       -> transfer worker (v2/send.rs per receiver; v2/recv.rs)
 - Heap corruption found on the way (about 1 run in 15, sender or receiver aborted at the end of the MTU phase,
   "tcache_thread_shutdown(): unaligned tcache chunk"): `tokio-uring` 0.5.0 `Driver::drop` replaced the `Lifecycle::Ignored(data)`
   of reads already dropped with `Ignored(())`, freeing the buffer, msghdr and address the kernel was still to write.
-  Fixed in `vendor/tokio-uring` (patched in the workspace); 60/60 clean runs afterwards, 0/60 failed with io_uring off before.
+  Fixed in the tokio-uring fork (`patches/tokio-uring.patch`); 60/60 clean runs afterwards, 0/60 failed with io_uring off before.
 - Not run: sudfa. The relay on artisan was not redeployed (ssh to it was refused in this session).
 
 ### UDP to sudfa (2026-10-18)
