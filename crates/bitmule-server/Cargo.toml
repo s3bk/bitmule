@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 bitmule-core = { path = "../bitmule-core" }
-tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "fs", "io-util", "sync", "net"] }
+sha2 = { workspace = true }
+base64 = "0.22"
 axum = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }
@@ -36,6 +38,7 @@ rand = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
+tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tokio-tungstenite = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

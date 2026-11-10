@@ -25,6 +25,12 @@ pub mod ws;
 pub mod relay2;
 pub mod stun;
 
+/// The link surfaces: shares, invites, the granter's inbox, egress metering
+/// (merged from the `bitmule-proto` prototype; see the module docs).
+pub mod share;
+/// The links-only host: the viewer at `/`, and nothing to browse.
+pub mod hosts;
+
 use rand::Rng;
 pub use room::{Role, Room};
 use serde::{Deserialize, Serialize};
