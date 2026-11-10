@@ -1,9 +1,9 @@
-# bitmule web: the marketing page at `/`, the app at `/app.html`
+# bitmule web: the marketing page at `/`, the app at `/app`
 
 Zero-build pages. Open `app.html` in any modern browser
 (needs to be served over HTTP for the ES-module import to work — the
 `file://` scheme blocks dynamic imports); `index.html` is the marketing
-page, and `bitmule-server` serves it for `/`.
+page, and `bitmule-server` serves it for `/` and the app for `/app`.
 
 ## Serve locally
 
@@ -95,8 +95,8 @@ the CLI and itself through a local server. Every wait is 10 s.
 
 ## Layout
 
-- `index.html`    — the marketing page served at `/` (its CSS in `bitmule.css`, its theme chooser in `bitmule.js`, so it runs under the CSP). Hero links: *Create a share* → `/app.html`, *Ask for files* → `/app.html#request`.
-- `app.html`      — single page that hosts both send-mode UI and receive-mode UI; also what the server's missing-path fallback serves, so `/send` and other client-side routes land here.
+- `index.html`    — the marketing page served at `/` (its CSS in `bitmule.css`, its theme chooser in `bitmule.js`, so it runs under the CSP). Hero links: *Create a share* → `/app`, *Ask for files* → `/app#request`.
+- `app.html`      — the single page behind `/app`: send-mode, receive-mode and request-mode UI. `bitmule-server` serves it for `/app`, redirects `/app.html` there, and its missing-path fallback serves it too, so `/send#<key>` (the shape of every invite link already printed) and the app's own client-side routes land here.
 - `style.css`      — dark theme.
 - `main.js`        — routes on `location.hash`: no hash → send mode, valid 64-hex hash → receive mode.
 - `vendor/qrcode.js` — vendored QR generator (MIT, K. Arase).

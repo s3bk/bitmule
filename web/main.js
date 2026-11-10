@@ -626,10 +626,10 @@ function wireSendMode() {
 function wireRecvMode() {
   els.recvCancel.addEventListener("click", () => {
     closeRecvSession();
-    // Drop the session fragment, but stay on this document: `/` is the
-    // marketing page, the app is `/app.html`, so rewriting the path to `/`
-    // would put the SPA at a URL a reload serves as something else.
-    history.replaceState(null, "", location.pathname);
+    // Drop the session fragment and go back to the app's one address. A
+    // share link may have landed on `/d`, `/u` or `/` (the viewer and the
+    // landing page), none of which is the app; `/app` is.
+    history.replaceState(null, "", "/app");
     applyRoute();
   });
 }
@@ -740,7 +740,11 @@ function currentSessionFragment() {
 function applyRoute() {
   const fragment = currentSessionFragment();
   const hex = fragment ? fragment.sessionHex : null;
-  const isSendPath = location.pathname === "/send" || location.pathname === "/send/";
+  const path = location.pathname.replace(/\/+$/, "");
+  // The app's invite route is `/app/send`; `/send` is the shape of every
+  // invite link printed before the app moved under `/app`, and still lands
+  // on the same document through the server's fallback.
+  const isSendPath = path === "/app/send" || path === "/send";
 
   // Self-download guard: if the fragment matches a session THIS tab is
   // currently serving (as sender OR as request-files receiver-with-URL),

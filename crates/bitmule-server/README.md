@@ -116,8 +116,9 @@ else may run on it and no data may go anywhere but back to the origin.
 There is no per-page exception. The marketing page keeps its CSS and its theme
 chooser in `web/bitmule.css` and `web/bitmule.js` so that it renders under the
 same policy. It is the `index.html` of the static root, so it answers `/`; the
-SPA is `web/app.html`, and the missing-path fallback routes there (client-side
-routes such as `/send` land on it). Its only third parties are the web-font
+SPA is served at `/app` (and `/app.html` permanently redirects there), and the
+missing-path fallback serves the same document, so client-side routes such as
+`/send` land on it. Its only third parties are the web-font
 hosts (`fonts.googleapis.com` for the stylesheet, `fonts.gstatic.com` for the
 files), allowed in `style-src`/`font-src` and nowhere else; `tests/web_headers.rs`
 fails the build if a page gains an inline `<style>`, an inline script or a

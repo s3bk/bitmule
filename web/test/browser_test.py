@@ -449,7 +449,7 @@ def test_ui_receive(flags):
     link = cli.find(r"#([A-Za-z0-9_-]{86})", "cli share link")
     page = Page(server, downloads=downloads)
     try:
-        page.open("/", ready="window.bitmule")
+        page.open("/app", ready="window.bitmule")
         page.driver.get(f"{server.url}/#{link}")
         page.wait_eval("document.body.dataset.transferStatus === 'complete'", "page reports the transfer complete")
         got = wait_download(downloads, "downloaded file")
@@ -465,7 +465,7 @@ def test_ui_send():
     out = Path(tempfile.mkdtemp(dir=tmp))
     page = Page(server)
     try:
-        page.open("/", ready="window.bitmule")
+        page.open("/app", ready="window.bitmule")
         page.driver.find_element("id", "file-input").send_keys(str(path))
         url = page.wait_eval("document.getElementById('session-link').value", "share link in the page")
         cli = Cli(server, "recv", "--relay", "--out", str(out), url)
@@ -487,7 +487,7 @@ def test_ui_zip_from_cli():
     link = cli.find(r"#([A-Za-z0-9_-]{86})", "cli share link")
     page = Page(server, downloads=downloads)
     try:
-        page.open("/", ready="window.bitmule")
+        page.open("/app", ready="window.bitmule")
         page.driver.get(f"{server.url}/#{link}")
         page.wait_eval("document.querySelector('.bundle-dialog')", "bundle dialog")
         page.driver.find_element("css selector", ".bundle-dialog .pick-btn.secondary").click()
@@ -514,7 +514,7 @@ def test_ui_request():
     downloads = Path(tempfile.mkdtemp(dir=tmp))
     page = Page(server, downloads=downloads)
     try:
-        page.open("/", ready="window.bitmule")
+        page.open("/app", ready="window.bitmule")
         page.driver.find_element("id", "request-files-btn").click()
         url = page.wait_eval("document.getElementById('request-link').value", "request link in the page")
         assert "/send#" in url, url
@@ -534,7 +534,7 @@ def test_ui_invited_send():
     key = cli.find(r"/send#([0-9a-f]{64})", "cli request link")
     page = Page(server)
     try:
-        page.open("/", ready="window.bitmule")
+        page.open("/app", ready="window.bitmule")
         page.driver.get(f"{server.url}/send#{key}")
         page.wait_eval("!document.getElementById('invited-send-mode').hidden", "invited send mode")
         page.driver.find_element("id", "invited-file-input").send_keys(str(path))

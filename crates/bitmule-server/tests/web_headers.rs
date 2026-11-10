@@ -18,13 +18,14 @@ const FONT_FILE_HOST: &str = "https://fonts.gstatic.com";
 
 #[tokio::test]
 async fn pages_carry_the_content_policy() {
-    let app = security_headers(router(Arc::new(AppState::new())).fallback_service(
-        tower_http::services::ServeDir::new(web_dir()).append_index_html_on_directories(true),
+    let app = security_headers(bitmule_server::static_site(
+        router(Arc::new(AppState::new())),
+        &web_dir(),
     ));
 
     // every page, the marketing one included: it used to be the exception, and
     // a policy that blocks inline styles then left the deployed page unstyled
-    for path in ["/", "/index.html", "/app.html"] {
+    for path in ["/", "/index.html", "/app"] {
         let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), 200, "{path}");
         let csp = response.headers()["content-security-policy"].to_str().unwrap().to_string();
@@ -45,6 +46,41 @@ async fn pages_carry_the_content_policy() {
     // the API answers with the headers too
     let response = app.oneshot(Request::get("/pow").body(Body::empty()).unwrap()).await.unwrap();
     assert!(response.headers().contains_key("content-security-policy"));
+}
+
+/// The app has one address, `/app`. `/app.html` is where it used to be and
+/// redirects there, `/send` is the shape of every invite link already printed
+/// and still lands on the app, and `/` is the marketing page and only that.
+#[tokio::test]
+async fn the_app_lives_at_app() {
+    let app = security_headers(bitmule_server::static_site(
+        router(Arc::new(AppState::new())),
+        &web_dir(),
+    ));
+
+    let body_of = |app: axum::Router, path: &'static str| async move {
+        let response = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        (response.status(), axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap())
+    };
+
+    let (status, body) = body_of(app.clone(), "/app").await;
+    assert_eq!(status, 200);
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("id=\"dropzone\""), "/app is not the app");
+
+    let response = app.clone().oneshot(Request::get("/app.html").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), 308);
+    assert_eq!(response.headers()["location"], "/app");
+
+    let (status, body) = body_of(app.clone(), "/send").await;
+    assert_eq!(status, 200);
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("id=\"dropzone\""), "/send does not land on the app");
+
+    let (status, body) = body_of(app, "/").await;
+    assert_eq!(status, 200);
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("hero-title"), "/ is not the marketing page");
 }
 
 /// Both pages load scripts and styles from their own origin only, and neither

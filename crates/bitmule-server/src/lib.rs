@@ -74,6 +74,65 @@ pub fn router(state: std::sync::Arc<AppState>) -> axum::Router {
         .with_state(state)
 }
 
+/// Mount the static web directory the way the site is laid out: the marketing
+/// page at `/` (it is `index.html` of the root), the single-page app at
+/// `/app`, and the app again for every path the directory does not hold, so a
+/// client-side route such as `/send#<key>` — the shape of every invite link
+/// already printed — lands on the same document.
+///
+/// `/app.html` is where the app used to live, and is now a permanent redirect:
+/// the document has one address, and it does not name the file it is stored
+/// in. `/app/` redirects to `/app` rather than being a second spelling — the
+/// app's assets are addressed from the root, so the trailing slash buys
+/// nothing and would make a second name for the same page.
+///
+/// Every other path is served as a file and a miss stays a miss: a missing
+/// script should 404, not quietly answer with the app's HTML.
+pub fn static_site(app: axum::Router, web_dir: &std::path::Path) -> axum::Router {
+    use axum::{response::Redirect, routing::get, Router};
+    use tower_http::services::ServeDir;
+
+    let pages = Router::new()
+        .route("/app", get(app_document))
+        .route("/app/*rest", get(app_document))
+        .route("/send", get(app_document))
+        .route("/app.html", get(|| async { Redirect::permanent("/app") }))
+        .with_state(web_dir.join("app.html"));
+
+    app.merge(pages).fallback_service(
+        ServeDir::new(web_dir).append_index_html_on_directories(true),
+    )
+}
+
+/// The single-page app, for its own address and every client-side route under
+/// it. `/send` is the route of every invite link already printed.
+async fn app_document(
+    axum::extract::State(spa): axum::extract::State<std::path::PathBuf>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use axum::{http::{header, HeaderValue, StatusCode}, response::{IntoResponse, Redirect, Response}};
+
+    if uri.path().ends_with('/') {
+        return Redirect::permanent("/app").into_response();
+    }
+    match tokio::fs::read(&spa).await {
+        Ok(html) => {
+            let mut response = Response::new(axum::body::Body::from(html));
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache"),
+            );
+            response
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// The headers every response carries. The page that handles share links
 /// (`/#<key>`) holds the secret of the transfer, so it gets a policy that
 /// leaves a script no way to run from anywhere but this origin, nor to send
