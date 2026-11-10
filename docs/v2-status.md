@@ -52,7 +52,8 @@ Wire-incompatible with earlier builds: **redeploy `bitmule-server` and update al
   are deleted unless `--keep-failed` (`v2::VerifyFailed`). Overwrite truncates before verification.
 - `--unsafe` is needed for non-https servers (`Server::parse_checked`, `Client::allow_insecure`; MCP via env
   `BITMULE_ALLOW_INSECURE=1`).
-- Server sends CSP and other security headers (`security_headers`, test `tests/web_headers.rs`); `web/bitmule.html` is exempt.
+- Server sends CSP and other security headers (`security_headers`, test `tests/web_headers.rs`) to every page, the
+  marketing page included: its CSS and its theme chooser are `web/bitmule.css` and `web/bitmule.js`, not inline.
   `web/README.md` no longer suggests an inline script.
 - Dependencies unified (reqwest 0.12, url 2, tower 0.5, tower-http 0.6, thiserror 2, raptorq git fork). Remaining duplicates are
   transitive (RustCrypto 0.10 generation, tungstenite 0.24 via axum 0.7, zstd 0.13 via zip, rand 0.8/0.9/0.10).

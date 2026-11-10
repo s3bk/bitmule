@@ -79,27 +79,30 @@ pub fn router(state: std::sync::Arc<AppState>) -> axum::Router {
 /// leaves a script no way to run from anywhere but this origin, nor to send
 /// data anywhere but back to it.
 ///
-/// `/bitmule.html` (the marketing page: inline script, web fonts) is exempt
-/// from the content policy. It never sees a share link.
+/// Two hosts are allowed, and only for the marketing page's typefaces: it may
+/// fetch a stylesheet from `fonts.googleapis.com` and the font files it names
+/// from `fonts.gstatic.com`. Neither can run, and `connect-src 'self'` keeps a
+/// page from sending anything anywhere. Every page carries the same policy —
+/// including `/bitmule.html`, which used to be exempt because its CSS and its
+/// theme chooser were inline. They are `bitmule.css` and `bitmule.js` now, so a
+/// marketing page served at `/` (an index.html under a static root) is styled
+/// instead of stripped bare by a policy that blocks inline styles.
 pub fn security_headers(app: axum::Router) -> axum::Router {
     use axum::{extract::Request, http::{HeaderValue, header}, middleware::{self, Next}, response::Response};
 
     const CSP: &str = "default-src 'none'; \
         script-src 'self' 'wasm-unsafe-eval'; \
-        style-src 'self'; \
+        style-src 'self' https://fonts.googleapis.com; \
         img-src 'self' data: blob:; \
-        font-src 'self'; \
+        font-src 'self' https://fonts.gstatic.com; \
         connect-src 'self'; \
         worker-src 'self' blob:; \
         object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
     async fn add(request: Request, next: Next) -> Response {
-        let app_page = request.uri().path() != "/bitmule.html";
         let mut response = next.run(request).await;
         let headers = response.headers_mut();
-        if app_page {
-            headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-        }
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
         headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
         headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
