@@ -590,3 +590,90 @@ async fn invite_upload_resumes() {
     let uploaded: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(uploaded["used_bytes"].as_u64().unwrap(), content.len() as u64);
 }
+
+#[tokio::test]
+async fn a_restart_keeps_a_partial_upload() {
+    let h = harness();
+    let content = bytes_of(50_000);
+    let half = content.len() / 2;
+
+    let create = json_request(
+        "POST",
+        "/v1/pub/shares",
+        None,
+        serde_json::json!({
+            "sid": SID,
+            "auth_hash": auth_hash(AUTH),
+            "files": [{ "uid": "file00000001", "size": content.len() }],
+        }),
+    );
+    let (status, _, body) = call(&h.app, create).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
+
+    let uri = share_file_uri("file00000001");
+    let mut first = request("PUT", &uri, Some(AUTH), content[..half].to_vec());
+    first.headers_mut().insert(
+        "content-range",
+        format!("bytes 0-{last}/{total}", last = half - 1, total = content.len())
+            .parse()
+            .unwrap(),
+    );
+    let (status, headers, _) = call(&h.app, first).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(headers["x-bm-offset"], half.to_string());
+
+    // The process dies here — mid-upload, with no chance to tidy up. Nothing
+    // about the upload lived in memory: no journal, no offset in a hash map,
+    // no lock held across the gap. A new server over the same directory knows
+    // exactly as much as the old one did.
+    drop(h.app);
+    let app = share::router(Api {
+        store: Arc::new(Store::new(h.dir.path())),
+        meter: Arc::new(Meter::new()),
+        cfg: Arc::new(share::Config::default()),
+    });
+
+    // the first question a resuming client asks, answered the same way
+    let (status, headers, body) = call(&app, request("GET", &uri, Some(AUTH), Body::empty())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-bm-offset"], half.to_string());
+    assert_eq!(headers["x-bm-total"], content.len().to_string());
+    let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(state["uploaded"], false);
+
+    // and the rest finishes the file, without repeating what it weighs
+    let mut resume = request("PUT", &uri, Some(AUTH), content[half..].to_vec());
+    resume
+        .headers_mut()
+        .insert("upload-offset", half.to_string().parse().unwrap());
+    let (status, headers, body) = call(&app, resume).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(headers["x-bm-offset"], content.len().to_string());
+
+    let commit = request(
+        "POST",
+        &format!("/v1/pub/s/{SID}/commit"),
+        Some(AUTH),
+        Body::empty(),
+    );
+    let (status, _, body) = call(&app, commit).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let (status, _, body) = call(
+        &app,
+        request(
+            "GET",
+            &format!("/v1/pub/s/{SID}/files/file00000001/content"),
+            Some(AUTH),
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, content, "a restart joins the two halves at the seam");
+}
