@@ -821,6 +821,13 @@ function applyRoute() {
   }
 })();
 
+// ---- background: what earlier visits left behind ----------------------
+
+// Received files and journals nobody claims any more. A transfer that is
+// still in use has a journal, and a journalled file is kept however old it
+// is, so this only ever removes orphans (a day is the cutoff).
+v2.cleanupStaleDownloads().catch(() => {});
+
 // ---- boot --------------------------------------------------------------
 
 // Consume ?debug=interrupt at boot: strip it from the URL and set a

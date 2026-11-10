@@ -52,7 +52,14 @@ stays responsive; the page only does the UI and WebRTC.
 
 - `v2-worker.js` — one job per worker (send / receive / request): the signaling
   websocket, relay upload and download, reading the file, assembling the
-  received file in OPFS (memory if there is none).
+  received file in OPFS (memory if there is none). The worker is a
+  `SharedWorker` named after the transfer, so a reload attaches to the job that
+  is still running; if the worker itself is gone, the journal it left in OPFS
+  (see `opfs.js`) lets the next one carry on where it stopped.
+- `opfs.js` — what outlives a page: the file being assembled, the spool of
+  bytes whose length is not known yet, and one small journal per transfer
+  (two alternating slots, newest wins, so a write torn by a crash costs one
+  flush rather than the whole record).
 - `v2.js` — starts a job, owns the `RTCPeerConnection`s, passes data channel
   messages to and from the worker.
 - `main.js` — UI only.
@@ -69,10 +76,17 @@ or `bitmule-files.zip`); several files go as a store-mode zip; no UDP.
 ## Tests
 
 ```
+node web/test/opfs_test.js        # no browser: OPFS store, journal, resume
 pip install selenium
 cargo build --release -p bitmule -p bitmule-server
 python3 web/test/browser_test.py [name-filter]
 ```
+
+`web/test/opfs_test.js` runs `opfs.js` against an in-memory file system in
+node: what a journal records and which of its two slots wins, what a reopened
+file holds, what housekeeping keeps, and — with `web/test/resume-worker.js`
+standing in for `v2-worker.js` — that a reloaded page attaches to the transfer
+still running and that a worker that died is picked up from its journal.
 
 Drives Chrome (headless, a matching chrome/chromedriver pair from
 selenium-manager's cache, or `BITMULE_CHROME` / `BITMULE_CHROMEDRIVER`) against
@@ -81,6 +95,7 @@ the CLI and itself through a local server. Every wait is 10 s.
 ## Layout
 
 - `index.html`     — single page that hosts both send-mode UI and receive-mode UI.
+- `bitmule.html`   — the marketing page (its CSS in `bitmule.css`, its theme chooser in `bitmule.js`, so it runs under the CSP).
 - `style.css`      — dark theme.
 - `main.js`        — routes on `location.hash`: no hash → send mode, valid 64-hex hash → receive mode.
 - `vendor/qrcode.js` — vendored QR generator (MIT, K. Arase).

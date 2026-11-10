@@ -1,6 +1,11 @@
 // bitmule v2, page side: starts a transfer worker (v2-worker.js, where the
 // protocol runs) and does the one thing a worker can't everywhere, WebRTC.
 //
+// The worker is shared and named after the transfer, so a reload attaches to
+// the transfer that is still running rather than starting a second one; and if
+// the worker is gone too, the journal it left in OPFS is what a new worker
+// carries on from (opfs.js).
+//
 //   const job = v2.startReceive({ server, link, on: { state, progress, done, error } });
 //   job.cancel();
 //
@@ -27,8 +32,18 @@
 //       on.shareLink(link)      the sender answered: start a receive with this
 // All jobs: on.state(text), on.error(message).
 
+import { Journal, cleanupOlderThan } from "./opfs.js";
+
 const CAP_RELAY = 1;
 const CAP_WEBRTC = 2;
+
+// The name a job's SharedWorker is registered under. The worker lives as long
+// as a page is attached to it, and a reload attaches to the same one.
+const WORKER_PREFIX = "bitmule-transfer-";
+
+function newJobId() {
+  return `job-${crypto.randomUUID()}`;
+}
 
 // A buffer's worth in the channel at most; the rest waits in the queue below.
 const DC_HIGH = 4 * 1024 * 1024;
@@ -145,25 +160,93 @@ class Rtc {
   }
 }
 
+/// The page's end of one job's worker.
+///
+/// A `SharedWorker` named after the transfer: a reload reaches the same worker,
+/// which is still running the same job, instead of starting a second one. Where
+/// shared workers are missing (or refuse module scripts) a dedicated worker
+/// runs the job — the page then owns it, and it dies with the page.
+class Channel {
+  constructor(id, onmessage) {
+    const url = new URL("./v2-worker.js", import.meta.url);
+    let shared = null;
+    try {
+      if (typeof SharedWorker === "function") {
+        shared = new SharedWorker(url, { type: "module", name: `${WORKER_PREFIX}${id}` });
+      }
+    } catch {
+      shared = null;
+    }
+    if (shared) {
+      this.shared = true;
+      this.port = shared.port;
+    } else {
+      this.shared = false;
+      this.worker = new Worker(url, { type: "module" });
+      this.worker.onerror = (e) => onmessage({ type: "error", message: e.message || "the transfer worker failed" });
+      this.port = this.worker;
+    }
+    this.port.onmessage = (e) => onmessage(e.data);
+    if (this.port.start) this.port.start();
+  }
+
+  post(message, transfer) {
+    this.port.postMessage(message, transfer || []);
+  }
+
+  /// Stop listening. A shared worker keeps the transfer and goes on without a
+  /// page (a reload attaches to it); a dedicated one has nobody else, so it
+  /// ends here.
+  detach() {
+    try { this.port.close && this.port.close(); } catch {}
+    if (this.worker) this.worker.terminate();
+  }
+}
+
 class Job {
-  constructor(kind, options, extra) {
+  constructor(kind, options, extra = {}) {
+    this.kind = kind;
+    this.id = extra.jobId || newJobId();
     this.server = options.server;
     this.on = options.on || {};
     this.rtcs = new Map();
     this.finished = false;
-    this.worker = new Worker(new URL("./v2-worker.js", import.meta.url), { type: "module" });
-    this.worker.onmessage = (e) => this.fromWorker(e.data);
-    this.worker.onerror = (e) => this.fail(e.message || "the transfer worker failed");
-    const caps = CAP_RELAY | (webrtcAvailable() ? CAP_WEBRTC : 0);
+    this.channel = null;
+    this.caps = CAP_RELAY | (webrtcAvailable() ? CAP_WEBRTC : 0);
     // a function can't go to the worker: it asks for a new stream when it needs one
-    const { openStream, ...rest } = extra;
-    this.openStream = openStream || null;
+    this.openStream = extra.openStream || null;
+    this.started = this.start(extra).catch((e) => this.fail(String((e && e.message) || e)));
+  }
+
+  async start(extra) {
+    // A receive of the same link that did not finish is the same transfer: the
+    // worker may still be running it, or its journal may be on disk. Either
+    // way it is taken back rather than fetched a second time.
+    if (this.kind === "receive" && extra.adopt !== false) {
+      const entry = (await Journal.list()).find((e) => e.kind === "receive" && e.link === extra.link);
+      if (entry) {
+        this.id = entry.id;
+        this.channel = new Channel(this.id, (m) => this.fromWorker(m));
+        this.toWorker({ type: "resume", jobId: this.id, caps: this.caps });
+        return;
+      }
+    }
+    if (this.finished) return;
+    this.channel = new Channel(this.id, (m) => this.fromWorker(m));
+    if (extra.attach) {
+      this.toWorker({ type: "resume", jobId: this.id, caps: this.caps });
+      return;
+    }
     // a ReadableStream (the data of a streaming send) is handed over, not copied
-    this.toWorker({ type: "start", job: kind, server: this.server, caps, ...rest, restartable: !!openStream }, rest.stream ? [rest.stream] : []);
+    const { attach, adopt, openStream, stream, ...rest } = extra;
+    this.toWorker(
+      { type: "start", job: this.kind, jobId: this.id, server: this.server, caps: this.caps, ...rest, restartable: !!openStream },
+      stream ? [stream] : [],
+    );
   }
 
   toWorker(message, transfer) {
-    if (!this.finished) this.worker.postMessage(message, transfer || []);
+    if (!this.finished && this.channel) this.channel.post(message, transfer);
   }
 
   state(text) {
@@ -180,8 +263,10 @@ class Job {
     this.finished = true;
     for (const rtc of this.rtcs.values()) rtc.close();
     this.rtcs.clear();
-    // the result is a message already received; the worker can go
-    setTimeout(() => this.worker.terminate(), 100);
+    // the result is a message already received: stop listening, and leave a
+    // shared worker to itself (it has nothing left to do and dies with the page)
+    if (this.channel) this.channel.detach();
+    this.channel = null;
   }
 
   fromWorker(m) {
@@ -245,23 +330,31 @@ export function startSend({ server, blob = null, stream = null, openStream = nul
   });
 }
 
-export function startReceive({ server, link, on }) {
-  return new Job("receive", { server, on }, { link });
+/// Receive a share link. A transfer of that link that stopped halfway is picked
+/// up where it stopped, so the page does not have to know which one it is.
+export function startReceive({ server, link, on, adopt = true }) {
+  return new Job("receive", { server, on }, { link, adopt });
 }
 
 export function startRequest({ server, on }) {
   return new Job("request", { server, on }, {});
 }
 
-/// Received files are assembled in OPFS; drop the ones left behind by earlier
-/// visits (a day old: nothing in use is that old).
+/// Transfers that are still here: running in a worker, or stopped halfway with
+/// a journal on disk that says where. Newest first.
+export async function pending() {
+  const entries = await Journal.list();
+  return entries.filter((e) => e.kind === "send" || e.kind === "receive");
+}
+
+/// Take a transfer back by id (from `pending()`), whether a worker is still
+/// running it or it has to be picked up from its journal.
+export function resume(id, { server, on, kind = "receive" } = {}) {
+  return new Job(kind, { server, on }, { jobId: id, attach: true, adopt: false });
+}
+
+/// Drop received files and journals left behind by earlier visits (a day old:
+/// nothing in use is that old).
 export async function cleanupStaleDownloads() {
-  try {
-    const root = await navigator.storage.getDirectory();
-    for await (const [name, handle] of root.entries()) {
-      if (!name.startsWith("bitmule-recv-") || handle.kind !== "file") continue;
-      const file = await handle.getFile();
-      if (Date.now() - file.lastModified > 24 * 3600 * 1000) await root.removeEntry(name);
-    }
-  } catch {}
+  await cleanupOlderThan(24 * 3600 * 1000);
 }
