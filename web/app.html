@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>bit mule</title>
+    <link rel="icon" type="image/svg+xml" href="/icons/icon256.webp" />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <a href="/">
+            <img alt="" class="logo" aria-hidden="true" src="/icons/icon_color.webp">
+            <div><h1>bit mule</h1></div>
+        </a>
+        <div>
+            <p id="tagline" class="tagline">drop files to send</p>
+        </div>
+      </header>
+
+      <!-- SEND MODE — shown when the URL has no hash and path is / -->
+      <div id="send-mode" hidden>
+        <section
+          id="dropzone"
+          class="dropzone"
+          role="button"
+          tabindex="0"
+          aria-label="Drop files here or click to choose"
+        >
+          <div class="dropzone-inner">
+            <div class="dropzone-icon" aria-hidden="true">↓</div>
+            <p class="dropzone-msg">Drop files here</p>
+            <button id="pick-btn" type="button" class="pick-btn">
+              Choose files
+            </button>
+            <input
+              id="file-input"
+              type="file"
+              multiple
+              hidden
+              aria-hidden="true"
+            />
+          </div>
+        </section>
+
+        <div class="mode-flip">
+          <button id="request-files-btn" type="button" class="cancel-btn">
+            Request files instead
+          </button>
+        </div>
+
+        <section id="queue" class="queue" aria-live="polite"></section>
+
+        <section id="session" class="session" hidden aria-live="polite">
+          <h2 class="session-title">Share this link with the receiver</h2>
+          <div class="session-link-row">
+            <input
+              id="session-link"
+              class="session-link"
+              type="text"
+              readonly
+              aria-label="share link"
+            />
+            <button id="copy-link" class="pick-btn" type="button">Copy</button>
+          </div>
+          <div id="session-qr" class="session-qr" aria-hidden="true"></div>
+          <div id="session-state" class="session-state">
+            waiting for receiver…
+          </div>
+          <div class="session-controls">
+            <label class="session-toggle">
+              <input id="stop-after-first" type="checkbox" />
+              stop after first complete download
+            </label>
+            <div id="session-counters" class="session-counters" aria-live="polite">
+              Active: <span id="session-active-count">0</span>
+              &nbsp;·&nbsp;
+              Total: <span id="session-total-count">0</span>
+            </div>
+          </div>
+          <!-- F01: per-peer progress list. One row per receiver
+               currently connected; updated live as chunks flush. -->
+          <ul id="peer-progress-list" class="peer-progress-list" aria-live="polite"></ul>
+          <button id="cancel-session" class="cancel-btn" type="button">
+            Cancel
+          </button>
+        </section>
+      </div>
+
+      <!-- REQUEST-FILES MODE — I'm the receiver, waiting for a sender to arrive at /send#<my-hex> -->
+      <div id="request-mode" hidden>
+        <section id="request-session" class="session" aria-live="polite">
+          <h2 class="session-title">Send this link to whoever should send you files</h2>
+          <div class="session-link-row">
+            <input
+              id="request-link"
+              class="session-link"
+              type="text"
+              readonly
+              aria-label="request link"
+            />
+            <button id="copy-request-link" class="pick-btn" type="button">Copy</button>
+          </div>
+          <div id="request-qr" class="session-qr" aria-hidden="true"></div>
+          <div id="request-state" class="session-state">
+            waiting for sender to open the link…
+          </div>
+          <div id="request-download" class="recv-download" hidden></div>
+          <button id="request-cancel" class="cancel-btn" type="button">
+            Cancel
+          </button>
+        </section>
+      </div>
+
+      <!-- RECEIVE MODE — shown when the URL hash is a valid 64-hex session -->
+      <div id="receive-mode" hidden>
+        <section id="recv-session" class="session" aria-live="polite">
+          <h2 class="session-title">Connected to sender</h2>
+          <div class="session-state" id="recv-state">connecting…</div>
+          <div id="recv-download" class="recv-download" hidden></div>
+          <div class="status recv-status">
+            <div class="status-row">
+              <span class="status-label">session</span>
+              <span id="recv-session-id" class="status-value pending">–</span>
+            </div>
+            <div class="status-row">
+              <span class="status-label">server</span>
+              <span id="recv-server-status" class="status-value pending">
+                connecting…
+              </span>
+            </div>
+          </div>
+          <button id="recv-cancel" class="cancel-btn" type="button">
+            Close
+          </button>
+        </section>
+      </div>
+
+      <!-- INVITED-SENDER MODE — I'm the sender, receiver waits with pre-generated hex, path is /send + hex hash -->
+      <div id="invited-send-mode" hidden>
+        <section
+          id="invited-dropzone"
+          class="dropzone"
+          role="button"
+          tabindex="0"
+          aria-label="Drop files to send to the requester"
+        >
+          <div class="dropzone-inner">
+            <div class="dropzone-icon" aria-hidden="true">↑</div>
+            <p class="dropzone-msg">
+              Someone is waiting for files.<br />Drop files here to send them.
+            </p>
+            <button id="invited-pick-btn" type="button" class="pick-btn">
+              Choose files
+            </button>
+            <input
+              id="invited-file-input"
+              type="file"
+              multiple
+              hidden
+              aria-hidden="true"
+            />
+          </div>
+        </section>
+
+        <section id="invited-queue" class="queue" aria-live="polite"></section>
+
+        <section id="invited-session" class="session" hidden aria-live="polite">
+          <h2 class="session-title">Sending to the requester</h2>
+          <div id="invited-session-state" class="session-state">
+            connecting to receiver…
+          </div>
+          <button id="invited-cancel" class="cancel-btn" type="button">
+            Cancel
+          </button>
+        </section>
+      </div>
+
+      <!-- Options menu (F00). Toggles persist to localStorage;
+           main.js reads them on session start. -->
+      <section id="options" class="options" aria-live="polite">
+        <details>
+          <summary class="options-summary">Options</summary>
+          <label class="option-row">
+            <input id="opt-multi-send" type="checkbox" />
+            multi-send by default (keep the URL live for more receivers)
+          </label>
+          <label class="option-row">
+            <input id="opt-upnp" type="checkbox" />
+            request UPnP port mapping (native only — no-op in browser)
+          </label>
+          <label class="option-row">
+            <input id="opt-clipboard-watch" type="checkbox" />
+            watch clipboard for bitmule links
+          </label>
+          <label class="option-row">
+            <input id="opt-auto-download" type="checkbox" />
+            automatically start downloads from clipboard links
+            <span class="option-hint">(requires clipboard watch)</span>
+          </label>
+        </details>
+      </section>
+
+      <!-- F02: clipboard-detected links queue. Populated by the
+           clipboard watcher when opt-clipboard-watch is on; each row
+           has a "Download" button unless opt-auto-download fired
+           already. -->
+      <section id="fetch-queue" class="fetch-queue" hidden aria-live="polite">
+        <h2 class="section-title">Detected links</h2>
+        <ul id="fetch-queue-list" class="fetch-queue-list"></ul>
+      </section>
+
+      <!-- Global status row (visible in both modes) -->
+      <section id="status" class="status" aria-live="polite">
+        <div class="status-row">
+          <span class="status-label">wasm</span>
+          <span id="wasm-status" class="status-value pending">loading…</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">server</span>
+          <span id="server-status" class="status-value pending">connecting…</span>
+        </div>
+      </section>
+      <!-- On-screen debug log for iOS Safari, which has no accessible
+           dev console without a Mac tether. Toggle via the summary
+           element; last ~60 lines from main.js's `dlog()` land here. -->
+      <section id="debug" class="debug" aria-live="polite">
+        <details>
+          <summary class="debug-summary">Debug log</summary>
+          <pre id="debug-log" class="debug-log"></pre>
+        </details>
+      </section>
+    </main>
+    <script src="./vendor/qrcode.js"></script>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

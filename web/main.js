@@ -626,7 +626,10 @@ function wireSendMode() {
 function wireRecvMode() {
   els.recvCancel.addEventListener("click", () => {
     closeRecvSession();
-    history.replaceState(null, "", "/");
+    // Drop the session fragment, but stay on this document: `/` is the
+    // marketing page, the app is `/app.html`, so rewriting the path to `/`
+    // would put the SPA at a URL a reload serves as something else.
+    history.replaceState(null, "", location.pathname);
     applyRoute();
   });
 }
@@ -781,6 +784,13 @@ function applyRoute() {
     // Landing / send mode
     els.sendMode.hidden = false;
     els.tagline.textContent = "drop files to send";
+    // `#request` is the marketing page's "Ask for files" button: land in the
+    // request panel rather than on the dropzone. Strip it after use so a
+    // reload does not flip modes under someone who has already flipped back.
+    if (location.hash === "#request") {
+      history.replaceState(null, "", location.pathname + location.search);
+      els.requestFilesBtn.click();
+    }
   }
 }
 

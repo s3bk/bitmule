@@ -1,238 +1,242 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>bit mule</title>
-    <link rel="icon" type="image/svg+xml" href="/icons/icon256.webp" />
-    <link rel="stylesheet" href="./style.css" />
-  </head>
-  <body>
-    <main>
-      <header>
-        <a href="/">
-            <img alt="" class="logo" aria-hidden="true" src="/icons/icon_color.webp">
-            <div><h1>bit mule</h1></div>
-        </a>
-        <div>
-            <p id="tagline" class="tagline">drop files to send</p>
-        </div>
-      </header>
+<!DOCTYPE html>
+<html lang="en" data-theme="green">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bit Mule</title>
+<link rel="icon" type="image/svg+xml" href="/icons/icon256.webp" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="bitmule.css">
+</head>
+<body>
+<div class="wrap">
 
-      <!-- SEND MODE — shown when the URL has no hash and path is / -->
-      <div id="send-mode" hidden>
-        <section
-          id="dropzone"
-          class="dropzone"
-          role="button"
-          tabindex="0"
-          aria-label="Drop files here or click to choose"
-        >
-          <div class="dropzone-inner">
-            <div class="dropzone-icon" aria-hidden="true">↓</div>
-            <p class="dropzone-msg">Drop files here</p>
-            <button id="pick-btn" type="button" class="pick-btn">
-              Choose files
-            </button>
-            <input
-              id="file-input"
-              type="file"
-              multiple
-              hidden
-              aria-hidden="true"
-            />
-          </div>
-        </section>
-
-        <div class="mode-flip">
-          <button id="request-files-btn" type="button" class="cancel-btn">
-            Request files instead
-          </button>
-        </div>
-
-        <section id="queue" class="queue" aria-live="polite"></section>
-
-        <section id="session" class="session" hidden aria-live="polite">
-          <h2 class="session-title">Share this link with the receiver</h2>
-          <div class="session-link-row">
-            <input
-              id="session-link"
-              class="session-link"
-              type="text"
-              readonly
-              aria-label="share link"
-            />
-            <button id="copy-link" class="pick-btn" type="button">Copy</button>
-          </div>
-          <div id="session-qr" class="session-qr" aria-hidden="true"></div>
-          <div id="session-state" class="session-state">
-            waiting for receiver…
-          </div>
-          <div class="session-controls">
-            <label class="session-toggle">
-              <input id="stop-after-first" type="checkbox" />
-              stop after first complete download
-            </label>
-            <div id="session-counters" class="session-counters" aria-live="polite">
-              Active: <span id="session-active-count">0</span>
-              &nbsp;·&nbsp;
-              Total: <span id="session-total-count">0</span>
-            </div>
-          </div>
-          <!-- F01: per-peer progress list. One row per receiver
-               currently connected; updated live as chunks flush. -->
-          <ul id="peer-progress-list" class="peer-progress-list" aria-live="polite"></ul>
-          <button id="cancel-session" class="cancel-btn" type="button">
-            Cancel
-          </button>
-        </section>
+  <header>
+    <div>
+      <div class="wordmark">bit<span>Mule</span></div>
+      <div class="tagline">Carries your files. Never reads what it's carrying.</div>
+    </div>
+    <div class="theme-chooser">
+      <div class="label">theme</div>
+      <div class="theme-options" id="theme-options">
+        <button class="theme-btn active" data-theme-btn="green"><span class="swatch sw-green"></span>Green</button>
+        <button class="theme-btn" data-theme-btn="bw"><span class="swatch sw-bw"></span>Black &amp; white</button>
+        <button class="theme-btn" data-theme-btn="beige"><span class="swatch sw-beige"></span>Beige</button>
+        <button class="theme-btn" data-theme-btn="purple"><span class="swatch sw-purple"></span>Purple</button>
       </div>
+    </div>
+  </header>
+  <div class="logo"></div>
 
-      <!-- REQUEST-FILES MODE — I'm the receiver, waiting for a sender to arrive at /send#<my-hex> -->
-      <div id="request-mode" hidden>
-        <section id="request-session" class="session" aria-live="polite">
-          <h2 class="session-title">Send this link to whoever should send you files</h2>
-          <div class="session-link-row">
-            <input
-              id="request-link"
-              class="session-link"
-              type="text"
-              readonly
-              aria-label="request link"
-            />
-            <button id="copy-request-link" class="pick-btn" type="button">Copy</button>
-          </div>
-          <div id="request-qr" class="session-qr" aria-hidden="true"></div>
-          <div id="request-state" class="session-state">
-            waiting for sender to open the link…
-          </div>
-          <div id="request-download" class="recv-download" hidden></div>
-          <button id="request-cancel" class="cancel-btn" type="button">
-            Cancel
-          </button>
-        </section>
+  <!-- HERO: the app itself, one click away. Keep the markup plain: the CSP a
+       page here is served under allows no inline style and no inline script,
+       so everything below is a class in bitmule.css. -->
+  <section class="hero" aria-labelledby="hero-title">
+    <h1 id="hero-title" class="hero-title">Send a file. Get a link.</h1>
+    <p class="hero-lede">
+      Encrypted before it leaves your device, and free when the two machines can
+      talk to each other directly. No account, nothing to install.
+    </p>
+    <div class="cta-row">
+      <a class="cta cta-primary" href="/app.html">Create a share</a>
+      <a class="cta" href="/app.html#request">Ask for files</a>
+      <a class="cta cta-quiet" href="#what">How it works</a>
+    </div>
+    <p class="hero-note">
+      Got a bitMule link? Open it — the key travels in the part of the link a
+      server never sees.
+    </p>
+  </section>
+
+  <!-- WHAT IS IT -->
+  <section class="page-section" id="what">
+    <div class="section-head"><h2>What is it?</h2></div>
+    <p class="lede">
+        <span class="wordmark">bit<span>Mule</span></span> is an end-to-end encrypted file transfer tool. Send something directly, peer-to-peer,
+      for free — or subscribe to hosted uploads and a hosted inbox so you can send and receive without
+      either device staying online. Desktop, CLI, web and mobile all speak the same protocol, and the
+      server is built to never see what's inside your files, encrypted or not.
+    </p>
+  </section>
+
+  <!-- PRIVACY AND SECURITY -->
+  <section class="page-section">
+    <div class="section-head"><h2>Privacy and security</h2></div>
+    <div class="grid cols-2">
+      <div class="block">
+        <div class="block-title">How it's protected</div>
+        <ul>
+          <li>End-to-end encryption in <b>two layers</b> — files are compressed, padded and encrypted before they ever leave your device.</li>
+          <li>The server never sees your key. For direct shares, the decryption key lives in a piece of the link itself that's never sent anywhere.</li>
+          <li>Optional password protection layered on top of the link-based key, for an extra step when you want one.</li>
+          <li>Identifying metadata — EXIF and similar — is stripped automatically before encryption.</li>
+        </ul>
       </div>
-
-      <!-- RECEIVE MODE — shown when the URL hash is a valid 64-hex session -->
-      <div id="receive-mode" hidden>
-        <section id="recv-session" class="session" aria-live="polite">
-          <h2 class="session-title">Connected to sender</h2>
-          <div class="session-state" id="recv-state">connecting…</div>
-          <div id="recv-download" class="recv-download" hidden></div>
-          <div class="status recv-status">
-            <div class="status-row">
-              <span class="status-label">session</span>
-              <span id="recv-session-id" class="status-value pending">–</span>
-            </div>
-            <div class="status-row">
-              <span class="status-label">server</span>
-              <span id="recv-server-status" class="status-value pending">
-                connecting…
-              </span>
-            </div>
-          </div>
-          <button id="recv-cancel" class="cancel-btn" type="button">
-            Close
-          </button>
-        </section>
+      <div class="block">
+        <div class="block-title">What we deliberately don't do</div>
+        <ul>
+          <li>No server-side virus scanning.</li>
+          <li>No link previews or thumbnails.</li>
+          <li>No watermarking.</li>
+          <li>No content-based audit trails.</li>
+          <li>All of these would require seeing inside your files — and by design, we can't.</li>
+        </ul>
       </div>
+    </div>
+  </section>
 
-      <!-- INVITED-SENDER MODE — I'm the sender, receiver waits with pre-generated hex, path is /send + hex hash -->
-      <div id="invited-send-mode" hidden>
-        <section
-          id="invited-dropzone"
-          class="dropzone"
-          role="button"
-          tabindex="0"
-          aria-label="Drop files to send to the requester"
-        >
-          <div class="dropzone-inner">
-            <div class="dropzone-icon" aria-hidden="true">↑</div>
-            <p class="dropzone-msg">
-              Someone is waiting for files.<br />Drop files here to send them.
-            </p>
-            <button id="invited-pick-btn" type="button" class="pick-btn">
-              Choose files
-            </button>
-            <input
-              id="invited-file-input"
-              type="file"
-              multiple
-              hidden
-              aria-hidden="true"
-            />
-          </div>
-        </section>
+  <!-- SUPPORTED PLATFORMS AND PRICES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Supported platforms <span class="section-note-inline">(and prices)</span></h2></div>
+    <table>
+      <tr><td class="name">Desktop app</td><td class="price">free</td><td class="note">open source</td></tr>
+      <tr><td class="name">CLI</td><td class="price">free</td><td class="note">open source, scriptable</td></tr>
+      <tr><td class="name">Web app</td><td class="price">free</td><td class="note">no sign-up for direct (P2P) sharing</td></tr>
+      <tr><td class="name">Android app</td><td class="price">5€</td><td class="note">one-time purchase</td></tr>
+      <tr><td class="name">iOS app</td><td class="price">10€</td><td class="note">one-time purchase</td></tr>
+    </table>
+    <p class="lede lede-small">Pro services (hosted uploads and hosted inbox) work identically across every platform above.</p>
+  </section>
 
-        <section id="invited-queue" class="queue" aria-live="polite"></section>
-
-        <section id="invited-session" class="session" hidden aria-live="polite">
-          <h2 class="session-title">Sending to the requester</h2>
-          <div id="invited-session-state" class="session-state">
-            connecting to receiver…
-          </div>
-          <button id="invited-cancel" class="cancel-btn" type="button">
-            Cancel
-          </button>
-        </section>
+  <!-- FREE FEATURES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Free features</h2></div>
+    <div class="grid cols-2">
+      <div class="block">
+        <div class="block-title">Direct sharing <small>P2P</small></div>
+        <ul>
+          <li>Share files and folders instantly via a link — the recipient's browser or app starts downloading automatically.</li>
+          <li><b>No account</b> needed to send or receive.</li>
+          <li>Works across desktop, CLI and web today.</li>
+        </ul>
       </div>
+      <div class="block">
+        <div class="block-title">Desktop, CLI &amp; web</div>
+        <ul>
+          <li>Full-featured, no paywall — desktop and CLI are open source; the web app needs no install.</li>
+          <li>The web app doesn't do background sync or auto-upload — a browser limitation, not a pricing one.</li>
+          <li>Mobile apps add native convenience (share-sheet, background sync, camera roll, push) for a small one-time fee, but do nothing the web app can't already do.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
 
-      <!-- Options menu (F00). Toggles persist to localStorage;
-           main.js reads them on session start. -->
-      <section id="options" class="options" aria-live="polite">
-        <details>
-          <summary class="options-summary">Options</summary>
-          <label class="option-row">
-            <input id="opt-multi-send" type="checkbox" />
-            multi-send by default (keep the URL live for more receivers)
-          </label>
-          <label class="option-row">
-            <input id="opt-upnp" type="checkbox" />
-            request UPnP port mapping (native only — no-op in browser)
-          </label>
-          <label class="option-row">
-            <input id="opt-clipboard-watch" type="checkbox" />
-            watch clipboard for bitmule links
-          </label>
-          <label class="option-row">
-            <input id="opt-auto-download" type="checkbox" />
-            automatically start downloads from clipboard links
-            <span class="option-hint">(requires clipboard watch)</span>
-          </label>
-        </details>
-      </section>
+  <!-- PAID FEATURES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Paid features</h2></div>
+    <div class="grid cols-3">
+      <div class="block">
+        <div class="block-title">Hosted uploads</div>
+        <ul>
+          <li>Upload once, get a <b>persistent link</b> that works any time — your device doesn't need to stay online.</li>
+          <li>Unique per-recipient links, individually revocable, or a shared link with a download cap.</li>
+          <li>Mix both on the same upload.</li>
+          <li>Default 7-day expiry, adjustable account-wide or per upload.</li>
+          <li>A single-use link is only spent once the download <b>completes</b> successfully.</li>
+        </ul>
+      </div>
+      <div class="block">
+        <div class="block-title">Hosted inbox</div>
+        <ul>
+          <li>Let anyone send you files without your device being online.</li>
+          <li>One-time upload links via app, CLI or <span class="accent2">REST API</span>.</li>
+          <li><b>Standing upload access</b> for regular contacts, with configurable storage and file-count limits.</li>
+          <li>Uploads encrypt directly to your identity; only your private key opens them.</li>
+          <li>Batch links and webhooks for events, classes, vendor lists, or your own automation.</li>
+        </ul>
+      </div>
+      <div class="block">
+        <div class="block-title">Trust &amp; contacts</div>
+        <ul>
+          <li>Add a contact by public key or fingerprint, or import by username with a fingerprint confirmation step.</li>
+          <li>Optional multi-device key sync, or keep a key on one device for maximum control.</li>
+          <li><b>Key rotation</b> is self-signed by the old key — contacts update automatically, in-flight links still resolve.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
 
-      <!-- F02: clipboard-detected links queue. Populated by the
-           clipboard watcher when opt-clipboard-watch is on; each row
-           has a "Download" button unless opt-auto-download fired
-           already. -->
-      <section id="fetch-queue" class="fetch-queue" hidden aria-live="polite">
-        <h2 class="section-title">Detected links</h2>
-        <ul id="fetch-queue-list" class="fetch-queue-list"></ul>
-      </section>
-
-      <!-- Global status row (visible in both modes) -->
-      <section id="status" class="status" aria-live="polite">
-        <div class="status-row">
-          <span class="status-label">wasm</span>
-          <span id="wasm-status" class="status-value pending">loading…</span>
+  <!-- PRICING FOR PAID FEATURES -->
+  <section class="page-section">
+    <div class="section-head"><h2>Pricing for paid features</h2></div>
+    <div class="tiers">
+      <div class="tier">
+        <div class="tier-what">
+          <div class="tier-name">Basic</div>
+          <div class="tier-spec">100GB storage · 500GB bandwidth</div>
         </div>
-        <div class="status-row">
-          <span class="status-label">server</span>
-          <span id="server-status" class="status-value pending">connecting…</span>
+        <div class="tier-price">4€<sub>/mo</sub></div>
+      </div>
+      <div class="tier ext">
+        <div class="tier-what">
+          <div class="tier-name">Extended</div>
+          <div class="tier-spec">500GB storage · 2TB bandwidth</div>
         </div>
-      </section>
-      <!-- On-screen debug log for iOS Safari, which has no accessible
-           dev console without a Mac tether. Toggle via the summary
-           element; last ~60 lines from main.js's `dlog()` land here. -->
-      <section id="debug" class="debug" aria-live="polite">
-        <details>
-          <summary class="debug-summary">Debug log</summary>
-          <pre id="debug-log" class="debug-log"></pre>
-        </details>
-      </section>
-    </main>
-    <script src="./vendor/qrcode.js"></script>
-    <script type="module" src="./main.js"></script>
-  </body>
+        <div class="tier-price">10€<sub>/mo</sub></div>
+      </div>
+    </div>
+    <ul>
+      <li>Identity verification (payment + email, at minimum) is required for both tiers — abuse mitigation, not a trial gate.</li>
+      <li>Billed at Extended but usage stays within Basic's caps for a period → <b>auto-downgraded</b> to the Basic price for that period.</li>
+      <li>Under 20% of your billed tier's caps (peak storage and summed bandwidth) → cancel for a <b>full refund</b> on that period. Trial insurance, not a recurring rebate.</li>
+    </ul>
+    <div class="overage">
+      <span>overage, flat &amp; metered: storage <b>0.006€/GB·mo</b></span>
+      <span>bandwidth <b>0.0025€/GB</b></span>
+      <span>no packs to buy, nothing to roll over</span>
+    </div>
+  </section>
+
+  <!-- CRYPTO DETAILS -->
+  <section class="page-section">
+    <div class="section-head">
+      <h2>Crypto details</h2>
+      <span class="section-note">for those who care — spec v1, reviewed 2026-09-03</span>
+    </div>
+    <div class="cipher-strip">
+      <span><b>AES-256-GCM</b> bulk cipher</span>
+      <span class="dot">/</span>
+      <span><b>X25519</b> ephemeral exchange</span>
+      <span class="dot">/</span>
+      <span><b>forward secrecy</b> by design</span>
+      <span class="dot">/</span>
+      <span>fails closed, never to plaintext</span>
+    </div>
+    <div class="grid cols-3">
+      <div class="block alt">
+        <div class="block-title">Key exchange</div>
+        <ul>
+          <li>Fresh <b>X25519</b> keypair per session; DH secret HKDF-split into independent wrap and meta keys.</li>
+          <li>Ephemeral privates are wiped right after use, so a leaked link later can't reconstruct a past session's key.</li>
+        </ul>
+      </div>
+      <div class="block alt">
+        <div class="block-title">Bulk transfer</div>
+        <ul>
+          <li>Bulk stream key <span class="accent2">B</span> is fresh per file, chunk-indexed nonces, AEAD on every chunk.</li>
+          <li>Missing chunk at close-out → transfer <b>rejected</b>, not silently corrupted.</li>
+        </ul>
+      </div>
+      <div class="block alt">
+        <div class="block-title">Failure mode</div>
+        <ul>
+          <li>No plaintext fallback — a failed key exchange errors the transfer instead of downgrading.<span class="accepted-tag">fail closed</span></li>
+          <li>Optional Ed25519 signature proves sender identity without breaking anonymous sends.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div><span class="wordmark">bit<span>Mule</span></span> — a mule for your bits. It carries the crate; it never asks what's inside.</div>
+    <div>Have a feature request, or found something that doesn't work as described? <a href="#">Tell us</a>.</div>
+  </footer>
+
+</div>
+
+<script src="bitmule.js"></script>
+
+</body>
 </html>

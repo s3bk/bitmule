@@ -82,11 +82,11 @@ pub fn router(state: std::sync::Arc<AppState>) -> axum::Router {
 /// Two hosts are allowed, and only for the marketing page's typefaces: it may
 /// fetch a stylesheet from `fonts.googleapis.com` and the font files it names
 /// from `fonts.gstatic.com`. Neither can run, and `connect-src 'self'` keeps a
-/// page from sending anything anywhere. Every page carries the same policy —
-/// including `/bitmule.html`, which used to be exempt because its CSS and its
-/// theme chooser were inline. They are `bitmule.css` and `bitmule.js` now, so a
-/// marketing page served at `/` (an index.html under a static root) is styled
-/// instead of stripped bare by a policy that blocks inline styles.
+/// page from sending anything anywhere. Every page carries the same policy.
+/// The marketing page used to be exempt, under a name of its own, because its
+/// CSS and its theme chooser were inline; they are `bitmule.css` and
+/// `bitmule.js` now, so it is served as `/` (index.html under a static root)
+/// and styled instead of stripped bare by a policy that blocks inline styles.
 pub fn security_headers(app: axum::Router) -> axum::Router {
     use axum::{extract::Request, http::{HeaderValue, header}, middleware::{self, Next}, response::Response};
 

@@ -24,7 +24,7 @@ async fn pages_carry_the_content_policy() {
 
     // every page, the marketing one included: it used to be the exception, and
     // a policy that blocks inline styles then left the deployed page unstyled
-    for path in ["/", "/index.html", "/bitmule.html"] {
+    for path in ["/", "/index.html", "/app.html"] {
         let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), 200, "{path}");
         let csp = response.headers()["content-security-policy"].to_str().unwrap().to_string();
@@ -51,9 +51,12 @@ async fn pages_carry_the_content_policy() {
 /// has an inline `<script>`, an inline `<style>` or a `style=` attribute. The
 /// content policy enforces it in a browser; this catches it before a release,
 /// because the failure is a page that renders bare rather than one that errors.
+///
+/// `index.html` is the marketing page — the one place a third-party stylesheet
+/// is allowed, and only for its typefaces — and `app.html` is the SPA.
 #[test]
 fn the_pages_carry_no_inline_script_or_style() {
-    for name in ["index.html", "bitmule.html"] {
+    for name in ["index.html", "app.html"] {
         let html = std::fs::read_to_string(web_dir().join(name)).unwrap();
         let mut rest = html.as_str();
         let mut scripts = 0;
@@ -84,7 +87,7 @@ fn the_pages_carry_no_inline_script_or_style() {
                 continue;
             }
             let fonts = tag.contains(FONT_STYLE_HOST) || tag.contains(FONT_FILE_HOST) || tag.contains("//fonts.");
-            assert!(name == "bitmule.html" && fonts, "{name}: external resource <link{tag}>");
+            assert!(name == "index.html" && fonts, "{name}: external resource <link{tag}>");
         }
     }
 }

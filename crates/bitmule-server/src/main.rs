@@ -138,15 +138,16 @@ async fn main() -> anyhow::Result<()> {
     let mut app = bitmule_server::router(state).merge(share_api());
 
     // If --web-dir is set, mount a static-file fallback for everything
-    // else. ServeDir serves index.html for `/` automatically and 404s
-    // for missing paths. Missing-path fallback then routes to
-    // index.html so client-side routes like `/send` resolve to the SPA.
+    // else. ServeDir serves index.html for `/` automatically — that is the
+    // marketing page — and 404s for missing paths. Missing-path fallback then
+    // routes to app.html, the single-page app, so client-side routes like
+    // `/send` resolve to it while `/` stays the page you land on.
     if let Some(dir) = &args.web_dir {
-        let index_path = dir.join("index.html");
-        let index_fallback = ServeFile::new(&index_path);
+        let app_path = dir.join("app.html");
+        let app_fallback = ServeFile::new(&app_path);
         let serve = ServeDir::new(dir)
             .append_index_html_on_directories(true)
-            .not_found_service(index_fallback);
+            .not_found_service(app_fallback);
         app = app.fallback_service(serve);
         info!(web_dir = %dir.display(), "serving static SPA from web-dir");
     }
