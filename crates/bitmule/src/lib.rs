@@ -636,7 +636,7 @@ impl RecvBuilder {
     pub async fn start(self) -> Result<RecvOutcome> {
         let frag = extract_link_fragment(&self.share_url)
             .ok_or_else(|| Error::BadShareUrl(self.share_url.clone()))?;
-        let link = ShareLink::from_b64_url(&frag)
+        let link = ShareLink::from_link(&frag)
             .map_err(|_| Error::BadShareUrl(format!("fragment {frag:?} is not a share link")))?;
 
         // Prefer the server explicitly baked into the share URL (so

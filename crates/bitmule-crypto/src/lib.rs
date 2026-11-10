@@ -34,6 +34,8 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, SharedSecret};
 use zeroize::Zeroize;
 
+pub mod base32link;
+
 /// 32-byte URL-shared secret. Session id is SHA256(A), publicly visible.
 /// A itself is only ever known to the two endpoints.
 #[derive(Clone)]
@@ -201,20 +203,18 @@ impl Drop for ShareKey {
 
 /// URL-fragment payload of a transfer link.
 ///
-/// Current layout: 32-byte `share_key` (URL secret, drives session_id and KEX
-/// MAC), 32-byte `signature` (data commitment = SHA256(data || bulk_key)), and
-/// a 3-byte checksum over those 64 bytes. Base64url without padding: 67 bytes
-/// become 90 characters.
+/// What this tree emits since 2026-11: uppercase base32, `share_key ||
+/// signature` with the kind bits behind them — 103 characters, see
+/// [`base32link`] and [`ShareLink::to_link`].
 ///
-/// Legacy layout, still accepted so old links keep working: `share_key ||
-/// signature` with no checksum, 64 bytes, 86 characters.
+/// What it still parses, so links already in the wild keep working:
 ///
-/// The length alone tells the two apart, so no version byte is needed and all
-/// three spare bytes go to the checksum: a link that was cut short in a chat,
-/// wrapped badly, or has one character changed is now diagnosed at parse time
-/// ("truncated", "checksum mismatch") instead of surfacing later as an opaque
-/// KEX or commitment failure. 24 bits catch a random corruption with
-/// probability 1 - 2^-24.
+/// * Base64url without padding, 90 characters: `share_key` (32), `signature`
+///   (32, the data commitment = SHA256(data || bulk_key)) and a 3-byte
+///   checksum over those 64 bytes.
+/// * The pre-checksum base64url form, 64 bytes, 86 characters.
+///
+/// The length alone tells the formats apart, so no version byte is needed.
 #[derive(Clone)]
 pub struct ShareLink {
     pub share_key: ShareKey,
@@ -309,6 +309,60 @@ impl ShareLink {
         hasher.update(bulk_key.0);
         let computed: [u8; 32] = hasher.finalize().into();
         constant_time_eq(&self.signature, &computed)
+    }
+
+    /// The link this tree emits: uppercase base32, 103 characters, the same
+    /// payload the base64url form carried (`share_key || signature`) in the
+    /// alphabet a QR code can pack two characters to eleven bits.
+    ///
+    /// A link whose signature is all zeros carries no commitment (`recv`
+    /// already treats that as "nothing to check"), so it is emitted as the
+    /// 52-character form rather than pretending to commit to the data.
+    pub fn to_link(&self) -> String {
+        let uncommitted = self.signature == [0u8; 32];
+        let sig: Option<&[u8]> = if uncommitted { None } else { Some(&self.signature) };
+        base32link::encode(base32link::LinkKind::Live, &self.share_key.0, sig)
+            .expect("a 32-byte key with zero or 32 signature bytes is a defined shape")
+    }
+
+    /// Parse a share link in any format this tree has emitted: the base32 form
+    /// (52 characters uncommitted, 103 with the data commitment) and the two
+    /// base64url forms (90 and 86 characters) that predate it.
+    ///
+    /// The 78-character form — key plus a 128-bit commitment, which only the
+    /// browser mints — is refused by name rather than folded into a 32-byte
+    /// commitment with padding, because a padded commitment would silently
+    /// fail verification later.
+    pub fn from_link(s: &str) -> Result<Self> {
+        let cleaned: String = s.chars().filter(|c| !is_link_noise(*c)).collect();
+        let body = cleaned.trim_start_matches('#');
+        let n = body.chars().count();
+        if n == SHARE_LINK_CHARS || n == SHARE_LINK_CHARS_LEGACY {
+            return Self::from_b64_url(body);
+        }
+        let link = base32link::decode(body)?;
+        if link.key.len() != 32 {
+            bail!(
+                "this is an upload invite ({} characters), not a share; open it \
+                 where it was issued",
+                link.chars
+            );
+        }
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&link.key);
+        let mut sig = [0u8; 32];
+        if let Some(got) = &link.signature {
+            if got.len() != 32 {
+                bail!(
+                    "this link carries a {}-bit data commitment; this build checks \
+                     256-bit ones — open it in the browser, or ask the sender for a \
+                     full link",
+                    got.len() * 8
+                );
+            }
+            sig.copy_from_slice(got);
+        }
+        Ok(Self { share_key: ShareKey(sk), signature: sig })
     }
 }
 
@@ -834,6 +888,36 @@ mod tests {
     fn some_link() -> ShareLink {
         let sig = { let mut b = [0u8; 32]; OsRng.fill_bytes(&mut b); b };
         ShareLink::new(ShareKey::random(), sig)
+    }
+
+    #[test]
+    fn share_link_b32_roundtrip() {
+        let link = ShareLink::new(
+            ShareKey([7u8; 32]),
+            [9u8; 32],
+        );
+        let s = link.to_link();
+        assert_eq!(s.chars().count(), 103, "committed links are 103 characters");
+        let back = ShareLink::from_link(&s).unwrap();
+        assert_eq!(back.share_key.0, link.share_key.0);
+        assert_eq!(back.signature, link.signature);
+        // Noise and case are forgiven, on purpose: a link arrives through a chat.
+        assert!(ShareLink::from_link(&format!(" #{}\n", s.to_lowercase())).is_ok());
+        // An uncommitted link is the 52-character form and keeps a zero signature.
+        let bare = ShareLink::new(ShareKey([7u8; 32]), [0u8; 32]).to_link();
+        assert_eq!(bare.chars().count(), 52);
+        assert_eq!(ShareLink::from_link(&bare).unwrap().signature, [0u8; 32]);
+        // The 128-bit form is refused by name, not padded.
+        let b128 = base32link::encode(
+            base32link::LinkKind::Live,
+            &[7u8; 32],
+            Some(&[9u8; 16]),
+        )
+        .unwrap();
+        let err = ShareLink::from_link(&b128).err().expect("128-bit commitment is refused");
+        assert!(err.to_string().contains("128-bit"));        // And the old base64url links still parse through the same door.
+        let old = ShareLink::new(ShareKey([7u8; 32]), [9u8; 32]).to_b64_url();
+        assert_eq!(ShareLink::from_link(&old).unwrap().signature, [9u8; 32]);
     }
 
     #[test]

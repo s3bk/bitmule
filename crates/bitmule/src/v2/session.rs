@@ -334,7 +334,7 @@ pub async fn request(server: &Server, options: Options, on_request: impl FnOnce(
                     _ => {}
                 }
             }
-            Some(text) = found.recv() => match ShareLink::from_b64_url(&text) {
+            Some(text) = found.recv() => match ShareLink::from_link(&text) {
                 Ok(link) => return Ok(link),
                 Err(e) => warn!("sender sent a bad share link: {e}"),
             },
@@ -362,7 +362,7 @@ pub async fn send_to_request(
     tokio::spawn(async move {
         let _rx = rx;
         let Ok(link) = link_rx.await else { return };
-        if tx.send(Peer2Peer::ShareLink(link.to_b64_url())).await.is_err() {
+        if tx.send(Peer2Peer::ShareLink(link.to_link())).await.is_err() {
             return;
         }
         // let the link get through the workers before the connection goes

@@ -367,7 +367,7 @@ where
     let share_url = format!(
         "{}/#{}",
         server.trim_end_matches('/'),
-        link.to_b64_url()
+        link.to_link()
     );
 
     // Dispatch matrix:
@@ -542,7 +542,7 @@ async fn cmd_recv(
         Some(raw) => {
             let frag = extract_link_fragment(&raw)
                 .ok_or_else(|| anyhow!("couldn't extract share fragment from {raw:?}"))?;
-            let link = ShareLink::from_b64_url(&frag)
+            let link = ShareLink::from_link(&frag)
                 .map_err(|e| anyhow!("share fragment {frag:?} is not a share link: {e}"))?;
             (link, parse_server(&extract_server_from_url(&raw).unwrap_or_else(|| server.to_string()))?)
         }

@@ -116,16 +116,29 @@ pub struct ShareLink {
 
 #[wasm_bindgen]
 impl ShareLink {
-    /// Parse the base64url fragment of a share URL.
-    #[wasm_bindgen(js_name = fromB64Url)]
-    pub fn from_b64_url(s: &str) -> Result<ShareLink, JsError> {
-        let link = bx::ShareLink::from_b64_url(s).map_err(js_err)?;
+    /// Parse the fragment of a share URL: the base32 link this tree emits
+    /// (52 or 103 characters) or a base64url link from before 2026-11.
+    #[wasm_bindgen(js_name = fromLink)]
+    pub fn from_link(s: &str) -> Result<ShareLink, JsError> {
+        let link = bx::ShareLink::from_link(s).map_err(js_err)?;
         Ok(ShareLink { key: bx::ShareKey(link.share_key.0), signature: link.signature })
     }
 
+    /// The old name for `fromLink`, kept so existing pages keep working.
+    #[wasm_bindgen(js_name = fromB64Url)]
+    pub fn from_b64_url(s: &str) -> Result<ShareLink, JsError> {
+        Self::from_link(s)
+    }
+
+    #[wasm_bindgen(js_name = toLink)]
+    pub fn to_link(&self) -> String {
+        bx::ShareLink::new(bx::ShareKey(self.key.0), self.signature).to_link()
+    }
+
+    /// The old name for `toLink`.
     #[wasm_bindgen(js_name = toB64Url)]
     pub fn to_b64_url(&self) -> String {
-        bx::ShareLink::new(bx::ShareKey(self.key.0), self.signature).to_b64_url()
+        self.to_link()
     }
 
     #[wasm_bindgen(js_name = shareKeyHex)]
@@ -313,11 +326,17 @@ impl Session {
         transfer.finish().map(|s| s.to_vec()).map_err(js_err)
     }
 
-    /// The share link (base64url fragment) of the transfer.
+    /// The share link (a base32 fragment) of the transfer.
+    #[wasm_bindgen(js_name = link)]
+    pub fn link(&self) -> Result<String, JsError> {
+        let signature = self.signature.ok_or_else(|| JsError::new("no transfer set"))?;
+        Ok(bx::ShareLink::new(bx::ShareKey(self.core.share_key().0), signature).to_link())
+    }
+
+    /// The old name for `link`.
     #[wasm_bindgen(js_name = linkB64)]
     pub fn link_b64(&self) -> Result<String, JsError> {
-        let signature = self.signature.ok_or_else(|| JsError::new("no transfer set"))?;
-        Ok(bx::ShareLink::new(bx::ShareKey(self.core.share_key().0), signature).to_b64_url())
+        self.link()
     }
 
     #[wasm_bindgen(js_name = numBlocks)]

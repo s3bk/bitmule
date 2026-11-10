@@ -99,7 +99,7 @@ impl Server {
 
     /// The URL to hand to a receiver.
     pub fn share_url(&self, link: &ShareLink) -> String {
-        format!("{}/#{}", self.http(""), link.to_b64_url())
+        format!("{}/#{}", self.http(""), link.to_link())
     }
 }
 
