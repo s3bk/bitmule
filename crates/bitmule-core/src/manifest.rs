@@ -1,13 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// Chunk size in bytes. Adaptive at manifest-creation time based on total size.
+/// Chunk size in bytes, adaptive at manifest-creation time: 1 KiB up to 1 MiB,
+/// doubling with the total size and clamped at both ends.
 ///
-/// - `< 100MB`  → 256 KiB
-/// - `< 10GB`   → 1 MiB
-/// - `>= 10GB`  → 4 MiB
-///
-/// When both peers negotiate a LAN-direct ICE candidate pair, chunk size can
-/// be bumped further (see protocol renegotiation).
+/// This is the size the chunk *list* is cut into; it is not the block the
+/// wire seals. A live transfer seals 2 MiB of plaintext per block
+/// (`BLOCK_PLAIN` in bitmule-client-common/src/fountain.rs), and that is the
+/// only block size send.rs and recv.rs accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ChunkSize {
