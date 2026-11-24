@@ -762,10 +762,15 @@ fn copy_to_clipboard(text: &str) -> bool {
 }
 
 /// What goes in the symbol: the printed spelling of the same 32 bytes — 48
-/// base-43 alphanumeric characters instead of 43 base64url ones, which is
-/// what keeps the code at QR version 3 (hosted-uploads spec, "The printed
-/// code"). Falls back to the link itself if the fragment is not a code this
-/// build can print.
+/// base-43 alphanumeric characters instead of 43 base64url ones — inside an
+/// upper-case link, `HTTPS://MUL.LI#…`, so a camera can still open it. The
+/// whole thing is 63 characters and costs 391 bits at QR version 3, ECC L
+/// (440 bits, 49 spare); the bare 48 digits would be 277 bits, so printing
+/// the scheme and host as well costs nothing the symbol cannot pay
+/// (hosted-uploads spec, "The printed code").
+///
+/// Falls back to the link itself if the fragment is not a code this build can
+/// print.
 fn print_text_for(url: &str) -> String {
     use bitmule_client_native::crypto::{code, ShareLink};
     let Some((head, frag)) = url.split_once('#') else { return url.to_string() };

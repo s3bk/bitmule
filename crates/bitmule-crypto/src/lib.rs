@@ -955,6 +955,28 @@ mod tests {
         );
     }
 
+    /// The two links that were in the wild when the code landed — pasted by
+    /// the owner on 2026-11-24, both 52 characters of base32. They must still
+    /// open: the object behind each one is out there, and a decoder that
+    /// only knew the code would strand it.
+    #[test]
+    fn links_in_the_wild_before_the_code_still_open() {
+        for s in [
+            "https://mul.li/#AYGVFINBAYO6U7SYTKYQKNDU76JUSIXYPTCCMA6I2VNC5XD27RTK",
+            "https://mul.li/#F7LU75M3LOFBH4GG7NGQBH6GU33C4JGMRC4XOO6FAXK6WVZCNG3K",
+        ] {
+            let link = ShareLink::from_link(s).expect("a 52-character base32 link opens");
+            assert_eq!(link.signature, [0u8; 32], "no commitment rides in a 52-character link");
+            let frag = s.rsplit_once('#').expect("a fragment").1;
+            let shape = base32link::decode(frag).expect("the base32 shape is intact");
+            assert_eq!(shape.key.len(), 32);
+            assert_eq!(shape.chars, 52);
+            // Encoder and decoder still agree bit for bit: re-encoding the
+            // payload under its own kind gives back the same characters.
+            assert_eq!(base32link::encode(shape.kind, &shape.key, None).unwrap(), frag);
+        }
+    }
+
     /// A key minted before the 32-byte code keeps the base32 spelling it was
     /// sent with, signature and all: three bits cannot be dropped without
     /// naming a different key.

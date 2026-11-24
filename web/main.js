@@ -67,9 +67,12 @@ function isHex64(s) {
   return typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
 }
 
-// The URL fragment is either an 86-char base64url share link (share key and
-// signature, for a receiver) or a 64-char hex request key (`/send#`, for a
-// sender answering a request). Returns null if neither shape matches.
+// The URL fragment is one of the shapes the code has had: 43 text characters
+// or 48 printed (the 32-byte code this build emits), 52/103 base32, 78 base32
+// with a 128-bit commitment, 86/90 base64url from before 2026-11, or a 64-char
+// hex request key (`/send#`, for a sender answering a request). The wasm
+// module picks the format from the length, so the only job here is to refuse
+// what cannot be a link at all and to wait for wasm before judging.
 // Parsing a share link needs the wasm module on this thread; until it is
 // loaded the result is "sharelink-pending" and the route is applied again
 // when it is.
@@ -79,7 +82,7 @@ function parseSessionFragment(rawHash) {
   if (isHex64(h)) {
     return { kind: "hex", sessionHex: h, link: null };
   }
-  if (/^[A-Za-z0-9_\-=]{80,100}$/.test(h)) {
+  if (/^[^\s#]{26,120}$/.test(h)) {
     if (!window.bitmule || !window.bitmule.ShareLink) {
       return { kind: "sharelink-pending", sessionHex: null, link: null };
     }
@@ -191,7 +194,23 @@ function renderQrInto(el, text) {
   }
 }
 
-function renderQr(text) { renderQrInto(els.sessionQr, text); }
+// The symbol carries the 32-byte key, printed: 48 base-43 characters in an
+// upper-case link (`HTTPS://MUL.LI#…`), which is 391 bits at QR version 3,
+// ECC L — 49 bits spare — where the 43-character base64url text form would
+// force byte mode and a larger symbol. It still scans to a URL, so a phone
+// camera opens it. Falls back to the text as given when it cannot be printed
+// (wasm not loaded yet, or an old key whose top bits cannot be dropped).
+function qrTextFor(text) {
+  try {
+    const digits = window.bitmule.ShareLink.fromB64Url(text).printLink();
+    const host = new URL(text, serverHttpBase(CONFIG.server)).host.toUpperCase();
+    return `HTTPS://${host}#${digits}`;
+  } catch (e) {
+    return text;
+  }
+}
+
+function renderQr(text) { renderQrInto(els.sessionQr, qrTextFor(text)); }
 
 // On-screen debug log for iOS Safari, which has no accessible console
 // without a Mac tether. Keeps the last N lines in a <pre> the user can

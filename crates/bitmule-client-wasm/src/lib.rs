@@ -142,6 +142,14 @@ impl ShareLink {
         self.to_link()
     }
 
+    /// The printed spelling of the same 32 bytes: 48 base-43 characters, what
+    /// a QR symbol carries (version 3 at ECC L). No scheme and no host — the
+    /// page shows the URL beside the symbol.
+    #[wasm_bindgen(js_name = printLink)]
+    pub fn print_link(&self) -> Result<String, JsError> {
+        bx::code::encode_print(bx::code::Kind::Live, &self.key.0).map_err(js_err)
+    }
+
     #[wasm_bindgen(js_name = shareKeyHex)]
     pub fn share_key_hex(&self) -> String {
         self.key.to_hex()
