@@ -764,26 +764,12 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// What goes in the symbol: the printed spelling of the same 32 bytes — 48
 /// base-43 alphanumeric characters instead of 44 base64url ones — inside an
 /// upper-case link, `HTTPS://MUL.LI#…`, so a camera can still open it. The
-/// whole thing is 63 characters, but `#` is not in the alphanumeric set, so
-/// it is three segments and not one: `HTTPS://MUL.LI` is 7 pairs (77 bits +
-/// 4+9 header = 90), `#` is one byte-mode character (8 + 4+8 = 20), the 48
-/// digits are 24 pairs (264 + 4+9 = 277), plus a 4-bit terminator — 391 of
-/// the 440 bits QR version 3 at ECC L carries, so 49 bits are spare (8 more
-/// characters, the format holding 77). The bare 48 digits are 277 bits: the
-/// scheme and host cost 114 more, which still fits (hosted-uploads spec,
-/// "The printed code").
+/// three segments cost 391 of the 440 bits QR version 3 at ECC L carries
+/// (`code::print_url_for` has the arithmetic and the 56-digit cap).
 ///
-/// Falls back to the link itself if the fragment is not a code this build can
-/// print.
+/// Falls back to the link itself if it is not a code this build can print.
 fn print_text_for(url: &str) -> String {
-    use bitmule_client_native::crypto::{code, ShareLink};
-    let Some((head, frag)) = url.split_once('#') else { return url.to_string() };
-    let Ok(link) = ShareLink::from_link(frag) else { return url.to_string() };
-    let host = head
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    code::print_url(host, code::Kind::Live, &link.share_key.0).unwrap_or_else(|_| url.to_string())
+    bitmule_client_native::crypto::code::print_url_for(url)
 }
 
 /// Render `text` as a QR bitmap and encode it as a

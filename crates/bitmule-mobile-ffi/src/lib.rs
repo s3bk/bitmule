@@ -325,10 +325,19 @@ async fn send_file_inner(
     Ok(SendOutcome { share_url, session_hex, peers_served: 1 })
 }
 
+/// A QR symbol for a link, as PNG. A share link is drawn in its printed form —
+/// 48 alphanumeric characters instead of 44 base64url ones — with ECC L, which
+/// is what keeps a live link at version 3 (29×29): three segments, 391 of the
+/// 440 bits the symbol holds. Any other text is encoded as given, so callers
+/// that pass something else keep the old behaviour.
 pub fn qr_png_bytes(text: String, pixel_scale: u32) -> Result<Vec<u8>, BitmuleError> {
     let scale = pixel_scale.max(1).min(32);
-    let code = qrcode::QrCode::new(text.as_bytes())
-        .map_err(|e| BitmuleError::Unknown { reason: format!("qr encode: {e}") })?;
+    let printed = bitmule_client_native::crypto::code::print_url_for(&text);
+    let code = qrcode::QrCode::with_error_correction_level(
+        printed.as_bytes(),
+        qrcode::EcLevel::L,
+    )
+    .map_err(|e| BitmuleError::Unknown { reason: format!("qr encode: {e}") })?;
     let image = code
         .render::<image::Luma<u8>>()
         .module_dimensions(scale, scale)

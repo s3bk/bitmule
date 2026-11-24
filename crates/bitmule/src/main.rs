@@ -491,8 +491,16 @@ async fn cmd_send_stdin(server: &str, name: String, mode: TransportMode) -> Resu
 fn print_link(server: &v2::Server, link: &ShareLink) {
     let url = server.share_url(link);
     println!("share:   {url}");
-    if let Ok(qr) = QrCode::new(url.as_bytes()) {
-        println!("{}", qr.render::<unicode::Dense1x2>().build());
+    // The symbol carries the printed form of the same link — 48 alphanumeric
+    // characters instead of 44 base64url ones. Three segments (`HTTPS://HOST`,
+    // `#` as one byte, the digits) come to 391 of the 440 bits a version 3
+    // symbol at ECC L holds; the text form is byte mode throughout and needs
+    // a bigger symbol for the same key.
+    let printed = bitmule_client_native::crypto::code::print_url_for(&url);
+    println!("print:   {printed}");
+    match QrCode::with_error_correction_level(printed.as_bytes(), qrcode::EcLevel::L) {
+        Ok(qr) => println!("{}", qr.render::<unicode::Dense1x2>().build()),
+        Err(e) => eprintln!("qr: {e}"),
     }
     println!("waiting for a receiver…");
 }

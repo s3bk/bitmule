@@ -284,6 +284,39 @@ pub fn print_url(host: &str, kind: Kind, key: &[u8; 32]) -> Result<String> {
     ))
 }
 
+/// What a client puts in the symbol for a link it already holds:
+/// `https://host/#<text code>` becomes `HTTPS://HOST#<printed code>`, the kind
+/// carried over from the link.
+///
+/// This is the one place a surface turns a link into symbol content, so every
+/// client draws the same symbol: 63 characters in three QR segments — host 14
+/// alphanumeric, `#` one byte, code 48 alphanumeric — 391 of the 440 bits a
+/// version 3 symbol at ECC L holds. The text form would be byte mode
+/// throughout (59 bytes, 484 bits) and need a version 4 symbol.
+///
+/// Anything that is not a code comes back unchanged, so a caller can pass its
+/// URL through without checking first. Already-printed input comes back as it
+/// is (the printed form is canonical).
+pub fn print_url_for(url: &str) -> String {
+    let Some((head, frag)) = url.split_once('#') else { return url.to_string() };
+    let (kind, key) = match decode(frag) {
+        Ok(c) => (c.kind, c.key),
+        // The spellings from before the code: a base32 or long base64url
+        // link is a live share and prints as one.
+        Err(_) => match crate::ShareLink::from_link(frag) {
+            Ok(l) => (Kind::Live, l.share_key.0),
+            Err(_) => return url.to_string(),
+        },
+    };
+    let host = head
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("HTTPS://")
+        .trim_start_matches("HTTP://")
+        .trim_end_matches('/');
+    print_url(host, kind, &key).unwrap_or_else(|_| url.to_string())
+}
+
 /// Whitespace and zero-width characters, which chat clients, terminal
 /// wrapping and copy buttons add, plus a leading `#` from a pasted fragment.
 fn clean(s: &str) -> String {
@@ -528,6 +561,43 @@ mod tests {
         assert!(alnum_bits(&ceiling) <= 440);
         let too_many: String = std::iter::repeat('A').take(78).collect();
         assert!(alnum_bits(&too_many) > 440);
+    }
+
+    /// What every client draws: the printed form of the link it holds, with
+    /// the kind carried over. Also pins the cap at version 3, ECC L, for the
+    /// fragment form — `HTTPS://HOST` is 90 bits, `#` 20, the code's own
+    /// header 13, the terminator 4, so 127 bits go before the first digit and
+    /// 313 are left: 56 digits fit (308), 57 do not (314).
+    #[test]
+    fn a_link_prints_as_the_symbols_content() {
+        let k = key(21);
+        let text = format!("https://mul.li/#{}", encode(Kind::Live, &k).unwrap());
+        let printed = print_url_for(&text);
+        assert_eq!(printed, print_url("mul.li", Kind::Live, &k).unwrap());
+        assert_eq!(crate::ShareLink::from_link(&printed).unwrap().share_key.0, k);
+        assert_eq!(print_url_for(&printed), printed, "printing is idempotent");
+
+        // The kind rides through: a hosted link prints as hosted.
+        let hosted = format!("https://mul.li/#{}", encode(Kind::Hosted, &k).unwrap());
+        let digits = print_url_for(&hosted);
+        let digits = digits.strip_prefix("HTTPS://MUL.LI#").unwrap();
+        assert_eq!(decode_print(digits).unwrap().kind, Kind::Hosted);
+
+        // Host case and the trailing slash before `#` do not matter.
+        let http = format!("HTTP://Mul.Li/#{}", encode(Kind::Live, &k).unwrap());
+        assert_eq!(print_url_for(&http), printed);
+
+        // 48 of the 56 digits the symbol has room for.
+        let digits = printed.rsplit_once('#').unwrap().1;
+        assert_eq!(symbol_bits("mul.li", digits), 391);
+        let cap: String = std::iter::repeat('A').take(56).collect();
+        assert!(symbol_bits("mul.li", &cap) <= 440, "56 digits still fit");
+        let over: String = std::iter::repeat('A').take(57).collect();
+        assert!(symbol_bits("mul.li", &over) > 440, "57 digits do not fit");
+
+        // Junk passes through untouched, so a caller need not check first.
+        assert_eq!(print_url_for("https://mul.li/#nope"), "https://mul.li/#nope");
+        assert_eq!(print_url_for("https://mul.li/"), "https://mul.li/");
     }
 
     impl Kind {

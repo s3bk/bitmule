@@ -114,6 +114,15 @@ pub struct ShareLink {
     signature: [u8; 32],
 }
 
+/// The printed form of a link, for the symbol: `https://host/#<text code>`
+/// becomes `HTTPS://HOST#<48 digits>`, the kind carried over — three QR
+/// segments, 391 of the 440 bits a version 3 symbol at ECC L holds. Text that
+/// is not a link comes back unchanged (`crypto::code::print_url_for`).
+#[wasm_bindgen(js_name = printUrl)]
+pub fn print_url(url: &str) -> String {
+    bx::code::print_url_for(url)
+}
+
 #[wasm_bindgen]
 impl ShareLink {
     /// Parse the fragment of a share URL: the 32-byte code this tree emits

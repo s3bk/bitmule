@@ -217,19 +217,20 @@ function renderQrInto(el, text) {
   }
 }
 
-// The symbol carries the 32-byte key, printed: 48 base-43 characters in an
-// upper-case link (`HTTPS://MUL.LI#…`). `#` is not in the alphanumeric set,
-// so that is three segments — 14 chars (90 bits), `#` in byte mode (20), 48
-// digits (277) — plus a 4-bit terminator: 391 of the 440 bits QR version 3 at
-// ECC L carries, 49 bits spare, 8 characters of headroom — where the
-// 44-character base64url text form would force byte mode and a larger symbol.
-// It still scans to a URL, so a phone camera opens it. Falls back to the text
-// as given when it cannot be printed (wasm not loaded yet).
+// The symbol carries the link in its printed form: 48 base-43 characters in
+// an upper-case URL (`HTTPS://MUL.LI#…`) instead of the 44 base64url ones a
+// copied link holds. `#` is not in the alphanumeric set, so it is three
+// segments — host 14 chars (90 bits), `#` in byte mode (20), 48 digits (277)
+// — plus a 4-bit terminator: 391 of the 440 bits QR version 3 at ECC L
+// carries, 49 spare, 8 characters of headroom; the text form would be byte
+// mode throughout (484 bits) and need version 4. `printUrl` in the wasm
+// module is the helper every surface draws from (`code::print_url_for`),
+// and it returns anything that is not a link unchanged. Falls back to the
+// text as given when wasm is not loaded yet.
 function qrTextFor(text) {
   try {
-    const digits = window.bitmule.ShareLink.fromB64Url(text).printLink();
-    const host = new URL(text, serverHttpBase(CONFIG.server)).host.toUpperCase();
-    return `HTTPS://${host}#${digits}`;
+    const abs = new URL(text, serverHttpBase(CONFIG.server)).href;
+    return window.bitmule.printUrl(abs);
   } catch (e) {
     return text;
   }
