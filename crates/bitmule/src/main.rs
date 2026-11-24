@@ -225,6 +225,16 @@ async fn main() -> Result<()> {
         Command::Add { first, pubkey } => contact_add(first, pubkey).await,
         Command::Version => {
             println!("bitmule {}", env!("CARGO_PKG_VERSION"));
+            // What the bundle brought with it. A sender needs the encoder to
+            // convert video and the linearizer to put page 1 first; saying so
+            // here beats failing at share time.
+            let loc = bitmule_client_common::sidecar::Locator::from_env();
+            for (tool, path) in loc.report() {
+                match path {
+                    Some(p) => println!("{}: {}", tool.file_name(), p.display()),
+                    None => println!("{}: missing ({})", tool.file_name(), tool.role()),
+                }
+            }
             Ok(())
         }
     }

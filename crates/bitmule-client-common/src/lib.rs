@@ -6,6 +6,9 @@ pub mod transfer;
 pub mod fountain;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod blockio;
+/// Where the bundled helper programs (ffmpeg, the PDF linearizer) are found.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sidecar;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 pub mod fs;
