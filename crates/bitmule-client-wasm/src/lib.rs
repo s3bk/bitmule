@@ -117,7 +117,7 @@ pub struct ShareLink {
 #[wasm_bindgen]
 impl ShareLink {
     /// Parse the fragment of a share URL: the 32-byte code this tree emits
-    /// (43 characters as text, 48 printed) or any older spelling — base32
+    /// (44 characters as text, 48 printed) or any older spelling — base32
     /// from 2026-11-10, base64url from before it.
     #[wasm_bindgen(js_name = fromLink)]
     pub fn from_link(s: &str) -> Result<ShareLink, JsError> {

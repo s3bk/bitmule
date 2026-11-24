@@ -222,10 +222,9 @@ function renderQrInto(el, text) {
 // so that is three segments — 14 chars (90 bits), `#` in byte mode (20), 48
 // digits (277) — plus a 4-bit terminator: 391 of the 440 bits QR version 3 at
 // ECC L carries, 49 bits spare, 8 characters of headroom — where the
-// 43-character base64url text form would force byte mode and a larger symbol.
+// 44-character base64url text form would force byte mode and a larger symbol.
 // It still scans to a URL, so a phone camera opens it. Falls back to the text
-// as given when it cannot be printed (wasm not loaded yet, or an old key whose
-// top bits cannot be dropped).
+// as given when it cannot be printed (wasm not loaded yet).
 function qrTextFor(text) {
   try {
     const digits = window.bitmule.ShareLink.fromB64Url(text).printLink();

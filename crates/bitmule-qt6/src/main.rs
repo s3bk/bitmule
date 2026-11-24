@@ -624,7 +624,7 @@ fn split_share_url(url: &str) -> Option<(String, String)> {
 }
 
 fn parse_fragment(fragment: &str) -> Option<bitmule_client_native::crypto::ShareLink> {
-    // Every spelling the tree has emitted: the 32-byte code (43 characters),
+    // Every spelling the tree has emitted: the 32-byte code (44 characters),
     // its printed form (48), the base32 forms of 2026-11-10 and the base64url
     // links from before them. `from_link` tells them apart by length.
     bitmule_client_native::crypto::ShareLink::from_link(fragment).ok()
@@ -762,7 +762,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 }
 
 /// What goes in the symbol: the printed spelling of the same 32 bytes — 48
-/// base-43 alphanumeric characters instead of 43 base64url ones — inside an
+/// base-43 alphanumeric characters instead of 44 base64url ones — inside an
 /// upper-case link, `HTTPS://MUL.LI#…`, so a camera can still open it. The
 /// whole thing is 63 characters, but `#` is not in the alphanumeric set, so
 /// it is three segments and not one: `HTTPS://MUL.LI` is 7 pairs (77 bits +
