@@ -209,7 +209,8 @@ impl UploaderApi {
         qmetaobject::future::execute_async(async move {
             let url = share(paths).await;
             let url_str = url.to_string();
-            let qr = qr_data_url_for(&url_str);
+            // The symbol carries the printed spelling of the same 32 bytes.
+            let qr = qr_data_url_for(&print_text_for(&url_str));
             // Register the URL as own-upload so the clipboard watcher
             // ignores it if the user copies it and it comes back
             // through the poll.
@@ -623,7 +624,10 @@ fn split_share_url(url: &str) -> Option<(String, String)> {
 }
 
 fn parse_fragment(fragment: &str) -> Option<bitmule_client_native::crypto::ShareLink> {
-    bitmule_client_native::crypto::ShareLink::from_b64_url(fragment).ok()
+    // Every spelling the tree has emitted: the 32-byte code (43 characters),
+    // its printed form (48), the base32 forms of 2026-11-10 and the base64url
+    // links from before them. `from_link` tells them apart by length.
+    bitmule_client_native::crypto::ShareLink::from_link(fragment).ok()
 }
 
 /// Unpack `zip_path` (stored, deflated or zstd entries, holding at most
@@ -757,6 +761,22 @@ fn copy_to_clipboard(text: &str) -> bool {
     true
 }
 
+/// What goes in the symbol: the printed spelling of the same 32 bytes — 48
+/// base-43 alphanumeric characters instead of 43 base64url ones, which is
+/// what keeps the code at QR version 3 (hosted-uploads spec, "The printed
+/// code"). Falls back to the link itself if the fragment is not a code this
+/// build can print.
+fn print_text_for(url: &str) -> String {
+    use bitmule_client_native::crypto::{code, ShareLink};
+    let Some((head, frag)) = url.split_once('#') else { return url.to_string() };
+    let Ok(link) = ShareLink::from_link(frag) else { return url.to_string() };
+    let host = head
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    code::print_url(host, code::Kind::Live, &link.share_key.0).unwrap_or_else(|_| url.to_string())
+}
+
 /// Render `text` as a QR bitmap and encode it as a
 /// `data:image/png;base64,...` URL suitable for direct binding on a
 /// QML `Image.source`. PNG over SVG: smaller wire (~1–3KB vs
@@ -771,7 +791,11 @@ fn qr_data_url_for(text: &str) -> String {
     use qrcode::QrCode;
 
     if text.is_empty() { return String::new(); }
-    let code = match QrCode::new(text.as_bytes()) {
+    // ECC L is the owner's default for the printed code (2026-11-24): 7%
+    // recovery still scans a clean flat surface, and it is what lets the 63
+    // character URL fit version 3 (29×29) instead of version 4. Surfaces that
+    // need more tolerance get version 4 at M, a render-time choice.
+    let code = match QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("qr generation failed: {e}");

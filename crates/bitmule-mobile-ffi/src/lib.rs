@@ -180,7 +180,7 @@ async fn recv_file_inner(
     on_progress: Arc<dyn ProgressListener>,
 ) -> Result<RecvOutcome, BitmuleError> {
     let parsed = parse_share_url(url)?;
-    let link = ShareLink::from_b64_url(&parsed.fragment)
+    let link = ShareLink::from_link(&parsed.fragment)
         .map_err(|e| BitmuleError::InvalidFragment { reason: format!("{e:#}") })?;
     // a share link can name any server: not one without TLS
     let server = Server::parse_checked(&parsed.server, false).map_err(|e| BitmuleError::InvalidUrl { reason: format!("{e:#}") })?;
