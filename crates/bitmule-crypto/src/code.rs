@@ -446,6 +446,30 @@ mod tests {
         assert!(!u.chars().any(|c| c.is_ascii_lowercase()));
     }
 
+    /// The symbol is QR version 3 at ECC L: 55 data codewords, 440 bits. In
+    /// alphanumeric mode a character costs 6 bits or 11 for a pair, on top of
+    /// a 4-bit mode indicator and a 9-bit count (versions 1–9).
+    fn alnum_bits(s: &str) -> usize {
+        let n = s.chars().count();
+        4 + 9 + 11 * (n / 2) + 6 * (n % 2)
+    }
+
+    #[test]
+    fn print_url_fits_qr_v3_l() {
+        let u = print_url("mul.li", Kind::Hosted, &key(11)).unwrap();
+        assert_eq!(u.chars().count(), 63);
+        assert_eq!(alnum_bits(&u), 360);
+        assert!(alnum_bits(&u) <= 440, "v3-L carries 440 bits");
+        // The bare digits would be 277 bits; the scheme and host cost 83 more.
+        let bare = encode_print(Kind::Hosted, &key(11)).unwrap();
+        assert_eq!(alnum_bits(&bare), 277);
+        // 80 bits spare is 14 characters of headroom: the format holds 77.
+        let ceiling: String = std::iter::repeat('A').take(77).collect();
+        assert!(alnum_bits(&ceiling) <= 440);
+        let too_many: String = std::iter::repeat('A').take(78).collect();
+        assert!(alnum_bits(&too_many) > 440);
+    }
+
     impl Kind {
         fn iter() -> [Kind; 3] {
             [Kind::Live, Kind::Hosted, Kind::Invite]

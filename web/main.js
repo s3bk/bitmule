@@ -195,9 +195,10 @@ function renderQrInto(el, text) {
 }
 
 // The symbol carries the 32-byte key, printed: 48 base-43 characters in an
-// upper-case link (`HTTPS://MUL.LI#…`), which is 391 bits at QR version 3,
-// ECC L — 49 bits spare — where the 43-character base64url text form would
-// force byte mode and a larger symbol. It still scans to a URL, so a phone
+// upper-case link (`HTTPS://MUL.LI#…`). 63 characters is 347 bits, +13 of
+// header = 360 of the 440 bits QR version 3 at ECC L carries: 80 bits spare,
+// 14 characters of headroom — where the 43-character base64url text form
+// would force byte mode and a larger symbol. It still scans to a URL, so a phone
 // camera opens it. Falls back to the text as given when it cannot be printed
 // (wasm not loaded yet, or an old key whose top bits cannot be dropped).
 function qrTextFor(text) {
