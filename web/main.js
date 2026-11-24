@@ -174,6 +174,29 @@ const els = {
 
 // ---- QR ----------------------------------------------------------------
 
+// QR's alphanumeric mode: digits, upper case and these seven marks. `#` is
+// not in it, which is why the printed link is three segments.
+const QR_ALNUM = /^[0-9A-Z $%*+\-./:]+$/;
+
+// Hand the generator the segments the cost estimate assumes. `addData` with
+// no mode means byte mode, and 63 bytes would be 516 bits — a 33-module
+// symbol. Segmented, scheme+host and the 48 digits are alphanumeric (90 +
+// 277 bits), `#` is one byte (20) and the terminator 4: 391 bits, 29 modules.
+function addQrData(qr, text) {
+  const hash = text.indexOf("#");
+  if (
+    hash > 0 &&
+    QR_ALNUM.test(text.slice(0, hash)) &&
+    QR_ALNUM.test(text.slice(hash + 1))
+  ) {
+    qr.addData(text.slice(0, hash), "Alphanumeric");
+    qr.addData("#", "Byte");
+    qr.addData(text.slice(hash + 1), "Alphanumeric");
+    return;
+  }
+  qr.addData(text, QR_ALNUM.test(text) ? "Alphanumeric" : "Byte");
+}
+
 function renderQrInto(el, text) {
   if (typeof window.qrcode !== "function") {
     el.textContent = "";
@@ -181,7 +204,7 @@ function renderQrInto(el, text) {
   }
   try {
     const qr = window.qrcode(0, "L");
-    qr.addData(text);
+    addQrData(qr, text);
     qr.make();
     el.innerHTML = qr.createSvgTag({
       cellSize: 5,
@@ -195,12 +218,14 @@ function renderQrInto(el, text) {
 }
 
 // The symbol carries the 32-byte key, printed: 48 base-43 characters in an
-// upper-case link (`HTTPS://MUL.LI#…`). 63 characters is 347 bits, +13 of
-// header = 360 of the 440 bits QR version 3 at ECC L carries: 80 bits spare,
-// 14 characters of headroom — where the 43-character base64url text form
-// would force byte mode and a larger symbol. It still scans to a URL, so a phone
-// camera opens it. Falls back to the text as given when it cannot be printed
-// (wasm not loaded yet, or an old key whose top bits cannot be dropped).
+// upper-case link (`HTTPS://MUL.LI#…`). `#` is not in the alphanumeric set,
+// so that is three segments — 14 chars (90 bits), `#` in byte mode (20), 48
+// digits (277) — plus a 4-bit terminator: 391 of the 440 bits QR version 3 at
+// ECC L carries, 49 bits spare, 8 characters of headroom — where the
+// 43-character base64url text form would force byte mode and a larger symbol.
+// It still scans to a URL, so a phone camera opens it. Falls back to the text
+// as given when it cannot be printed (wasm not loaded yet, or an old key whose
+// top bits cannot be dropped).
 function qrTextFor(text) {
   try {
     const digits = window.bitmule.ShareLink.fromB64Url(text).printLink();

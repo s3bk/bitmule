@@ -764,12 +764,14 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// What goes in the symbol: the printed spelling of the same 32 bytes — 48
 /// base-43 alphanumeric characters instead of 43 base64url ones — inside an
 /// upper-case link, `HTTPS://MUL.LI#…`, so a camera can still open it. The
-/// whole thing is 63 characters — 31 alphanumeric pairs plus one odd one,
-/// 347 bits — and with the 4-bit mode indicator and 9-bit count that is 360
-/// of the 440 bits QR version 3 at ECC L carries, so 80 bits are spare (14
-/// more characters, the format holding 77). The bare 48 digits are 277 bits:
-/// the scheme and host of a 6-character host cost 83 more, which still fits
-/// (hosted-uploads spec, "The printed code").
+/// whole thing is 63 characters, but `#` is not in the alphanumeric set, so
+/// it is three segments and not one: `HTTPS://MUL.LI` is 7 pairs (77 bits +
+/// 4+9 header = 90), `#` is one byte-mode character (8 + 4+8 = 20), the 48
+/// digits are 24 pairs (264 + 4+9 = 277), plus a 4-bit terminator — 391 of
+/// the 440 bits QR version 3 at ECC L carries, so 49 bits are spare (8 more
+/// characters, the format holding 77). The bare 48 digits are 277 bits: the
+/// scheme and host cost 114 more, which still fits (hosted-uploads spec,
+/// "The printed code").
 ///
 /// Falls back to the link itself if the fragment is not a code this build can
 /// print.
