@@ -22,6 +22,7 @@
 //   {type: "dcOpen" | "dcClosed", peer}
 //   {type: "dcMessage", peer, data}         one data channel message (ArrayBuffer)
 //   {type: "dcDrained", peer, bytes}        bytes the page has handed to the channel so far
+//   {type: "netPolicy", mode, metered, consented}  the link changed, or the user pressed
 // worker -> page:
 //   {type: "hello", job, id}    on connect: what this worker is holding, if anything
 //   {type: "state", text}   {type: "link", link}   {type: "requestKey", key}
@@ -29,9 +30,11 @@
 //   {type: "progress", bytes, total, via}
 //   {type: "rtcStart", peer, role}   {type: "rtcSignal", peer, message}   {type: "rtcClose", peer}
 //   {type: "dcSend", peer, data}
+//   {type: "uploadGate", reason, bytes, mode}   an upload that may not start yet
 //   {type: "done", ...}   {type: "error", message}
 
 import { Journal, Spool, Store, RECV_PREFIX } from "./opfs.js";
+import { decide, normalizeMode } from "./netpolicy.js";
 
 // Loaded once, lazily: a worker that only has a journal to hand back does not
 // need the protocol, and a build without the wasm bundle still starts instead
@@ -238,6 +241,13 @@ class Sender {
     this.relayStarted = false;
     this.cancelled = false;
     this.finished = false;
+    // Mobile data: the page owns the setting and watches the link, and tells us
+    // what it sees (netpolicy.js). The upload is what the rule governs, so the
+    // copy lives here — an upload that may not start is not started, not
+    // started and then stopped.
+    this.net = { mode: normalizeMode(opts.mode), metered: !!opts.metered, consented: false };
+    this.relayWanted = false;
+    this.relayKind = null;
   }
 
   async run() {
@@ -437,7 +447,82 @@ class Sender {
     this.link.sendPeer(id, { type: "Checksum", checksum: this.checksum });
   }
 
+  // -- mobile data ----------------------------------------------------------
+  //
+  // An upload does not start on a metered link by itself. The page watches
+  // `navigator.connection` and sends `netPolicy` when the link changes or the
+  // user presses; consent does not survive a change of link, because the bytes
+  // it was about have been spent by then and the next ones are a new amount.
+
+  /// "start", "ask" or "hold" — what an upload may do now (see netpolicy.js).
+  uploadDecision() {
+    return decide({
+      network: this.net.metered ? "cellular" : "wifi",
+      mode: this.net.mode,
+      consented: this.net.consented,
+    });
+  }
+
+  /// The door both relay paths go through: a receiver is waiting, so remember
+  /// that an upload is wanted, and say why instead of starting it when the link
+  /// is metered and nothing has been pressed.
+  allowUpload(kind) {
+    this.relayWanted = true;
+    this.relayKind = this.relayKind || kind;
+    const answer = this.uploadDecision();
+    if (answer === "start") return true;
+    this.holdUpload(answer);
+    return false;
+  }
+
+  holdUpload(reason) {
+    post({ type: "uploadGate", reason, bytes: this.size || 0, mode: this.net.mode });
+    state(reason === "hold"
+      ? "waiting for Wi-Fi — this device does not upload over mobile data"
+      : "waiting to start — this upload would use mobile data");
+  }
+
+  /// The link changed, or the user pressed: carry on, wait, or stop.
+  onNetPolicy(m) {
+    this.net = { mode: normalizeMode(m.mode), metered: !!m.metered, consented: m.consented === true };
+    if (this.finished) return;
+    if (!this.relayWanted) return; // no receiver is waiting for an upload yet
+    const answer = this.uploadDecision();
+    if (answer === "start") this.resumeUpload();
+    else this.pauseUpload(answer);
+  }
+
+  pauseUpload(reason) {
+    if (!this.relayStarted) { this.holdUpload(reason); return; }
+    this.stopRelay();
+    this.relayStarted = false;
+    // A live source cannot be read a second time: the page's stream for pass 0
+    // is gone, so this upload ends here rather than waiting for a press that
+    // could not resume it. The link stays up; a new receiver starts afresh.
+    if (this.streaming && !this.canRestartUpload()) {
+      this.relayWanted = false;
+      post({ type: "uploadGate", reason: "stopped", bytes: this.size || 0, mode: this.net.mode });
+      state("stopped — a live transfer cannot be picked up again on mobile data");
+      return;
+    }
+    this.holdUpload(reason);
+  }
+
+  resumeUpload() {
+    if (this.relayStarted || this.finished) return;
+    if (this.relayKind === "stream") this.startStreamRelay();
+    else this.startRelay();
+  }
+
+  /// Whether an upload that was stopped mid-pass can be run again from the top:
+  /// a blob can always be read again, and a page can give a restartable source a
+  /// new stream; a one-shot stream cannot.
+  canRestartUpload() {
+    return !!(this.opts.blob || this.opts.restartable);
+  }
+
   startStreamRelay() {
+    if (!this.allowUpload("stream")) return;
     if (this.relayStarted) return;
     this.relayStarted = true;
     this.relayAbort = new AbortController();
@@ -547,6 +632,7 @@ class Sender {
   // -- relay: one upload for all receivers, pass after pass until stopped --
 
   startRelay() {
+    if (!this.allowUpload("relay")) return;
     if (this.relayStarted) return;
     this.relayStarted = true;
     this.relayAbort = new AbortController();
@@ -1270,6 +1356,8 @@ async function onPage(m) {
       await resume(m);
     } else if (m.type === "cancel") {
       if (job) job.cancel();
+    } else if (m.type === "netPolicy") {
+      if (job && job.onNetPolicy) job.onNetPolicy(m);
     } else if (job) {
       job.onRtc(m);
     }

@@ -63,6 +63,9 @@ stays responsive; the page only does the UI and WebRTC.
   flush rather than the whole record).
 - `v2.js` — starts a job, owns the `RTCPeerConnection`s, passes data channel
   messages to and from the worker.
+- `netpolicy.js` — who may use mobile data for an upload: the page reads
+  `navigator.connection` and the stored setting, the worker asks for the
+  decision (start / ask / hold) and is the one that starts an upload.
 - `main.js` — UI only.
 
 Streaming send: `startSend({ streaming: true, ... })` sends data whose size is not known (a `ReadableStream`, or a
@@ -78,6 +81,7 @@ or `bitmule-files.zip`); several files go as a store-mode zip; no UDP.
 
 ```
 node web/test/opfs_test.js        # no browser: OPFS store, journal, resume
+node web/test/netpolicy_test.js   # no browser: the mobile-data rules
 pip install selenium
 cargo build --release -p bitmule -p bitmule-server
 python3 web/test/browser_test.py [name-filter]
@@ -88,6 +92,11 @@ node: what a journal records and which of its two slots wins, what a reopened
 file holds, what housekeeping keeps, and — with `web/test/resume-worker.js`
 standing in for `v2-worker.js` — that a reloaded page attaches to the transfer
 still running and that a worker that died is picked up from its journal.
+
+`web/test/netpolicy_test.js` runs `netpolicy.js` in node: which links count as
+metered, that a browser which will not say is treated as unmetered, the whole
+decision table, and that a device set never to use mobile data stays held even
+when something presses "start".
 
 Drives Chrome (headless, a matching chrome/chromedriver pair from
 selenium-manager's cache, or `BITMULE_CHROME` / `BITMULE_CHROMEDRIVER`) against

@@ -265,6 +265,39 @@ font-size: 32px;
   color: var(--ok);
 }
 
+/* An upload that waits for a press (see netpolicy.js): the line says what the
+   press would cost, the buttons are the press. */
+.upload-gate {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+/* `display: flex` above would otherwise beat the hidden attribute. */
+.upload-gate[hidden] {
+  display: none;
+}
+
+.upload-gate-text {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.upload-gate-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.upload-gate-buttons .pick-btn,
+.upload-gate-buttons .cancel-btn {
+  align-self: auto;
+}
+
 .cancel-btn {
   align-self: flex-start;
   background: transparent;

@@ -68,6 +68,17 @@
           <div id="session-state" class="session-state">
             waiting for receiver…
           </div>
+          <!-- An upload that may not start by itself waits here (F03). The two
+               buttons are the press the rule asks for; the line without them is
+               a device that has said it never uses mobile data, which is why it
+               offers no way past itself. -->
+          <div class="upload-gate" hidden>
+            <p class="upload-gate-text"></p>
+            <div class="upload-gate-buttons">
+              <button class="upload-gate-go pick-btn" type="button">Start upload</button>
+              <button class="upload-gate-wait cancel-btn" type="button">Wait for Wi-Fi</button>
+            </div>
+          </div>
           <div class="session-controls">
             <label class="session-toggle">
               <input id="stop-after-first" type="checkbox" />
@@ -171,6 +182,13 @@
           <div id="invited-session-state" class="session-state">
             connecting to receiver…
           </div>
+          <div class="upload-gate" hidden>
+            <p class="upload-gate-text"></p>
+            <div class="upload-gate-buttons">
+              <button class="upload-gate-go pick-btn" type="button">Start upload</button>
+              <button class="upload-gate-wait cancel-btn" type="button">Wait for Wi-Fi</button>
+            </div>
+          </div>
           <button id="invited-cancel" class="cancel-btn" type="button">
             Cancel
           </button>
@@ -198,6 +216,14 @@
             <input id="opt-auto-download" type="checkbox" />
             automatically start downloads from clipboard links
             <span class="option-hint">(requires clipboard watch)</span>
+          </label>
+          <!-- Mobile data (F03). Off = an upload over mobile data waits for a
+               press that names its size; on = it waits for Wi-Fi and there is
+               no press. See netpolicy.js and notes/hosted-uploads-spec.md. -->
+          <label class="option-row">
+            <input id="opt-no-cellular" type="checkbox" />
+            never upload over mobile data
+            <span class="option-hint">(wait for Wi-Fi instead)</span>
           </label>
         </details>
       </section>

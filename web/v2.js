@@ -303,6 +303,7 @@ class Job {
         if (rtc) { rtc.close(); this.rtcs.delete(m.peer); }
         return;
       }
+      case "uploadGate": return on.uploadGate && on.uploadGate(m);
       case "dcSend": {
         const rtc = this.rtcs.get(m.peer);
         if (rtc) rtc.send(m.data);
@@ -315,6 +316,12 @@ class Job {
     }
   }
 
+  /// Tell the worker what the page sees of the link and what the user pressed.
+  /// The worker is the side that starts an upload, so the answer has to be there.
+  netPolicy({ mode = null, metered = false, consented = false } = {}) {
+    this.toWorker({ type: "netPolicy", mode, metered: !!metered, consented: !!consented });
+  }
+
   cancel() {
     if (this.finished) return;
     this.toWorker({ type: "cancel" });
@@ -322,11 +329,12 @@ class Job {
   }
 }
 
-export function startSend({ server, blob = null, stream = null, openStream = null, size = 0, streaming = false, kind = "single", name = null, requestKey = null, on }) {
+export function startSend({ server, blob = null, stream = null, openStream = null, size = 0, streaming = false, kind = "single", name = null, requestKey = null, mode = null, metered = false, on }) {
   return new Job("send", { server, on }, {
     blob, stream, openStream, size,
     streaming: streaming || !!stream || !!openStream,
     kind, name: name || (blob && blob.name) || null, requestKey,
+    mode, metered,
   });
 }
 

@@ -10,6 +10,7 @@
 // ride the data channel; this cut only proves the connection opens.
 
 import * as v2 from "./v2.js";
+import { MODE_NEVER, classifyNetwork, labelOf, normalizeMode } from "./netpolicy.js";
 
 const CONFIG = {
   server:
@@ -135,6 +136,7 @@ const els = {
   optUpnp: document.getElementById("opt-upnp"),
   optClipboardWatch: document.getElementById("opt-clipboard-watch"),
   optAutoDownload: document.getElementById("opt-auto-download"),
+  optNoCellular: document.getElementById("opt-no-cellular"),
 
   // F02 clipboard fetch queue
   fetchQueue: document.getElementById("fetch-queue"),
@@ -391,6 +393,7 @@ async function startSendSession(files) {
   const current = () => sendSession === session;
 
   showSessionPanel("");
+  renderUploadGate(els.session, null);
   els.sessionState.textContent = "preparing…";
   let prepared;
   try {
@@ -406,8 +409,10 @@ async function startSendSession(files) {
     blob: prepared.blob,
     kind: prepared.kind,
     name: prepared.name,
+    ...linkState(),
     on: {
       state: (text) => { if (current()) els.sessionState.textContent = text; },
+      uploadGate: (info) => { if (current()) renderUploadGate(els.session, info); },
       link: (link) => {
         if (!current()) return;
         session.sessionHex = sessionHexOfLink(link);
@@ -531,6 +536,7 @@ async function startInvitedSendSession(requestKey, files) {
   closeInvitedSession();
   els.invitedDropzone.hidden = true;
   els.invitedSession.hidden = false;
+  renderUploadGate(els.invitedSession, null);
   els.invitedSessionState.textContent = "preparing…";
   els.invitedSessionState.classList.remove("transferring");
   renderQueueInto(els.invitedQueue, files);
@@ -553,8 +559,10 @@ async function startInvitedSendSession(requestKey, files) {
     kind: prepared.kind,
     name: prepared.name,
     requestKey,
+    ...linkState(),
     on: {
       state: (text) => { if (current()) els.invitedSessionState.textContent = text; },
+      uploadGate: (info) => { if (current()) renderUploadGate(els.invitedSession, info); },
       peers: (peers) => {
         if (current() && peers.length) els.invitedSessionState.classList.add("transferring");
       },
@@ -910,6 +918,8 @@ wireRecvMode();
 wireRequestMode();
 wireInvitedSendMode();
 wireOptions();
+wireUploadGate();
+startNetworkWatcher();
 window.addEventListener("hashchange", applyRoute);
 window.addEventListener("popstate", applyRoute);
 applyRoute();
@@ -921,7 +931,7 @@ const OPTIONS_KEY = "bitmule.options.v1";
 function loadOptions() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(OPTIONS_KEY) || "{}"); } catch {}
-  const defaults = { multiSend: true, upnp: false, clipboardWatch: false, autoDownload: false };
+  const defaults = { multiSend: true, upnp: false, clipboardWatch: false, autoDownload: false, mobileData: "ask" };
   return Object.assign(defaults, saved);
 }
 
@@ -939,6 +949,7 @@ function getOptions() {
     upnp: !!els.optUpnp.checked,
     clipboardWatch: !!els.optClipboardWatch.checked,
     autoDownload: !!els.optAutoDownload.checked,
+    mobileData: els.optNoCellular && els.optNoCellular.checked ? MODE_NEVER : "ask",
   };
 }
 
@@ -948,6 +959,7 @@ function wireOptions() {
   if (els.optUpnp) els.optUpnp.checked = opts.upnp;
   if (els.optClipboardWatch) els.optClipboardWatch.checked = opts.clipboardWatch;
   if (els.optAutoDownload) els.optAutoDownload.checked = opts.autoDownload;
+  if (els.optNoCellular) els.optNoCellular.checked = normalizeMode(opts.mobileData) === MODE_NEVER;
   // "multi-send by default" flips the stop-after-first default:
   // multi-send on → stop-after-first off, and vice versa.
   if (els.stopAfterFirst) els.stopAfterFirst.checked = !opts.multiSend;
@@ -958,7 +970,7 @@ function wireOptions() {
     if (els.optClipboardWatch && els.optClipboardWatch.checked) startClipboardWatcher();
     else stopClipboardWatcher();
   };
-  for (const el of [els.optMultiSend, els.optUpnp, els.optClipboardWatch, els.optAutoDownload]) {
+  for (const el of [els.optMultiSend, els.optUpnp, els.optClipboardWatch, els.optAutoDownload, els.optNoCellular]) {
     if (el) el.addEventListener("change", persist);
   }
   // Reflect multi-send back onto the stop-after-first checkbox each
@@ -969,6 +981,98 @@ function wireOptions() {
     });
   }
   if (opts.clipboardWatch) startClipboardWatcher();
+}
+
+// ---- mobile data (F03) ---------------------------------------------------
+//
+// The rules are in netpolicy.js and the decision belongs to the worker, because
+// the worker is where an upload starts. What the page adds is the two things
+// only it can know: what the link is (`navigator.connection`) and whether the
+// user pressed.
+
+function connectionOf() {
+  return navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+}
+
+function currentNetwork() {
+  return classifyNetwork(connectionOf());
+}
+
+/// What the worker needs to hear about the link, with no press attached.
+function linkState() {
+  return { mode: normalizeMode(getOptions().mobileData), metered: currentNetwork() === "cellular" };
+}
+
+function gateUi(scope) {
+  if (!scope) return {};
+  return {
+    box: scope.querySelector(".upload-gate"),
+    text: scope.querySelector(".upload-gate-text"),
+    go: scope.querySelector(".upload-gate-go"),
+    wait: scope.querySelector(".upload-gate-wait"),
+  };
+}
+
+/// An upload the worker will not start: say what it would spend and, when the
+/// device allows it, offer the press. With the device set never to use mobile
+/// data there is deliberately nothing to press and no way to the setting from
+/// here — a setting that can be overridden in the box that asks for it is not a
+/// setting (notes/hosted-uploads-spec.md).
+function renderUploadGate(scope, info) {
+  const ui = gateUi(scope);
+  if (!ui.box) return;
+  if (!info) { ui.box.hidden = true; return; }
+  const size = info.bytes ? fmtSize(info.bytes) : "";
+  ui.box.hidden = false;
+  ui.go.hidden = true;
+  ui.wait.hidden = true;
+  if (info.reason === "hold") {
+    ui.text.textContent = "waiting for Wi-Fi — this device is set never to upload over mobile data";
+  } else if (info.reason === "stopped") {
+    ui.text.textContent = "stopped — a live transfer cannot be picked up again on mobile data";
+  } else {
+    ui.text.textContent = `${size ? size + " " : "the upload "}will go over mobile data — start it now?`;
+    ui.go.textContent = size ? `Start upload (${size})` : "Start the upload";
+    ui.go.hidden = false;
+    ui.wait.hidden = false;
+  }
+}
+
+function wireUploadGate() {
+  const wire = (scope, sessionOf) => {
+    const ui = gateUi(scope);
+    if (!ui.box) return;
+    ui.go.addEventListener("click", () => {
+      const session = sessionOf();
+      if (!session || !session.job) return;
+      session.job.netPolicy({ ...linkState(), consented: true });
+      ui.go.hidden = true;
+      ui.wait.hidden = true;
+      ui.text.textContent = "starting the upload over mobile data…";
+    });
+    ui.wait.addEventListener("click", () => {
+      ui.go.hidden = true;
+      ui.wait.hidden = true;
+      ui.text.textContent = "waiting for Wi-Fi — the link above still works; the upload starts when the device finds Wi-Fi";
+    });
+  };
+  wire(els.session, () => sendSession);
+  wire(els.invitedSession, () => invitedSession);
+}
+
+/// A change of link — Wi-Fi to mobile data with an upload running is the one
+/// that matters. Every running send hears about it with no press attached, so a
+/// transfer that wanders onto the plan pauses and asks again instead of spending
+/// what is left of it. Browsers without the Network Information API never fire
+/// this; there the page cannot tell Wi-Fi from cellular at all (netpolicy.js).
+function startNetworkWatcher() {
+  const conn = connectionOf();
+  if (!conn || !conn.addEventListener) return;
+  conn.addEventListener("change", () => {
+    for (const session of [sendSession, invitedSession]) {
+      if (session && session.job) session.job.netPolicy(linkState());
+    }
+  });
 }
 
 // ---- F02: clipboard watcher + fetch queue ------------------------------
