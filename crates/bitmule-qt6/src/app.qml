@@ -56,7 +56,6 @@ ApplicationWindow {
         readonly property color fg: dark ? "#e7e9ec" : "#1b1d21"
         readonly property color fgMuted: dark ? "#a6acb4" : "#565d66"
         readonly property color fgFaint: dark ? "#7c838c" : "#7f868f"
-        readonly property color bright: "#ffffff"
 
         readonly property color accent: dark ? "#7aa9ee" : "#2b6bc4"
         readonly property color onAccent: dark ? "#0c131d" : "#ffffff"
@@ -91,7 +90,7 @@ ApplicationWindow {
     palette.placeholderText: theme.fgFaint
     palette.button: theme.surfaceMuted
     palette.buttonText: theme.fg
-    palette.brightText: theme.bright
+    palette.brightText: theme.onAccent
     palette.highlight: theme.accent
     palette.highlightedText: theme.onAccent
     palette.light: theme.bevelLight
@@ -114,8 +113,22 @@ ApplicationWindow {
         TabBar {
             id: bar
             Layout.fillWidth: true
-            TabButton { text: "Send" }
-            TabButton { text: "Receive" }
+            TabButton {
+                id: tabSend
+                text: "Send"
+                // The palette-driven style paints an unchecked tab from
+                // `dark`/`mid` and writes its label in `brightText`; with a
+                // light theme that is white on pale grey. Text roles, not
+                // bevel roles, for the two labels.
+                palette.brightText: theme.fgMuted
+                palette.windowText: theme.fg
+            }
+            TabButton {
+                id: tabRecv
+                text: "Receive"
+                palette.brightText: theme.fgMuted
+                palette.windowText: theme.fg
+            }
         }
 
         StackLayout {
@@ -166,6 +179,7 @@ ApplicationWindow {
                 }
 
                 Button {
+                    id: shareButton
                     text: "Share"
                     Layout.fillWidth: true
                     enabled: !api.is_busy && api.file_list.length > 0

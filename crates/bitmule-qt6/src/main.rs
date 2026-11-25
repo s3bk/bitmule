@@ -845,6 +845,18 @@ fn qr_data_url_for(text: &str) -> String {
 
 #[tokio::main]
 async fn main() {
+    // One look on every desktop. The platform styles (Fusion, material,
+    // whatever a desktop integration provides) paint controls from their own
+    // palettes and only partly follow the window palette; the Basic style
+    // draws every control from `palette.*` alone, so the colour table in
+    // app.qml is what the user actually sees. An explicit choice in the
+    // environment still wins, for experiments.
+    if std::env::var_os("QT_QUICK_CONTROLS_STYLE").is_none() {
+        // SAFETY: single-threaded, before any Qt object exists and before the
+        // QML engine reads the variable.
+        unsafe { std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Basic") };
+    }
+
     qml_register_type::<UploaderApi>(c_str!("Uploader"), 1, 0, c_str!("UploaderApi"));
 
     let mut engine = QmlEngine::new();
