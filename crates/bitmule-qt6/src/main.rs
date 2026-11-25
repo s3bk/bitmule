@@ -6,6 +6,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+mod account;
+
 const BITMULE_URL_PREFIX: &str = "https://bitmule.qdat.net/#";
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 
@@ -858,6 +860,7 @@ async fn main() {
     }
 
     qml_register_type::<UploaderApi>(c_str!("Uploader"), 1, 0, c_str!("UploaderApi"));
+    qml_register_type::<account::AccountApi>(c_str!("Uploader"), 1, 0, c_str!("AccountApi"));
 
     let mut engine = QmlEngine::new();
     engine.load_data(include_str!("app.qml").into());

@@ -104,6 +104,11 @@ ApplicationWindow {
         Component.onCompleted: api.init_from_qml()
     }
 
+    AccountApi {
+        id: account
+        Component.onCompleted: account.init_from_qml()
+    }
+
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 10
@@ -113,6 +118,10 @@ ApplicationWindow {
         TabBar {
             id: bar
             Layout.fillWidth: true
+            // `--account` opens on the account tab: for screenshots, and for
+            // the one case where the app starts because an account needs
+            // attention.
+            currentIndex: Qt.application.arguments.indexOf("--account") >= 0 ? 2 : 0
             TabButton {
                 id: tabSend
                 text: "Send"
@@ -130,6 +139,15 @@ ApplicationWindow {
             TabButton {
                 id: tabRecv
                 text: "Receive"
+                palette.dark: theme.surfaceMuted
+                palette.mid: theme.surfaceMuted
+                palette.window: theme.surface
+                palette.brightText: theme.fgMuted
+                palette.windowText: theme.fg
+            }
+            TabButton {
+                id: tabAccount
+                text: "Account"
                 palette.dark: theme.surfaceMuted
                 palette.mid: theme.surfaceMuted
                 palette.window: theme.surface
@@ -460,6 +478,195 @@ ApplicationWindow {
                         }
                     }
                 }
+            }
+            // ---------- Account tab ----------
+            //
+            // The same account the browser has: one record on this device,
+            // sealed under the password, made and opened by the same code
+            // (bitmule-account) as bitmule.net/app's vault.js. Nothing here
+            // is sent anywhere except the one activation call, which spends
+            // the operator's one-time token so the account may mint storage.
+            // The password is asked for again only after a lock or a restart.
+            ColumnLayout {
+                spacing: 10
+
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Label.WordWrap
+                    font.pixelSize: 12
+                    color: theme.fgMuted
+                    text: "An account is a key pair on this device. It is what may "
+                        + "create a share or an invite on the server; sending and "
+                        + "receiving a link never needs it."
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    font.pixelSize: 13
+                    color: theme.fg
+                    text: {
+                        if (account.state === "unlocked")
+                            return account.label + "  ·  " + account.plan
+                        if (account.state === "locked")
+                            return account.label + "  ·  locked"
+                        return "No account on this device"
+                    }
+                }
+
+                // ---- create: nothing on disk yet ----
+                GroupBox {
+                    Layout.fillWidth: true
+                    title: "Create"
+                    visible: account.state === "none"
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 8
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Label.WordWrap
+                            font.pixelSize: 11
+                            color: theme.fgFaint
+                            text: "The key is made here; the server is not asked anything. "
+                                + "You get a record you can back up, and the same password "
+                                + "opens it at bitmule.net/app."
+                        }
+                        TextField {
+                            id: createLabel
+                            Layout.fillWidth: true
+                            placeholderText: "what to call it (e.g. \"laptop\")"
+                            font.pixelSize: 12
+                        }
+                        TextField {
+                            id: createPassword
+                            Layout.fillWidth: true
+                            placeholderText: "password (8+ characters)"
+                            echoMode: TextInput.Password
+                            font.pixelSize: 12
+                        }
+                        TextField {
+                            id: createPassword2
+                            Layout.fillWidth: true
+                            placeholderText: "password again"
+                            echoMode: TextInput.Password
+                            font.pixelSize: 12
+                        }
+                        Button {
+                            Layout.fillWidth: true
+                            text: "Create account"
+                            enabled: !account.busy && createPassword.text.length > 0
+                                && createPassword.text === createPassword2.text
+                            onClicked: {
+                                if (account.create_account(createLabel.text, createPassword.text)) {
+                                    createPassword.text = ""
+                                    createPassword2.text = ""
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- unlock: a record on disk, no key in memory ----
+                GroupBox {
+                    Layout.fillWidth: true
+                    title: "Unlock"
+                    visible: account.state === "locked"
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 8
+                        TextField {
+                            id: unlockPassword
+                            Layout.fillWidth: true
+                            placeholderText: "password"
+                            echoMode: TextInput.Password
+                            font.pixelSize: 12
+                            onAccepted: unlockButton.clicked()
+                        }
+                        Button {
+                            id: unlockButton
+                            Layout.fillWidth: true
+                            text: "Unlock"
+                            enabled: !account.busy && unlockPassword.text.length > 0
+                            onClicked: {
+                                if (account.unlock(unlockPassword.text))
+                                    unlockPassword.text = ""
+                            }
+                        }
+                    }
+                }
+
+                // ---- unlocked: the account, and activation ----
+                GroupBox {
+                    Layout.fillWidth: true
+                    title: account.activated ? "This account" : "Activate"
+                    visible: account.state === "unlocked"
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 8
+
+                        Label {
+                            Layout.fillWidth: true
+                            font.pixelSize: 11
+                            color: theme.fgFaint
+                            text: account.activated
+                                ? account.account_id
+                                : "Not activated: this key may not mint storage yet."
+                            elide: Label.ElideMiddle
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            TextField {
+                                id: tokenField
+                                Layout.fillWidth: true
+                                visible: !account.activated
+                                placeholderText: "one-time token (tk_…)"
+                                font.pixelSize: 12
+                            }
+                            Button {
+                                Layout.fillWidth: true
+                                visible: !account.activated
+                                text: "Activate"
+                                enabled: !account.busy && tokenField.text.length > 0
+                                onClicked: account.activate(tokenField.text)
+                            }
+                        }
+
+                        Label {
+                            Layout.fillWidth: true
+                            visible: account.busy
+                            font.pixelSize: 11
+                            color: theme.fgMuted
+                            text: "Talking to the server…"
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            Button {
+                                Layout.fillWidth: true
+                                text: "Lock"
+                                onClicked: account.lock()
+                            }
+                            Button {
+                                Layout.fillWidth: true
+                                text: "Forget this device"
+                                onClicked: account.forget()
+                            }
+                        }
+                    }
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    visible: account.error.length > 0
+                    wrapMode: Label.WordWrap
+                    font.pixelSize: 11
+                    color: theme.danger
+                    text: account.error
+                }
+
+                Item { Layout.fillHeight: true }
             }
         }
     }

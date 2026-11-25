@@ -287,14 +287,27 @@ fn create_with_iters(
 // Opening and sealing
 // ---------------------------------------------------------------------------
 
-/// The one decryption: a record and a password in, the account out.
+/// The one decryption: a record and a password in, the account out. A client
+/// that stays unlocked derives the key once (`record_key`) and then calls
+/// `open_with_key`, so the password itself need not be kept in memory.
 pub fn open(record: &Record, password: &str) -> Result<Account> {
-    let key = derive(password, &B64.decode(&record.kdf.salt)?, record.kdf.iters);
+    open_with_key(record, &*record_key(record, password)?)
+}
+
+/// The record's key, derived from a password at the record's own salt and
+/// cost. The caller may hold this instead of the password while it stays
+/// unlocked; it opens this record and nothing else.
+pub fn record_key(record: &Record, password: &str) -> Result<Zeroizing<[u8; 32]>> {
+    Ok(derive(password, &B64.decode(&record.kdf.salt)?, record.kdf.iters))
+}
+
+/// Decrypt with a key already derived by `record_key`.
+pub fn open_with_key(record: &Record, key: &[u8; 32]) -> Result<Account> {
     let iv = B64.decode(&record.cipher.iv)?;
     if iv.len() != 12 {
         anyhow::bail!("the record's IV is not 12 bytes");
     }
-    let cipher = Aes256Gcm::new_from_slice(&*key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
     let plain = cipher
         .decrypt(
             Nonce::from_slice(&iv),
@@ -311,10 +324,15 @@ pub fn open(record: &Record, password: &str) -> Result<Account> {
 /// Re-seal an account into a record (new IV every time, new salt only on a
 /// password change — which is what `record` carries).
 pub fn seal_into(record: &mut Record, password: &str, account: &Account) -> Result<()> {
-    let key = derive(password, &B64.decode(&record.kdf.salt)?, record.kdf.iters);
+    seal_with_key(record, &*record_key(record, password)?, account)
+}
+
+/// Re-seal with a key already derived by `record_key`. The salt in the record
+/// is left alone, so the same key opens it again.
+pub fn seal_with_key(record: &mut Record, key: &[u8; 32], account: &Account) -> Result<()> {
     let mut iv = [0u8; 12];
     OsRng.fill_bytes(&mut iv);
-    let cipher = Aes256Gcm::new_from_slice(&*key).expect("32-byte key");
+    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
     let plain = serde_json::to_vec(account)?;
     let ct = cipher
         .encrypt(
