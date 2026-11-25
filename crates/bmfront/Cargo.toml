@@ -1,0 +1,9 @@
+[package]
+name = "bmfront"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The host in front of bitmule.net: one origin, /pow, /ws/* and /session/* to the relay, the rest to the app"
+publish = false
+
+[dependencies]

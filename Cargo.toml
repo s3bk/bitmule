@@ -6,6 +6,7 @@ members = [
     "crates/bitmule-buf",
     "crates/bitmule-crypto",
     "crates/bitmule-account",
+    "crates/bmfront",
     "crates/bitmule-server",
     "crates/bitmule-server-signal-ws",
     "crates/bitmule-client-wasm",
