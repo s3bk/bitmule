@@ -116,16 +116,23 @@ ApplicationWindow {
             TabButton {
                 id: tabSend
                 text: "Send"
-                // The palette-driven style paints an unchecked tab from
-                // `dark`/`mid` and writes its label in `brightText`; with a
-                // light theme that is white on pale grey. Text roles, not
-                // bevel roles, for the two labels.
+                // Basic's TabButton fills an unchecked tab with `palette.dark`
+                // and writes its label in `brightText`; from the window palette
+                // that is a near-black slab with white text on a light theme.
+                // The tab bar gets its own surfaces instead: checked = card,
+                // unchecked = muted, labels from the text roles.
+                palette.dark: theme.surfaceMuted
+                palette.mid: theme.surfaceMuted
+                palette.window: theme.surface
                 palette.brightText: theme.fgMuted
                 palette.windowText: theme.fg
             }
             TabButton {
                 id: tabRecv
                 text: "Receive"
+                palette.dark: theme.surfaceMuted
+                palette.mid: theme.surfaceMuted
+                palette.window: theme.surface
                 palette.brightText: theme.fgMuted
                 palette.windowText: theme.fg
             }
