@@ -115,6 +115,11 @@ struct UploaderApi {
     opt_upnp: qt_property!(bool; NOTIFY opt_upnp_changed),
     opt_clipboard_watch: qt_property!(bool; NOTIFY opt_clipboard_watch_changed),
     opt_auto_download: qt_property!(bool; NOTIFY opt_auto_download_changed),
+    /// `"auto"` | `"light"` | `"dark"`. The QML side reads it once on
+    /// load and owns the colour table; Rust only persists the choice.
+    /// Empty (an options file from before this field existed) reads as
+    /// `"auto"`.
+    opt_theme: qt_property!(QString; NOTIFY opt_theme_changed),
 
     // F02 fetch queue: bitmule URLs the clipboard watcher has detected
     // that are NOT this app's own shares. Bind on ListView / repeater.
@@ -129,6 +134,7 @@ struct UploaderApi {
     opt_upnp_changed: qt_signal!(),
     opt_clipboard_watch_changed: qt_signal!(),
     opt_auto_download_changed: qt_signal!(),
+    opt_theme_changed: qt_signal!(),
     fetch_queue_changed: qt_signal!(),
 
     // Shared paths state
@@ -251,6 +257,7 @@ impl UploaderApi {
             upnp: self.opt_upnp,
             clipboard_watch: self.opt_clipboard_watch,
             auto_download: self.opt_auto_download,
+            theme: self.opt_theme.to_string(),
         };
         if let Err(e) = write_options(&opts) {
             eprintln!("save_options: {e}");
@@ -283,10 +290,12 @@ impl UploaderApi {
         self.opt_upnp = opts.upnp;
         self.opt_clipboard_watch = opts.clipboard_watch;
         self.opt_auto_download = opts.auto_download;
+        self.opt_theme = QString::from(opts.theme.as_str());
         self.opt_multi_send_changed();
         self.opt_upnp_changed();
         self.opt_clipboard_watch_changed();
         self.opt_auto_download_changed();
+        self.opt_theme_changed();
 
         if opts.clipboard_watch {
             self.spawn_clipboard_watcher();
@@ -682,8 +691,26 @@ struct OptionsSnapshot {
     clipboard_watch: bool,
     #[serde(default)]
     auto_download: bool,
+    /// `"auto"` follows the desktop's colour scheme; `"light"` and
+    /// `"dark"` pin one. Anything else is read as `"auto"` by the QML.
+    #[serde(default = "default_theme")]
+    theme: String,
 }
 fn default_true() -> bool { true }
+fn default_theme() -> String { "auto".to_string() }
+
+impl OptionsSnapshot {
+    /// What a missing or unparsable options file reads as.
+    fn first_run() -> Self {
+        OptionsSnapshot {
+            multi_send: true,
+            upnp: false,
+            clipboard_watch: false,
+            auto_download: false,
+            theme: default_theme(),
+        }
+    }
+}
 
 fn options_path() -> PathBuf {
     // Prefer XDG_CONFIG_HOME/bitmule/, fall back to $HOME/.config/bitmule/.
@@ -698,12 +725,8 @@ fn options_path() -> PathBuf {
 fn load_options() -> OptionsSnapshot {
     let path = options_path();
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| OptionsSnapshot {
-            multi_send: true, upnp: false, clipboard_watch: false, auto_download: false,
-        }),
-        Err(_) => OptionsSnapshot {
-            multi_send: true, upnp: false, clipboard_watch: false, auto_download: false,
-        },
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| OptionsSnapshot::first_run()),
+        Err(_) => OptionsSnapshot::first_run(),
     }
 }
 
