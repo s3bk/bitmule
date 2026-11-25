@@ -1,0 +1,20 @@
+[package]
+name = "bitmule-account"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The account record: one P-256 key pair, sealed under a password"
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = "0.22"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdh"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1.9"

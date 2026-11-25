@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "kind": "bitmule-account",
+  "created": "2026-11-25T20:00:00.000Z",
+  "label": "browser",
+  "plan": "basic",
+  "pub": "BCADT2t3XWN3OSiNogLJ9pEw0qLuYwsszw0wXUoCzVaWlGlcw9p270hrD3iTPC167TzOcRBleDuBp3BTCrIQSj8",
+  "kdf": {
+    "alg": "PBKDF2-SHA-256",
+    "iters": 600000,
+    "salt": "BwcHBwcHBwcHBwcHBwcHBw"
+  },
+  "cipher": {
+    "alg": "AES-256-GCM",
+    "iv": "AwMDAwMDAwMDAwMD"
+  },
+  "ct": "M2sAg5k-HY-1kSD_aNJAefofLMZRf2p98Wldr0fJdQjxTiLRYTVWrylEc5s99nzZuFVEtOnelNm7NqAPeLSIavhE81E0W4SRnmTWSHd_7L6el33WqNETDC94cO0r1i90_-NjgQafcRdyyeDipfjW6Yp8PriKQCOS3NN0D8bkQcdY4ecUKtfLOjHFpmkyJutgT-IEKoasPGd5JvuyJ8rcnqopRunFfRM52tUAdqzRbgDmriqr3uzW2vLGip3AdJExt6nN7JykdbCxGxP7csN0qM-4z084jkJ_jO18RT4JGkVTVdzibh0DrIXCU9LTJBPQUBmwZOUfspvyCG-ygMvW5bXQp_Tus-Kq1i5jJ8Hg_JKfSWJSfOJpRJky06uBoDTrNd5_xlj-U-Lkyzgp9ZlGBpsKWUM_mM8T2_b9qxFffLycfK7E0KAQOccF-y0bwoNYl8iqSAlz1KSwe6wWHekk-Dw1VqVVmcoO8nW9qhK4FIBNabg6ZeQy9dRP0J4cuzbI5cZA5PpZe7N4lhurstAKXGepnCwJHW6oV4EE1Xg8jc2lTiVUtGDyLMWTcEfKPPfPl4KltnbLxyB21tivzoOUcw"
+}
