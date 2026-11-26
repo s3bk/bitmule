@@ -212,10 +212,19 @@ ApplicationWindow {
                 }
 
                 Label {
-                    text: "Uploading…"
+                    text: "Preparing…"
                     visible: api.is_busy
                     Layout.alignment: Qt.AlignHCenter
                     color: theme.fgMuted
+                    font.pixelSize: 12
+                }
+
+                Label {
+                    text: api.share_error
+                    visible: api.share_error.length > 0
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    color: theme.danger
                     font.pixelSize: 12
                 }
 
@@ -345,7 +354,7 @@ ApplicationWindow {
                     TextField {
                         id: recvUrlField
                         Layout.fillWidth: true
-                        placeholderText: "paste bitmule URL (https://bitmule.qdat.net/#…)"
+                        placeholderText: "paste bitmule URL (https://bitmule.net/#…)"
                         font.pixelSize: 12
                     }
                     Button {

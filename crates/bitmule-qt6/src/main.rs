@@ -9,7 +9,7 @@ use url::Url;
 mod account;
 mod keyring;
 
-const BITMULE_URL_PREFIX: &str = "https://bitmule.qdat.net/#";
+const BITMULE_URL_PREFIX: &str = "https://bitmule.net/#";
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 
 /// Prepare a bitmule share from `files` and spawn the send task in the
@@ -20,18 +20,17 @@ const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 /// One file is sent as it is; several files, or a directory, go as a zip the
 /// builder makes. v2 has no "keep the link live for more receivers" mode, so
 /// the old multi-send option no longer does anything.
-async fn share(files: Vec<PathBuf>) -> Url {
+async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
     use bitmule::v2::{self, Options, Server};
     use bitmule_client_common::transfer::{Storage, TransferBuilder};
 
-    const SERVER: &str = "https://bitmule.qdat.net";
-    let err_url = |msg: &str| {
-        Url::parse(&format!("about:blank#error={}", urlencoding_min(msg)))
-            .unwrap_or_else(|_| Url::parse("about:blank").unwrap())
-    };
+    // The host the web app lives on, and the only one that answers /pow and
+    // /ws/create: https://bitmule.qdat.net no longer terminates TLS, so no
+    // session can be made there and the UI would wait for a link forever.
+    const SERVER: &str = "https://bitmule.net";
 
     if files.is_empty() {
-        return err_url("no file selected");
+        return Err("no file selected".into());
     }
 
     let mut builder = TransferBuilder::new();
@@ -51,8 +50,8 @@ async fn share(files: Vec<PathBuf>) -> Url {
                     builder.add_file(Storage::File(entry.path().to_path_buf()), Some(name));
                 }
             }
-            Ok(_) => return err_url("not a regular file or directory"),
-            Err(e) => return err_url(&format!("stat: {e}")),
+            Ok(_) => return Err("not a regular file or directory".into()),
+            Err(e) => return Err(format!("stat {}: {e}", path.display())),
         }
     }
     // a lone directory still goes as a zip, even with a single file inside
@@ -63,7 +62,7 @@ async fn share(files: Vec<PathBuf>) -> Url {
     // hashes the data for the link's signature
     let (manifest, transfer) = match builder.commit_async().await {
         Ok(v) => v,
-        Err(e) => return err_url(&format!("prepare: {e:#}")),
+        Err(e) => return Err(format!("prepare: {e:#}")),
     };
 
     let server = Server::parse(SERVER);
@@ -82,23 +81,15 @@ async fn share(files: Vec<PathBuf>) -> Url {
         }
     });
 
-    match link_rx.await {
-        Ok(url) => Url::parse(&url).unwrap_or_else(|_| err_url("URL build")),
-        Err(_) => err_url("couldn't reach the server"),
+    // Making the session is the server's answer, before any data moves, so a
+    // minute here is generous — and better than the tab waiting forever.
+    match tokio::time::timeout(std::time::Duration::from_secs(60), link_rx).await {
+        Ok(Ok(url)) => Url::parse(&url).map_err(|e| format!("bad share URL from the server: {e}")),
+        Ok(Err(_)) => Err(format!("couldn't reach {SERVER}")),
+        Err(_) => Err(format!("{SERVER} didn't answer within 60 s")),
     }
 }
 
-/// Minimal percent-encoding for stuffing an error message into a URL
-/// fragment. Not RFC-3986-complete; only escapes what would break
-/// `Url::parse` on the return path.
-fn urlencoding_min(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u32),
-        })
-        .collect()
-}
 
 #[derive(QObject, Default)]
 struct UploaderApi {
@@ -107,6 +98,9 @@ struct UploaderApi {
     // State properties
     is_busy: qt_property!(bool; NOTIFY is_busy_changed),
     share_url: qt_property!(QString; NOTIFY share_url_changed),
+    /// Why the last share attempt did not produce a link — empty when it did,
+    /// or when nobody has tried yet. QML shows it under the Share button.
+    share_error: qt_property!(QString; NOTIFY share_error_changed),
     /// `data:image/svg+xml;base64,...` — bind directly on an Image
     /// source in QML to display the share URL as a scannable QR code.
     /// Empty string when no URL is set.
@@ -131,6 +125,7 @@ struct UploaderApi {
     // Signals
     is_busy_changed: qt_signal!(),
     share_url_changed: qt_signal!(),
+    share_error_changed: qt_signal!(),
     qr_data_url_changed: qt_signal!(),
     file_list_changed: qt_signal!(),
     opt_multi_send_changed: qt_signal!(),
@@ -209,6 +204,13 @@ impl UploaderApi {
     fn trigger_share(&mut self) {
         self.is_busy = true;
         self.is_busy_changed();
+        // a new attempt at once: the old link (and any old error) is stale
+        self.share_url = QString::default();
+        self.qr_data_url = QString::default();
+        self.share_error = QString::default();
+        self.share_url_changed();
+        self.qr_data_url_changed();
+        self.share_error_changed();
 
         let paths = self.paths.borrow().clone();
         let active_urls = self.active_share_urls.clone();
@@ -216,37 +218,52 @@ impl UploaderApi {
 
         // Run async operation
         qmetaobject::future::execute_async(async move {
-            let url = share(paths).await;
-            let url_str = url.to_string();
-            // The symbol carries the printed spelling of the same 32 bytes.
-            let qr = qr_data_url_for(&print_text_for(&url_str));
-            // Register the URL as own-upload so the clipboard watcher
-            // ignores it if the user copies it and it comes back
-            // through the poll.
-            if url_str.starts_with(BITMULE_URL_PREFIX) {
-                if let Ok(mut v) = active_urls.lock() { v.push(url_str.clone()); }
-            }
+            let result = share(paths).await;
 
-            // Copy to clipboard before touching the UI so the user
-            // sees the URL appear and can already paste it. Failures
-            // (no display, missing xdg utilities) are non-fatal — a
-            // Copy button in the QML will let the user try again.
-            copy_to_clipboard(&url_str);
+            // Everything that has to reach the UI, done on the main thread:
+            // the clipboard copy can happen from here, the properties may not.
+            let outcome = match result {
+                Ok(url) => {
+                    let url_str = url.to_string();
+                    // The symbol carries the printed spelling of the same 32 bytes.
+                    let qr = qr_data_url_for(&print_text_for(&url_str));
+                    // Register the URL as own-upload so the clipboard watcher
+                    // ignores it if the user copies it and it comes back
+                    // through the poll.
+                    if url_str.starts_with(BITMULE_URL_PREFIX) {
+                        if let Ok(mut v) = active_urls.lock() { v.push(url_str.clone()); }
+                    }
+                    // Copy to clipboard before touching the UI so the user
+                    // sees the URL appear and can already paste it. Failures
+                    // (no display, missing xdg utilities) are non-fatal — a
+                    // Copy button in the QML will let the user try again.
+                    copy_to_clipboard(&url_str);
+                    Ok((url_str, qr))
+                }
+                Err(e) => Err(e),
+            };
 
             // Update UI safely on main thread
             if let Some(api) = qpointer.as_pinned() {
                 {
                     let mut a = api.borrow_mut();
-                    a.share_url = QString::from(url_str);
-                    a.qr_data_url = QString::from(qr);
+                    match outcome {
+                        Ok((url_str, qr)) => {
+                            a.share_url = QString::from(url_str);
+                            a.qr_data_url = QString::from(qr);
+                        }
+                        Err(e) => a.share_error = QString::from(e),
+                    }
                     a.is_busy = false;
                 }
                 api.borrow_mut().share_url_changed();
                 api.borrow_mut().qr_data_url_changed();
+                api.borrow_mut().share_error_changed();
                 api.borrow_mut().is_busy_changed();
             }
         });
     }
+
 
     fn copy_share_url(&mut self) -> bool {
         let url = self.share_url.to_string();
@@ -315,7 +332,7 @@ impl UploaderApi {
                 progress: 0.0,
                 status: "error".into(),
                 path: None,
-                error: Some("URL doesn't start with https://bitmule.qdat.net/#".into()),
+                error: Some(format!("URL doesn't start with {BITMULE_URL_PREFIX}")),
             });
             return;
         }
