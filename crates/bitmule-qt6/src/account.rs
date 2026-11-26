@@ -34,7 +34,9 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 const ACCOUNT_FILE_NAME: &str = "account.json";
-const DEFAULT_SERVER: &str = "https://bitmule.qdat.net";
+/// The instance the browser app uses — activation has to go where accounts
+/// live, which is the public site, not the desktop client's own relay.
+const DEFAULT_SERVER: &str = "https://bitmule.net";
 
 /// A password nobody has to invent: 32 random bytes in base64url — 43
 /// characters, the same shape a person could have typed.
