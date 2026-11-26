@@ -16,7 +16,18 @@
 //! The password is not kept while unlocked: `record_key` is derived once and
 //! the derived key is held instead, and it is that key which re-seals the
 //! record when activation stores the account id and secret.
+//!
+//! The password itself lives in the desktop's keyring (`keyring.rs`: KWallet 6
+//! or GNOME Keyring over the Secret Service API) whenever one is there, so it
+//! is typed once and never again. A person who would rather not have one at
+//! all can leave the field empty: the app then makes a random password, seals
+//! the record with it and puts it in the keyring — the record stays exactly
+//! the browser's shape, so a backup still opens at bitmule.net/app with the
+//! password the app showed once. Where there is no keyring, the password is
+//! asked for, as before.
 
+use crate::keyring;
+use base64::Engine;
 use bitmule_account as vault;
 use qmetaobject::*;
 use std::path::PathBuf;
@@ -24,10 +35,26 @@ use zeroize::Zeroizing;
 
 const ACCOUNT_FILE_NAME: &str = "account.json";
 const DEFAULT_SERVER: &str = "https://bitmule.qdat.net";
-/// Short enough to type, long enough that the sealed record is worth sealing.
-/// `bitmule_account::MIN_PASSWORD` is the authority; this mirrors it for the
-/// message the QML shows.
-const MIN_PASSWORD: usize = 8;
+
+/// Run one keyring call to completion on the thread that asked. The keyring is
+/// D-Bus, which is async; these calls are short (a search, a store) and happen
+/// once per create, unlock or forget, beside a PBKDF2 that already blocks
+/// longer.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime")
+        .block_on(fut)
+}
+
+/// A password nobody has to invent: 32 random bytes in base64url — 43
+/// characters, the same shape a person could have typed.
+fn made_up_password() -> Zeroizing<String> {
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw).expect("the system's randomness");
+    Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+}
 
 fn account_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
@@ -73,19 +100,42 @@ pub struct AccountApi {
     /// Where activation talks to. Kept a property so a self-hosted instance
     /// can be typed in instead of the public one.
     server: qt_property!(QString; NOTIFY server_changed),
+    /// What the keyring says: `""` (not asked yet — the form is the way in),
+    /// `"checking"`, `"stored"` (it holds this account's password),
+    /// `"nothing"` (it works, nothing stored) or `"unavailable"` (no Secret
+    /// Service on this session, so a password is a thing to remember).
+    keyring: qt_property!(QString; NOTIFY keyring_changed),
+    /// The password the app made, shown once after creation so a backup can
+    /// be opened in the browser. Empty whenever the person typed their own.
+    recovery: qt_property!(QString; NOTIFY recovery_changed),
+    /// Keep the password in the keyring. On by default: the point of the
+    /// keyring is not to remember one, and it can be turned off for a record
+    /// that is meant to need the password every time.
+    remember: qt_property!(bool; NOTIFY remember_changed),
 
     state_changed: qt_signal!(),
     account_changed: qt_signal!(),
     error_changed: qt_signal!(),
     busy_changed: qt_signal!(),
     server_changed: qt_signal!(),
+    keyring_changed: qt_signal!(),
+    recovery_changed: qt_signal!(),
+    remember_changed: qt_signal!(),
 
-    /// `init_from_qml` — read what is on disk and set `state`.
+    /// `init_from_qml` — read what is on disk and set `state`. With a record
+    /// on disk there and a keyring that has its password, this also opens it,
+    /// so a restart asks for nothing.
     init_from_qml: qt_method!(fn(&mut self)),
-    /// Create a record on this device (no server involved).
+    /// Create a record on this device (no server involved). An empty password
+    /// means "make one and keep it in the keyring".
     create_account: qt_method!(fn(&mut self, label: QString, password: QString) -> bool),
     /// Open the record with the password.
     unlock: qt_method!(fn(&mut self, password: QString) -> bool),
+    /// Open the record with the password the keyring holds. Runs off the Qt
+    /// thread, since asking KWallet can wait on its own prompt.
+    unlock_from_keyring: qt_method!(fn(&mut self)),
+    /// Keep (or stop keeping) the password in the keyring from now on.
+    set_remember: qt_method!(fn(&mut self, on: bool)),
     /// Drop the key from memory. The record stays on disk.
     lock: qt_method!(fn(&mut self)),
     /// Spend a one-time token on this account: `POST /v1/pub/accounts`.
@@ -117,6 +167,52 @@ impl AccountApi {
         if self.state != q {
             self.state = q;
             self.state_changed();
+        }
+    }
+
+    fn set_keyring(&mut self, s: &str) {
+        let q = QString::from(s);
+        if self.keyring != q {
+            self.keyring = q;
+            self.keyring_changed();
+        }
+    }
+
+    fn set_recovery(&mut self, s: String) {
+        let q = QString::from(s);
+        if self.recovery != q {
+            self.recovery = q;
+            self.recovery_changed();
+        }
+    }
+
+    /// Put the password in the keyring when the person asked for that and the
+    /// session has one. A failure is not an error: the password still works,
+    /// it just has to be typed at the next start.
+    fn keep_in_keyring(&mut self, password: &str) {
+        if !self.remember {
+            return;
+        }
+        match block_on(keyring::store(password)) {
+            Ok(()) => self.set_keyring("stored"),
+            Err(_) => self.set_keyring("unavailable"),
+        }
+    }
+
+    fn set_remember(&mut self, on: bool) {
+        if self.remember == on {
+            return;
+        }
+        self.remember = on;
+        self.remember_changed();
+        // Turning it off takes the entry back out at once; the record and the
+        // password the person typed are untouched. Turning it on cannot do
+        // the reverse — only the password's owner has the password, and the
+        // app holds the derived key instead — so it applies from the next
+        // unlock on.
+        if !on {
+            let _ = block_on(keyring::forget());
+            self.set_keyring("nothing");
         }
     }
 
@@ -164,6 +260,9 @@ impl AccountApi {
                     self.label = QString::from(record.label.clone());
                     self.plan = QString::from(record.plan().to_string());
                     self.set_state("locked");
+                    // A record is on disk: if the keyring has its password,
+                    // the app opens itself and nobody is asked anything.
+                    self.unlock_from_keyring();
                 }
                 Err(e) => {
                     self.set_state("none");
@@ -176,19 +275,47 @@ impl AccountApi {
 
     fn create_account(&mut self, label: QString, password: QString) -> bool {
         self.clear_error();
+        self.set_recovery(String::new());
         let label = label.to_string().trim().to_string();
-        let password = password.to_string();
+        let mut password = Zeroizing::new(password.to_string());
         if label.is_empty() {
             self.set_error("Give the account a name you'll recognise — it is only ever shown here.");
             return false;
         }
-        if password.chars().count() < MIN_PASSWORD {
-            self.set_error(format!("Use at least {MIN_PASSWORD} characters."));
+        // An empty field means "I don't want to remember one": make a strong
+        // one and let the keyring hold it. That is only honest if the keyring
+        // is there — a record sealed under a password nobody holds is a
+        // brick — so the keyring is asked first, before the record exists.
+        let made_up = password.is_empty();
+        if made_up {
+            if !block_on(keyring::available()) {
+                self.set_keyring("unavailable");
+                self.set_error(
+                    "No keyring is available on this session (KWallet 6 or GNOME \
+                     Keyring), so the record needs a password of yours.",
+                );
+                return false;
+            }
+            *password = made_up_password().to_string();
+            if let Err(e) = block_on(keyring::store(&password)) {
+                self.set_keyring("unavailable");
+                self.set_error(format!("Couldn't put the password in the keyring: {e}"));
+                return false;
+            }
+            self.set_keyring("stored");
+        } else if password.chars().count() < vault::MIN_PASSWORD {
+            self.set_error(format!(
+                "Use at least {} characters, or leave it empty to keep one in the keyring.",
+                vault::MIN_PASSWORD
+            ));
             return false;
         }
         let (record, _account) = match vault::create(&label, &password, None) {
             Ok(v) => v,
             Err(e) => {
+                if made_up {
+                    let _ = block_on(keyring::forget());
+                }
                 self.set_error(e.to_string());
                 return false;
             }
@@ -196,6 +323,9 @@ impl AccountApi {
         let key = match vault::record_key(&record, &password) {
             Ok(k) => k,
             Err(e) => {
+                if made_up {
+                    let _ = block_on(keyring::forget());
+                }
                 self.set_error(e.to_string());
                 return false;
             }
@@ -203,13 +333,26 @@ impl AccountApi {
         let account = match vault::open_with_key(&record, &key) {
             Ok(a) => a,
             Err(e) => {
+                if made_up {
+                    let _ = block_on(keyring::forget());
+                }
                 self.set_error(e.to_string());
                 return false;
             }
         };
         if let Err(e) = self.store(record, key, account) {
+            if made_up {
+                let _ = block_on(keyring::forget());
+            }
             self.set_error(e);
             return false;
+        }
+        if made_up {
+            // Shown once: this is the only copy outside the keyring, and the
+            // only way a browser backup of this record can be opened.
+            self.set_recovery(password.to_string());
+        } else {
+            self.keep_in_keyring(&password);
         }
         self.set_state("unlocked");
         self.publish();
@@ -217,6 +360,47 @@ impl AccountApi {
     }
 
     fn unlock(&mut self, password: QString) -> bool {
+        let password = Zeroizing::new(password.to_string());
+        self.unlock_with(&password, true)
+    }
+
+    /// Open the record with the password the keyring holds, in the background
+    /// so a KWallet prompt cannot freeze the window. Called by the QML about
+    /// a second after start, and by the "Unlock with KWallet" button.
+    fn unlock_from_keyring(&mut self) {
+        self.clear_error();
+        self.set_keyring("checking");
+        let qpointer = QPointer::from(&*self);
+        qmetaobject::future::execute_async(async move {
+            let outcome = keyring::load().await;
+            if let Some(api) = qpointer.as_pinned() {
+                let mut a = api.borrow_mut();
+                match outcome {
+                    Ok(Some(password)) => {
+                        a.set_keyring("stored");
+                        if a.unlock_with(&password, false) {
+                            a.set_error(String::new());
+                        } else {
+                            // The entry is stale: the record was re-sealed
+                            // since. Drop it rather than offer it again, and
+                            // say nothing — the form in front of the person
+                            // is the answer.
+                            let _ = keyring::forget().await;
+                            a.set_keyring("nothing");
+                            a.set_error(String::new());
+                        }
+                    }
+                    Ok(None) => a.set_keyring("nothing"),
+                    Err(_) => a.set_keyring("unavailable"),
+                }
+            }
+        });
+    }
+
+    /// The work behind both ways in. `keep` says whether a password that
+    /// worked is put in the keyring — not when the keyring is where it came
+    /// from, and not when the person asked for it not to be.
+    fn unlock_with(&mut self, password: &str, keep: bool) -> bool {
         self.clear_error();
         let path = account_path();
         let text = match std::fs::read_to_string(&path) {
@@ -234,7 +418,7 @@ impl AccountApi {
                 return false;
             }
         };
-        let key = match vault::record_key(&record, &password.to_string()) {
+        let key = match vault::record_key(&record, password) {
             Ok(k) => k,
             Err(e) => {
                 self.set_error(e.to_string());
@@ -249,6 +433,9 @@ impl AccountApi {
                 }
                 self.set_state("unlocked");
                 self.publish();
+                if keep {
+                    self.keep_in_keyring(password);
+                }
                 true
             }
             Err(e) => {
@@ -276,6 +463,11 @@ impl AccountApi {
                 return false;
             }
         }
+        // The keyring entry goes with the record: a password with nothing to
+        // open is litter, and the next record must not inherit it.
+        let _ = block_on(keyring::forget());
+        self.set_keyring("nothing");
+        self.set_recovery(String::new());
         *self.local.borrow_mut() = None;
         self.label = QString::from("");
         self.plan = QString::from("");
@@ -413,9 +605,30 @@ mod tests {
     //! the token and the public point, and both an account and a refusal are
     //! read back the way the prototype server writes them.
 
-    use super::activate_on;
+    use super::{activate_on, made_up_password};
+    use bitmule_account as vault;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// What the app invents when the password field is left empty has to be a
+    /// password the vault seals under and the browser's field would take:
+    /// base64url, 43 characters, and not the same twice.
+    #[test]
+    fn the_made_up_password_is_a_password() {
+        let a = made_up_password();
+        let b = made_up_password();
+        assert_ne!(*a, *b);
+        assert_eq!(a.chars().count(), 43);
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "{}",
+            a.as_str()
+        );
+        assert!(a.chars().count() >= vault::MIN_PASSWORD);
+        // and it does the job it is made for: seal a record, open it again
+        let (record, _) = vault::create("laptop", &a, None).unwrap();
+        assert_eq!(vault::open(&record, &a).unwrap().label, "laptop");
+    }
 
     /// Answer one request with `status` and `body`, and hand back what was
     /// asked.

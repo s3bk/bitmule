@@ -24,4 +24,12 @@ open = "5"
 walkdir = { workspace = true }
 zip = { workspace = true, features = ["deflate", "zstd"] }
 zeroize = "1.9"
+getrandom = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# The account password, kept where the desktop keeps secrets: KWallet 6 on
+# KDE, GNOME Keyring elsewhere — both speak the Secret Service API, which is
+# D-Bus only (no libdbus: zbus speaks the wire protocol itself).
+secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
+# Not called directly: `secret-service` leaves the D-Bus runtime to the
+# application, and this one already runs tokio, so zbus must too.
+zbus = { version = "4", default-features = false, features = ["tokio"] }

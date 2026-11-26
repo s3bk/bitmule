@@ -486,7 +486,10 @@ ApplicationWindow {
             // (bitmule-account) as bitmule.net/app's vault.js. Nothing here
             // is sent anywhere except the one activation call, which spends
             // the operator's one-time token so the account may mint storage.
-            // The password is asked for again only after a lock or a restart.
+            // The password is not the person's to remember: it is made by the
+            // app or typed once, and then kept in the desktop's keyring, so a
+            // lock or a restart opens without a prompt. Without a keyring the
+            // password is asked for, and nothing else changes.
             ColumnLayout {
                 spacing: 10
 
@@ -528,7 +531,9 @@ ApplicationWindow {
                             color: theme.fgFaint
                             text: "The key is made here; the server is not asked anything. "
                                 + "You get a record you can back up, and the same password "
-                                + "opens it at bitmule.net/app."
+                                + "opens it at bitmule.net/app. Leave the password empty and "
+                                + "one is made for you and kept in the desktop's keyring — "
+                                + "nothing to remember."
                         }
                         TextField {
                             id: createLabel
@@ -539,7 +544,7 @@ ApplicationWindow {
                         TextField {
                             id: createPassword
                             Layout.fillWidth: true
-                            placeholderText: "password (8+ characters)"
+                            placeholderText: "password (10+ characters, or empty for none)"
                             echoMode: TextInput.Password
                             font.pixelSize: 12
                         }
@@ -550,10 +555,17 @@ ApplicationWindow {
                             echoMode: TextInput.Password
                             font.pixelSize: 12
                         }
+                        CheckBox {
+                            id: createRemember
+                            text: "Keep the password in the keyring (KWallet)"
+                            checked: account.remember
+                            font.pixelSize: 11
+                            onToggled: account.set_remember(checked)
+                        }
                         Button {
                             Layout.fillWidth: true
                             text: "Create account"
-                            enabled: !account.busy && createPassword.text.length > 0
+                            enabled: !account.busy && createLabel.text.length > 0
                                 && createPassword.text === createPassword2.text
                             onClicked: {
                                 if (account.create_account(createLabel.text, createPassword.text)) {
@@ -561,6 +573,35 @@ ApplicationWindow {
                                     createPassword2.text = ""
                                 }
                             }
+                        }
+                    }
+                }
+
+                // ---- the password the app made, shown once ----
+                GroupBox {
+                    Layout.fillWidth: true
+                    title: "Write this down"
+                    visible: account.recovery.length > 0
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 8
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Label.WordWrap
+                            font.pixelSize: 11
+                            color: theme.fgFaint
+                            text: "The app made this password and keeps it in the keyring, "
+                                + "so you never have to type it. It is the only way a copy "
+                                + "of the record can be opened in a browser; this is the one "
+                                + "time it is shown."
+                        }
+                        TextField {
+                            Layout.fillWidth: true
+                            readOnly: true
+                            text: account.recovery
+                            font.pixelSize: 12
+                            font.family: "monospace"
+                            selectByMouse: true
                         }
                     }
                 }
@@ -573,6 +614,22 @@ ApplicationWindow {
                     ColumnLayout {
                         anchors.fill: parent
                         spacing: 8
+                        Label {
+                            Layout.fillWidth: true
+                            wrapMode: Label.WordWrap
+                            font.pixelSize: 11
+                            color: theme.fgFaint
+                            text: {
+                                if (account.keyring === "checking")
+                                    return "Asking the keyring for this account's password…"
+                                if (account.keyring === "stored")
+                                    return "Its password is in the keyring."
+                                if (account.keyring === "unavailable")
+                                    return "No keyring on this session (KWallet 6 or GNOME "
+                                        + "Keyring), so the password is typed here."
+                                return "The password you typed when this record was made."
+                            }
+                        }
                         TextField {
                             id: unlockPassword
                             Layout.fillWidth: true
@@ -581,14 +638,26 @@ ApplicationWindow {
                             font.pixelSize: 12
                             onAccepted: unlockButton.clicked()
                         }
-                        Button {
-                            id: unlockButton
+                        RowLayout {
                             Layout.fillWidth: true
-                            text: "Unlock"
-                            enabled: !account.busy && unlockPassword.text.length > 0
-                            onClicked: {
-                                if (account.unlock(unlockPassword.text))
-                                    unlockPassword.text = ""
+                            spacing: 6
+                            Button {
+                                id: unlockButton
+                                Layout.fillWidth: true
+                                text: "Unlock"
+                                enabled: !account.busy && unlockPassword.text.length > 0
+                                onClicked: {
+                                    if (account.unlock(unlockPassword.text))
+                                        unlockPassword.text = ""
+                                }
+                            }
+                            Button {
+                                Layout.fillWidth: true
+                                text: "Use the keyring"
+                                visible: account.keyring !== "unavailable"
+                                    && account.keyring !== "nothing"
+                                enabled: !account.busy && account.keyring !== "checking"
+                                onClicked: account.unlock_from_keyring()
                             }
                         }
                     }
@@ -638,6 +707,14 @@ ApplicationWindow {
                             font.pixelSize: 11
                             color: theme.fgMuted
                             text: "Talking to the server…"
+                        }
+
+                        CheckBox {
+                            Layout.fillWidth: true
+                            text: "Keep the password in the keyring"
+                            checked: account.remember
+                            font.pixelSize: 11
+                            onToggled: account.set_remember(checked)
                         }
 
                         RowLayout {

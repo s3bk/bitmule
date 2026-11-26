@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use url::Url;
 
 mod account;
+mod keyring;
 
 const BITMULE_URL_PREFIX: &str = "https://bitmule.qdat.net/#";
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
