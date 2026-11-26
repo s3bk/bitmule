@@ -3,7 +3,9 @@ use qmetaobject::*;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use url::Url;
 
 mod account;
@@ -20,6 +22,10 @@ const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 /// One file is sent as it is; several files, or a directory, go as a zip the
 /// builder makes. v2 has no "keep the link live for more receivers" mode, so
 /// the old multi-send option no longer does anything.
+///
+/// Every stage says so on stderr: the window only shows "Preparing…", and a
+/// phase that takes minutes (hashing a big file, zipping a directory, the
+/// server's proof of work) has to be distinguishable from a hang.
 async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
     use bitmule::v2::{self, Options, Server};
     use bitmule_client_common::transfer::{Storage, TransferBuilder};
@@ -33,40 +39,60 @@ async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
         return Err("no file selected".into());
     }
 
+    log(format!("share: {} path(s) selected", files.len()));
     let mut builder = TransferBuilder::new();
+    let mut total_bytes = 0u64;
     for path in &files {
         match tokio::fs::metadata(path).await {
             Ok(md) if md.is_file() => {
+                log(format!("  file {} ({} bytes)", path.display(), md.len()));
+                total_bytes += md.len();
                 builder.add_file(Storage::File(path.clone()), path.file_name().map(PathBuf::from));
             }
             Ok(md) if md.is_dir() => {
                 // the directory's name stays the first component of every entry
                 let base = path.parent().unwrap_or(Path::new("")).to_path_buf();
+                let (mut entries, mut bytes) = (0u64, 0u64);
                 for entry in walkdir::WalkDir::new(path).sort_by_file_name().into_iter().flatten() {
                     if !entry.file_type().is_file() {
                         continue;
                     }
+                    if let Ok(md) = entry.metadata() {
+                        entries += 1;
+                        bytes += md.len();
+                    }
                     let name = entry.path().strip_prefix(&base).unwrap_or(entry.path()).to_path_buf();
                     builder.add_file(Storage::File(entry.path().to_path_buf()), Some(name));
                 }
+                log(format!("  dir {} ({entries} files, {bytes} bytes)", path.display()));
+                total_bytes += bytes;
             }
             Ok(_) => return Err("not a regular file or directory".into()),
             Err(e) => return Err(format!("stat {}: {e}", path.display())),
         }
     }
     // a lone directory still goes as a zip, even with a single file inside
-    if files.len() > 1 || files.iter().any(|p| p.is_dir()) {
+    let zipped = files.len() > 1 || files.iter().any(|p| p.is_dir());
+    if zipped {
         builder.force_multi_file_zip();
     }
+    log(format!(
+        "share: {} bytes{}",
+        total_bytes,
+        if zipped { " as a zip" } else { "" }
+    ));
 
-    // hashes the data for the link's signature
+    // hashes the data for the link's signature (and builds the zip, if any)
+    let phase = Phase::start("hashing the data for the link signature");
     let (manifest, transfer) = match builder.commit_async().await {
         Ok(v) => v,
         Err(e) => return Err(format!("prepare: {e:#}")),
     };
+    log("share: hashed, the data is ready to send");
 
     let server = Server::parse(SERVER);
     let (link_tx, link_rx) = tokio::sync::oneshot::channel::<String>();
+    phase.set("waiting for bitmule.net (proof of work, then the session)");
     tokio::spawn(async move {
         let server_for_url = server.clone();
         let mut link_tx = Some(link_tx);
@@ -76,19 +102,27 @@ async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
             }
         })
         .await;
-        if let Err(e) = result {
-            eprintln!("bitmule send failed: {e:#}");
+        match result {
+            Ok(()) => log("share: send finished, the link stays valid while peers use it"),
+            Err(e) => log(format!("share: send failed: {e:#}")),
         }
     });
 
     // Making the session is the server's answer, before any data moves, so a
     // minute here is generous — and better than the tab waiting forever.
-    match tokio::time::timeout(std::time::Duration::from_secs(60), link_rx).await {
+    let outcome = match tokio::time::timeout(Duration::from_secs(60), link_rx).await {
         Ok(Ok(url)) => Url::parse(&url).map_err(|e| format!("bad share URL from the server: {e}")),
         Ok(Err(_)) => Err(format!("couldn't reach {SERVER}")),
         Err(_) => Err(format!("{SERVER} didn't answer within 60 s")),
+    };
+    drop(phase);
+    match &outcome {
+        Ok(url) => log(format!("share: link {url}")),
+        Err(e) => log(format!("share: failed: {e}")),
     }
+    outcome
 }
+
 
 
 #[derive(QObject, Default)]
@@ -202,6 +236,7 @@ impl UploaderApi {
     }
 
     fn trigger_share(&mut self) {
+        log(format!("share: button pressed, {} path(s) in the list", self.paths.borrow().len()));
         self.is_busy = true;
         self.is_busy_changed();
         // a new attempt at once: the old link (and any old error) is stale
@@ -244,23 +279,26 @@ impl UploaderApi {
             };
 
             // Update UI safely on main thread
-            if let Some(api) = qpointer.as_pinned() {
-                {
-                    let mut a = api.borrow_mut();
-                    match outcome {
-                        Ok((url_str, qr)) => {
-                            a.share_url = QString::from(url_str);
-                            a.qr_data_url = QString::from(qr);
+                if let Some(api) = qpointer.as_pinned() {
+                    log("share: handing the result to the window");
+                    {
+                        let mut a = api.borrow_mut();
+                        match outcome {
+                            Ok((url_str, qr)) => {
+                                a.share_url = QString::from(url_str);
+                                a.qr_data_url = QString::from(qr);
+                            }
+                            Err(e) => a.share_error = QString::from(e),
                         }
-                        Err(e) => a.share_error = QString::from(e),
+                        a.is_busy = false;
                     }
-                    a.is_busy = false;
+                    api.borrow_mut().share_url_changed();
+                    api.borrow_mut().qr_data_url_changed();
+                    api.borrow_mut().share_error_changed();
+                    api.borrow_mut().is_busy_changed();
+                } else {
+                    log("share: the window is gone, dropping the result");
                 }
-                api.borrow_mut().share_url_changed();
-                api.borrow_mut().qr_data_url_changed();
-                api.borrow_mut().share_error_changed();
-                api.borrow_mut().is_busy_changed();
-            }
         });
     }
 
@@ -877,6 +915,7 @@ async fn main() {
         unsafe { std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Basic") };
     }
 
+    log("bitmule-qt6 starting");
     qml_register_type::<UploaderApi>(c_str!("Uploader"), 1, 0, c_str!("UploaderApi"));
     qml_register_type::<account::AccountApi>(c_str!("Uploader"), 1, 0, c_str!("AccountApi"));
 
@@ -884,3 +923,63 @@ async fn main() {
     engine.load_data(include_str!("app.qml").into());
     engine.exec();
 }
+
+/// Terminal log line, stamped with the time since the app started.
+///
+/// The GUI has no console of its own: the QML window only knows "busy" or
+/// "not busy", so a slow phase looks exactly like a hung one. Everything
+/// worth watching therefore goes to stderr, where a run from a terminal
+/// shows it.
+fn log(msg: impl AsRef<str>) {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    eprintln!("[{:>8.3}s] {}", start.elapsed().as_secs_f64(), msg.as_ref());
+}
+
+/// Names the phase a share is in and keeps saying so every few seconds.
+///
+/// Hashing a large file, zipping a directory and waiting on the server are
+/// all silent; without this the terminal is silent too and the user cannot
+/// tell work from a hang. Dropping the guard stops the ticker.
+struct Phase {
+    text: Arc<Mutex<&'static str>>,
+    stop: Arc<AtomicBool>,
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+impl Phase {
+    fn start(what: &'static str) -> Self {
+        let text = Arc::new(Mutex::new(what));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let text = text.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let what = *text.lock().unwrap();
+                    log(format!("still {what}…"));
+                }
+            })
+        };
+        log(what);
+        Self { text, stop, ticker }
+    }
+
+    fn set(&self, what: &'static str) {
+        *self.text.lock().unwrap() = what;
+        log(what);
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.ticker.abort();
+    }
+}
+
+
