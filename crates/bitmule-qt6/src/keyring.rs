@@ -105,6 +105,47 @@ pub async fn load() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
     }
 }
 
+/// Run one keyring call to completion on a thread of its own.
+///
+/// The Qt side reaches these from a slot on the GUI thread, and `main` is
+/// `#[tokio::main]`, so that thread is already inside a runtime: a `block_on`
+/// there panics ("Cannot start a runtime from within a runtime"). Building the
+/// future on the new thread rather than passing it across also means it need
+/// not be `Send`. The round trips on the session bus stay off the UI thread,
+/// which is the second reason these are offered in a blocking shape.
+fn on_own_thread<T, F, Fut>(make: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a tokio runtime for the keyring")
+            .block_on(make())
+    })
+    .join()
+    .map_err(|_| "the keyring call panicked".to_string())
+}
+
+/// `available` for callers on the GUI thread.
+pub fn available_now() -> bool {
+    on_own_thread(|| async { available().await }).unwrap_or(false)
+}
+
+/// `store` for callers on the GUI thread.
+pub fn store_now(key: &[u8; 32]) -> Result<(), String> {
+    let key = *key;
+    on_own_thread(move || async move { store(&key).await })?
+}
+
+/// `forget` for callers on the GUI thread.
+pub fn forget_now() -> Result<(), String> {
+    on_own_thread(|| async { forget().await })?
+}
+
 /// Drop our entry. Used when the record is forgotten, and when a key we kept
 /// turns out not to open the record (a stale entry).
 pub async fn forget() -> Result<(), String> {
@@ -119,4 +160,28 @@ pub async fn forget() -> Result<(), String> {
             .map_err(|e| format!("couldn't remove it: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::on_own_thread;
+
+    /// The Qt slots run on the thread `#[tokio::main]` is driving, so the
+    /// blocking shape of these calls has to work from *inside* a runtime —
+    /// the first version made its own runtime there and panicked with
+    /// "Cannot start a runtime from within a runtime". Outside one must work
+    /// just as well.
+    #[test]
+    fn a_keyring_call_survives_being_made_from_inside_a_runtime() {
+        assert_eq!(on_own_thread(|| async { 7u32 }).unwrap(), 7);
+
+        let rt = tokio::runtime::Runtime::new().expect("a runtime");
+        let from_inside = rt.block_on(async { on_own_thread(|| async { 11u32 }) });
+        assert_eq!(from_inside.unwrap(), 11);
+
+        // ... and from a task the runtime is driving, which is where the Qt
+        // event loop actually sits.
+        let from_a_task = rt.block_on(async { tokio::spawn(async { on_own_thread(|| async { 13u32 }) }).await });
+        assert_eq!(from_a_task.unwrap().unwrap(), 13);
+    }
 }

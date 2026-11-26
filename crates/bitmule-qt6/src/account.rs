@@ -36,18 +36,6 @@ use zeroize::Zeroizing;
 const ACCOUNT_FILE_NAME: &str = "account.json";
 const DEFAULT_SERVER: &str = "https://bitmule.qdat.net";
 
-/// Run one keyring call to completion on the thread that asked. The keyring is
-/// D-Bus, which is async; these calls are short (a search, a store) and happen
-/// once per create, unlock or forget, beside a PBKDF2 that already blocks
-/// longer.
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a tokio runtime")
-        .block_on(fut)
-}
-
 /// A password nobody has to invent: 32 random bytes in base64url — 43
 /// characters, the same shape a person could have typed.
 fn made_up_password() -> Zeroizing<String> {
@@ -193,7 +181,7 @@ impl AccountApi {
         if !self.remember {
             return;
         }
-        match block_on(keyring::store(key)) {
+        match keyring::store_now(key) {
             Ok(()) => self.set_keyring("stored"),
             Err(_) => self.set_keyring("unavailable"),
         }
@@ -210,12 +198,12 @@ impl AccountApi {
         // while unlocked the app holds the key itself, so there is nothing to
         // wait for.
         if !on {
-            let _ = block_on(keyring::forget());
+            let _ = keyring::forget_now();
             self.set_keyring("nothing");
         } else {
             let key = self.local.borrow().as_ref().map(|l| l.key.clone());
             if let Some(key) = key {
-                match block_on(keyring::store(&key)) {
+                match keyring::store_now(&key) {
                     Ok(()) => self.set_keyring("stored"),
                     Err(_) => self.set_keyring("unavailable"),
                 }
@@ -295,7 +283,7 @@ impl AccountApi {
         // brick — so the keyring is asked first, before the record exists.
         let made_up = password.is_empty();
         if made_up {
-            if !block_on(keyring::available()) {
+            if !keyring::available_now() {
                 self.set_keyring("unavailable");
                 self.set_error(
                     "No keyring is available on this session (KWallet 6 or GNOME \
@@ -336,7 +324,7 @@ impl AccountApi {
         // typed, a record on disk whose key is not in the keyring would be a
         // brick, so that order is the whole point.
         if made_up {
-            match block_on(keyring::store(&key)) {
+            match keyring::store_now(&key) {
                 Ok(()) => self.set_keyring("stored"),
                 Err(e) => {
                     self.set_keyring("unavailable");
@@ -349,7 +337,7 @@ impl AccountApi {
         }
         if let Err(e) = self.store(record, key, account) {
             if made_up {
-                let _ = block_on(keyring::forget());
+                let _ = keyring::forget_now();
             }
             self.set_error(e);
             return false;
@@ -494,7 +482,7 @@ impl AccountApi {
         }
         // The keyring entry goes with the record: a password with nothing to
         // open is litter, and the next record must not inherit it.
-        let _ = block_on(keyring::forget());
+        let _ = keyring::forget_now();
         self.set_keyring("nothing");
         self.set_recovery(String::new());
         *self.local.borrow_mut() = None;
