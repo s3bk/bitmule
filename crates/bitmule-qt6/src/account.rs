@@ -17,14 +17,14 @@
 //! the derived key is held instead, and it is that key which re-seals the
 //! record when activation stores the account id and secret.
 //!
-//! The password itself lives in the desktop's keyring (`keyring.rs`: KWallet 6
-//! or GNOME Keyring over the Secret Service API) whenever one is there, so it
-//! is typed once and never again. A person who would rather not have one at
-//! all can leave the field empty: the app then makes a random password, seals
-//! the record with it and puts it in the keyring — the record stays exactly
-//! the browser's shape, so a backup still opens at bitmule.net/app with the
-//! password the app showed once. Where there is no keyring, the password is
-//! asked for, as before.
+//! The key itself lives in the desktop's keyring (`keyring.rs`: KWallet 6 or
+//! GNOME Keyring over the Secret Service API) whenever one is there, so the
+//! password is typed once and never again. A person who would rather not have
+//! one at all can leave the field empty: the app then makes a random password,
+//! seals the record with it and keeps the key it derived — the record stays
+//! exactly the browser's shape, so a backup still opens at bitmule.net/app
+//! with the password the app showed once. Where there is no keyring, the
+//! password is asked for, as before.
 
 use crate::keyring;
 use base64::Engine;
@@ -101,7 +101,7 @@ pub struct AccountApi {
     /// can be typed in instead of the public one.
     server: qt_property!(QString; NOTIFY server_changed),
     /// What the keyring says: `""` (not asked yet — the form is the way in),
-    /// `"checking"`, `"stored"` (it holds this account's password),
+    /// `"checking"`, `"stored"` (it holds this account's key),
     /// `"nothing"` (it works, nothing stored) or `"unavailable"` (no Secret
     /// Service on this session, so a password is a thing to remember).
     keyring: qt_property!(QString; NOTIFY keyring_changed),
@@ -186,14 +186,14 @@ impl AccountApi {
         }
     }
 
-    /// Put the password in the keyring when the person asked for that and the
+    /// Put the key in the keyring when the person asked for that and the
     /// session has one. A failure is not an error: the password still works,
     /// it just has to be typed at the next start.
-    fn keep_in_keyring(&mut self, password: &str) {
+    fn keep_in_keyring(&mut self, key: &[u8; 32]) {
         if !self.remember {
             return;
         }
-        match block_on(keyring::store(password)) {
+        match block_on(keyring::store(key)) {
             Ok(()) => self.set_keyring("stored"),
             Err(_) => self.set_keyring("unavailable"),
         }
@@ -206,13 +206,20 @@ impl AccountApi {
         self.remember = on;
         self.remember_changed();
         // Turning it off takes the entry back out at once; the record and the
-        // password the person typed are untouched. Turning it on cannot do
-        // the reverse — only the password's owner has the password, and the
-        // app holds the derived key instead — so it applies from the next
-        // unlock on.
+        // key in memory are untouched. Turning it on can be done now as well:
+        // while unlocked the app holds the key itself, so there is nothing to
+        // wait for.
         if !on {
             let _ = block_on(keyring::forget());
             self.set_keyring("nothing");
+        } else {
+            let key = self.local.borrow().as_ref().map(|l| l.key.clone());
+            if let Some(key) = key {
+                match block_on(keyring::store(&key)) {
+                    Ok(()) => self.set_keyring("stored"),
+                    Err(_) => self.set_keyring("unavailable"),
+                }
+            }
         }
     }
 
@@ -297,12 +304,6 @@ impl AccountApi {
                 return false;
             }
             *password = made_up_password().to_string();
-            if let Err(e) = block_on(keyring::store(&password)) {
-                self.set_keyring("unavailable");
-                self.set_error(format!("Couldn't put the password in the keyring: {e}"));
-                return false;
-            }
-            self.set_keyring("stored");
         } else if password.chars().count() < vault::MIN_PASSWORD {
             self.set_error(format!(
                 "Use at least {} characters, or leave it empty to keep one in the keyring.",
@@ -313,9 +314,6 @@ impl AccountApi {
         let (record, _account) = match vault::create(&label, &password, None) {
             Ok(v) => v,
             Err(e) => {
-                if made_up {
-                    let _ = block_on(keyring::forget());
-                }
                 self.set_error(e.to_string());
                 return false;
             }
@@ -323,9 +321,6 @@ impl AccountApi {
         let key = match vault::record_key(&record, &password) {
             Ok(k) => k,
             Err(e) => {
-                if made_up {
-                    let _ = block_on(keyring::forget());
-                }
                 self.set_error(e.to_string());
                 return false;
             }
@@ -333,13 +328,25 @@ impl AccountApi {
         let account = match vault::open_with_key(&record, &key) {
             Ok(a) => a,
             Err(e) => {
-                if made_up {
-                    let _ = block_on(keyring::forget());
-                }
                 self.set_error(e.to_string());
                 return false;
             }
         };
+        // The key goes in before the record does: with a password nobody
+        // typed, a record on disk whose key is not in the keyring would be a
+        // brick, so that order is the whole point.
+        if made_up {
+            match block_on(keyring::store(&key)) {
+                Ok(()) => self.set_keyring("stored"),
+                Err(e) => {
+                    self.set_keyring("unavailable");
+                    self.set_error(format!("Couldn't put the key in the keyring: {e}"));
+                    return false;
+                }
+            }
+        } else {
+            self.keep_in_keyring(&key);
+        }
         if let Err(e) = self.store(record, key, account) {
             if made_up {
                 let _ = block_on(keyring::forget());
@@ -351,8 +358,6 @@ impl AccountApi {
             // Shown once: this is the only copy outside the keyring, and the
             // only way a browser backup of this record can be opened.
             self.set_recovery(password.to_string());
-        } else {
-            self.keep_in_keyring(&password);
         }
         self.set_state("unlocked");
         self.publish();
@@ -376,9 +381,9 @@ impl AccountApi {
             if let Some(api) = qpointer.as_pinned() {
                 let mut a = api.borrow_mut();
                 match outcome {
-                    Ok(Some(password)) => {
+                    Ok(Some(key)) => {
                         a.set_keyring("stored");
-                        if a.unlock_with(&password, false) {
+                        if a.unlock_with_key(key) {
                             a.set_error(String::new());
                         } else {
                             // The entry is stale: the record was re-sealed
@@ -397,24 +402,15 @@ impl AccountApi {
         });
     }
 
-    /// The work behind both ways in. `keep` says whether a password that
-    /// worked is put in the keyring — not when the keyring is where it came
-    /// from, and not when the person asked for it not to be.
+    /// The work behind both ways in. `keep` says whether a key that worked is
+    /// put in the keyring — not when the keyring is where it came from, and
+    /// not when the person asked for it not to be.
     fn unlock_with(&mut self, password: &str, keep: bool) -> bool {
         self.clear_error();
-        let path = account_path();
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => {
-                self.set_state("none");
-                self.set_error("There is no account on this device.");
-                return false;
-            }
-        };
-        let record = match vault::parse(&text) {
+        let record = match self.read_record() {
             Ok(r) => r,
             Err(e) => {
-                self.set_error(e.to_string());
+                self.set_error(e);
                 return false;
             }
         };
@@ -425,24 +421,57 @@ impl AccountApi {
                 return false;
             }
         };
-        match vault::open_with_key(&record, &key) {
-            Ok(account) => {
-                if let Err(e) = self.store(record, key, account) {
-                    self.set_error(e);
-                    return false;
-                }
-                self.set_state("unlocked");
-                self.publish();
-                if keep {
-                    self.keep_in_keyring(password);
-                }
-                true
+        self.open_record(record, key, keep)
+    }
+
+    /// Open the record with a key already in hand (the keyring's copy).
+    fn unlock_with_key(&mut self, key: Zeroizing<[u8; 32]>) -> bool {
+        self.clear_error();
+        let record = match self.read_record() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_error(e);
+                return false;
             }
+        };
+        self.open_record(record, key, false)
+    }
+
+    fn read_record(&mut self) -> Result<vault::Record, String> {
+        let path = account_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => {
+                self.set_state("none");
+                return Err("There is no account on this device.".to_string());
+            }
+        };
+        vault::parse(&text).map_err(|e| e.to_string())
+    }
+
+    fn open_record(
+        &mut self,
+        record: vault::Record,
+        key: Zeroizing<[u8; 32]>,
+        keep: bool,
+    ) -> bool {
+        let account = match vault::open_with_key(&record, &key) {
+            Ok(a) => a,
             Err(e) => {
                 self.set_error(format!("{e}."));
-                false
+                return false;
             }
+        };
+        if keep {
+            self.keep_in_keyring(&key);
         }
+        if let Err(e) = self.store(record, key, account) {
+            self.set_error(e);
+            return false;
+        }
+        self.set_state("unlocked");
+        self.publish();
+        true
     }
 
     fn lock(&mut self) {

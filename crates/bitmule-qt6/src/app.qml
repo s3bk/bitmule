@@ -487,9 +487,10 @@ ApplicationWindow {
             // is sent anywhere except the one activation call, which spends
             // the operator's one-time token so the account may mint storage.
             // The password is not the person's to remember: it is made by the
-            // app or typed once, and then kept in the desktop's keyring, so a
-            // lock or a restart opens without a prompt. Without a keyring the
-            // password is asked for, and nothing else changes.
+            // app or typed once, and then the key it unlocks is kept in the
+            // desktop's keyring, so a lock or a restart opens without a
+            // prompt. Without a keyring the password is asked for, and
+            // nothing else changes.
             ColumnLayout {
                 spacing: 10
 
@@ -557,7 +558,7 @@ ApplicationWindow {
                         }
                         CheckBox {
                             id: createRemember
-                            text: "Keep the password in the keyring (KWallet)"
+                            text: "Keep the key in the keyring (KWallet)"
                             checked: account.remember
                             font.pixelSize: 11
                             onToggled: account.set_remember(checked)
@@ -590,7 +591,7 @@ ApplicationWindow {
                             wrapMode: Label.WordWrap
                             font.pixelSize: 11
                             color: theme.fgFaint
-                            text: "The app made this password and keeps it in the keyring, "
+                            text: "The app made this password and keeps the key in the keyring, "
                                 + "so you never have to type it. It is the only way a copy "
                                 + "of the record can be opened in a browser; this is the one "
                                 + "time it is shown."
@@ -621,9 +622,9 @@ ApplicationWindow {
                             color: theme.fgFaint
                             text: {
                                 if (account.keyring === "checking")
-                                    return "Asking the keyring for this account's password…"
+                                    return "Asking the keyring for this account's key…"
                                 if (account.keyring === "stored")
-                                    return "Its password is in the keyring."
+                                    return "Its key is in the keyring."
                                 if (account.keyring === "unavailable")
                                     return "No keyring on this session (KWallet 6 or GNOME "
                                         + "Keyring), so the password is typed here."
@@ -711,7 +712,7 @@ ApplicationWindow {
 
                         CheckBox {
                             Layout.fillWidth: true
-                            text: "Keep the password in the keyring"
+                            text: "Keep the key in the keyring"
                             checked: account.remember
                             font.pixelSize: 11
                             onToggled: account.set_remember(checked)
