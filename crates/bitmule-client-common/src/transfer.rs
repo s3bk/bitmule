@@ -9,6 +9,12 @@ use futures_lite::AsyncReadExt;
 #[cfg(not(target_arch = "wasm32"))]
 use tempfile::NamedTempFile;
 
+/// Above this much data, the manifest carries no per-block hash list: filling
+/// it in means reading (and coding) the whole thing again before the link can
+/// exist, which on a film is minutes. The commitment still checks everything.
+#[cfg(not(target_arch = "wasm32"))]
+const BLOCK_HASHES_ABOVE: u64 = 8 << 20;
+
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::fs::File;
 
@@ -18,8 +24,7 @@ use js_sys::{wasm_bindgen::JsCast, Uint8Array};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, Navigator, window};
 
-use crate::Error;
-#[cfg(target_arch = "wasm32")]
+use crate::Error;#[cfg(target_arch = "wasm32")]
 use crate::{opfs::{self, open_write}, web::open_read};
 
 use bitmule_core::protocol::websocket::{TransferManifest, TransferType};
@@ -79,12 +84,19 @@ impl TransferBuilder {
             )
         };
 
-        // the hashes of what is actually staged for sending
+        // the hashes of what is actually staged for sending. A manifest's list
+        // is a nicety (a receiver may check each block as it lands); past a
+        // few megabytes reading the whole thing again to fill it in is the
+        // difference between a link in seconds and a link in minutes, and the
+        // commitment at the end checks the data anyway.
         #[cfg(not(target_arch = "wasm32"))]
         let block_hashes = {
-            let path = storage.tmp_file.path().to_path_buf();
+            let path = storage.path().to_path_buf();
             let key = bulk_key.clone();
             tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u64>>> {
+                if transfer_size > BLOCK_HASHES_ABOVE {
+                    return Ok(Some(Vec::new()));
+                }
                 crate::fountain::block_hashes(&std::fs::File::open(path)?, transfer_size, &key)
             }).await.map_err(|e| Error::from(anyhow!("hashing the blocks: {e}")))??.unwrap_or_default()
         };
@@ -126,7 +138,7 @@ impl Transfer {
     /// Where the data to send is staged.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn path(&self) -> &std::path::Path {
-        self.data.tmp_file.path()
+        self.data.path()
     }
 
     /// `SHA256(data || bulk_key)`; the signature half of the share link.
@@ -140,7 +152,7 @@ impl Transfer {
         use std::io::SeekFrom;
         use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
         // a fresh handle per call, so concurrent peers don't share a cursor
-        let mut file = File::open(self.data.tmp_file.path()).await?;
+        let mut file = File::open(self.data.path()).await?;
         file.seek(SeekFrom::Start(start)).await?;
         let mut buf = Vec::with_capacity(len);
         file.take(len as u64).read_to_end(&mut buf).await?;
@@ -152,7 +164,7 @@ impl Transfer {
     pub async fn read_exact_at(&self, start: u64, buf: &mut [u8]) -> Result<()> {
         use std::io::SeekFrom;
         use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
-        let mut file = File::open(self.data.tmp_file.path()).await?;
+        let mut file = File::open(self.data.path()).await?;
         file.seek(SeekFrom::Start(start)).await?;
         file.read_exact(buf).await?;
         Ok(())
@@ -196,36 +208,33 @@ impl From<Bytes> for Storage {
 }
 
 async fn storage_to_file(storage: &Storage) -> Result<PreparedFile, Error> {
-    // Native: materialize the Storage into a NamedTempFile so downstream
-    // relay chunking has a single, uniform file-backed reader path. Bytes
-    // get written into a fresh temp file; existing filesystem paths get
-    // copied so the temp file owns the lifecycle (caller-side deletion
-    // semantics stay consistent, and the source file can move / be deleted
-    // without breaking an in-flight transfer).
+    // Native: downstream relay chunking wants one file-backed reader path.
+    // A path that is already a file is used as it is — a copy would write the
+    // whole thing to a temp file before the link could even be made, which for
+    // a film is minutes of "Preparing…" and nothing else. Bytes go into a temp
+    // file, which then owns the lifecycle.
+    //
+    // The trade is that the source must stay where it is for as long as the
+    // transfer runs; the app says so while a share is open. A file that
+    // changes under it is caught (the blocks are hashed across passes).
     //
     // Wasm: the OPFS write path isn't wired yet (see zip_and_commit_wasm's
     // stage-and-hash comment); todo!() surfaces the trait/type mismatch at
     // cargo-check time on wasm, same discipline as the rest of this file.
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let tmp = NamedTempFile::new()
-            .map_err(|e| Error::from(anyhow!("storage_to_file: NamedTempFile::new: {e}")))?;
         match storage {
-            Storage::File(path) => {
-                let dst_path = tmp.path().to_path_buf();
-                tokio::fs::copy(path, &dst_path).await.map_err(|e| {
-                    Error::from(anyhow!("storage_to_file: copy {} -> {}: {e}",
-                        path.display(), dst_path.display()))
-                })?;
-            }
+            Storage::File(path) => Ok(PreparedFile { path: path.clone(), _tmp: None }),
             Storage::Bytes(b) => {
+                let tmp = NamedTempFile::new()
+                    .map_err(|e| Error::from(anyhow!("storage_to_file: NamedTempFile::new: {e}")))?;
                 tokio::fs::write(tmp.path(), b).await.map_err(|e| {
                     Error::from(anyhow!("storage_to_file: write bytes to {}: {e}",
                         tmp.path().display()))
                 })?;
+                Ok(PreparedFile { path: tmp.path().to_path_buf(), _tmp: Some(tmp) })
             }
         }
-        Ok(PreparedFile { tmp_file: tmp })
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -256,10 +265,21 @@ async fn storage_to_file(storage: &Storage) -> Result<PreparedFile, Error> {
 
 struct PreparedFile {
     #[cfg(not(target_arch = "wasm32"))]
-    tmp_file: NamedTempFile,
+    /// Where the data to send is. Either the file the caller named, or a
+    /// temporary one this struct owns (`_tmp` keeps it alive).
+    path: PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
+    _tmp: Option<NamedTempFile>,
 
     #[cfg(target_arch = "wasm32")]
     handle: FileSystemFileHandle
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PreparedFile {
+    fn path(&self) -> &PathBuf {
+        &self.path
+    }
 }
 
 async fn zip_and_commit(
@@ -339,7 +359,7 @@ async fn zip_and_commit_native_impl(
     let mut reader = read_file.compat();
     let (zip_size, commit) = commit_reader(&mut reader, bulk_key).await?;
 
-    Ok((zip_size, commit, Some(unpacked), PreparedFile { tmp_file: tmp }))
+    Ok((zip_size, commit, Some(unpacked), PreparedFile { path: write_path, _tmp: Some(tmp) }))
 }
 
 /// Wasm-side impl, kept close to the original scaffold. Uses OPFS via
