@@ -28,6 +28,46 @@ fn is_bitmule_link(s: &str) -> bool {
 
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 
+/// What one send tells the window while it runs. Every field is optional:
+/// an update changes only what it carries.
+#[derive(Clone, Default)]
+struct SendUpdate {
+    /// "preparing" | "live" | "done" | "error" | "stopped"
+    status: Option<&'static str>,
+    phase: Option<String>,
+    progress: Option<f64>,
+    size: Option<u64>,
+    peers: Option<usize>,
+    url: Option<String>,
+    error: Option<String>,
+}
+
+impl SendUpdate {
+    fn status(status: &'static str, phase: impl Into<String>) -> Self {
+        SendUpdate { status: Some(status), phase: Some(phase.into()), ..Default::default() }
+    }
+    fn phase(phase: impl Into<String>) -> Self {
+        SendUpdate { phase: Some(phase.into()), ..Default::default() }
+    }
+    fn progress(fraction: f64) -> Self {
+        SendUpdate { progress: Some(fraction), ..Default::default() }
+    }
+    fn peers(n: usize) -> Self {
+        SendUpdate { peers: Some(n), ..Default::default() }
+    }
+    fn link(url: impl Into<String>) -> Self {
+        SendUpdate { status: Some("live"), url: Some(url.into()), ..Default::default() }
+    }
+    fn failed(error: impl Into<String>) -> Self {
+        let error = error.into();
+        SendUpdate { status: Some("error"), phase: Some(error.clone()), error: Some(error), ..Default::default() }
+    }
+}
+
+/// How a send reports: from tokio worker threads, and for the length of the
+/// transfer.
+type SendReport = std::sync::Arc<dyn Fn(SendUpdate) + Send + Sync>;
+
 /// Prepare a bitmule share from `files` and spawn the send task in the
 /// background. Returns the share URL as soon as the session exists (the data
 /// is hashed for the link's signature first); the transfer keeps running in
@@ -37,10 +77,18 @@ const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 /// builder makes. v2 has no "keep the link live for more receivers" mode, so
 /// the old multi-send option no longer does anything.
 ///
-/// Every stage says so on stderr: the window only shows "Preparing…", and a
-/// phase that takes minutes (hashing a big file, zipping a directory, the
-/// server's proof of work) has to be distinguishable from a hang.
-async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
+/// Several shares can run at once: nothing here is shared between calls but
+/// the host, so a second one gets its own session and its own link.
+///
+/// Every stage says so on stderr and through `report`: the window used to
+/// show only "Preparing…", and a phase that takes minutes (hashing a big
+/// file, zipping a directory, the server's proof of work) has to be
+/// distinguishable from a hang.
+async fn share(
+    files: Vec<PathBuf>,
+    report: SendReport,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<Url, String> {
     use bitmule::v2::{self, Options, Server};
     use bitmule_client_common::transfer::{Storage, TransferBuilder};
 
@@ -97,6 +145,7 @@ async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
     ));
 
     // hashes the data for the link's signature (and builds the zip, if any)
+    report(SendUpdate { size: Some(total_bytes), ..SendUpdate::phase("hashing the data for the link signature") });
     let phase = Phase::start("hashing the data for the link signature");
     let (manifest, transfer) = match builder.commit_async().await {
         Ok(v) => v,
@@ -107,18 +156,75 @@ async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
     let server = Server::parse(SERVER);
     let (link_tx, link_rx) = tokio::sync::oneshot::channel::<String>();
     phase.set("waiting for bitmule.net (proof of work, then the session)");
+    report(SendUpdate::phase(format!("waiting for {SERVER} (proof of work, then the session)")));
     tokio::spawn(async move {
         let server_for_url = server.clone();
         let mut link_tx = Some(link_tx);
-        let result = v2::run_send(&server, manifest, transfer, Options::default(), move |link| {
-            if let Some(tx) = link_tx.take() {
-                let _ = tx.send(server_for_url.link_url(link));
+
+        // What the receivers say. `peers` counts the ones connected now, and
+        // the progress shown is the furthest of them: one sender can be
+        // feeding two tabs, and the slower one must not make the bar go back.
+        let peers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let per_receiver = std::sync::Arc::new(Mutex::new(std::collections::HashMap::<String, u64>::new()));
+        let on_event: v2::OnSendEvent = {
+            let report = report.clone();
+            let peers = peers.clone();
+            let per_receiver = per_receiver.clone();
+            std::sync::Arc::new(move |event: v2::SendEvent| match event {
+                v2::SendEvent::Connected { .. } => {
+                    let n = peers.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    report(SendUpdate::peers(n));
+                }
+                v2::SendEvent::Progress { receiver, bytes, total } => {
+                    if total == 0 {
+                        return;
+                    }
+                    let best = {
+                        let mut m = per_receiver.lock().unwrap();
+                        let seen = m.entry(receiver).or_insert(0);
+                        if *seen >= bytes {
+                            return;
+                        }
+                        *seen = bytes;
+                        m.values().copied().max().unwrap_or(0)
+                    };
+                    report(SendUpdate::progress((best.min(total)) as f64 / total as f64));
+                }
+                v2::SendEvent::Done { .. } => {}
+            })
+        };
+
+        let on_link = {
+            let report = report.clone();
+            let server_for_url = server_for_url.clone();
+            move |link: &bitmule_client_native::crypto::ShareLink| {
+                let url = server_for_url.link_url(link);
+                report(SendUpdate::link(url.clone()));
+                if let Some(tx) = link_tx.take() {
+                    let _ = tx.send(url);
+                }
             }
-        })
-        .await;
-        match result {
-            Ok(()) => log("share: send finished, the link stays valid while peers use it"),
-            Err(e) => log(format!("share: send failed: {e:#}")),
+        };
+
+        let running = v2::run_send_events(&server, manifest, transfer, Options::default(), on_link, on_event);
+        tokio::pin!(running);
+        tokio::select! {
+            result = &mut running => match result {
+                Ok(()) => {
+                    report(SendUpdate::status("done", "every receiver has the file"));
+                    log("share: send finished, the link stays valid while peers use it");
+                }
+                Err(e) => {
+                    report(SendUpdate::failed(format!("{e:#}")));
+                    log(format!("share: send failed: {e:#}"));
+                }
+            },
+            _ = &mut stop => {
+                // Dropping `running` closes the session: the link stops
+                // answering, and nothing is left in the background.
+                report(SendUpdate::status("stopped", "stopped"));
+                log("share: stopped");
+            }
         }
     });
 
@@ -193,9 +299,24 @@ struct UploaderApi {
     /// Internal store for recv transfers. Rendered to `recv_transfers`
     /// as JSON strings on every mutation.
     recv_state: Arc<Mutex<Vec<RecvTransferState>>>,
+    /// Every send this window has started, oldest first — the Active tab.
+    /// Starting another one does not touch the ones already running: each
+    /// is its own relay session with its own link.
+    send_state: Arc<Mutex<Vec<SendEntry>>>,
+    /// The next id to hand a send. Ids are what QML uses to stop or forget
+    /// one; they are not the link (a send has no link yet while it is
+    /// preparing).
+    send_next_id: Arc<Mutex<u64>>,
+    /// One channel per running send: dropping the sender (or sending on it)
+    /// is what stops the transfer.
+    send_stops: Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<()>>>>,
 
     // Invokable methods from QML
     add_files: qt_method!(fn(&mut self, urls: QVariantList)),
+    /// Forget one entry of the share list, by its position in it.
+    remove_file: qt_method!(fn(&mut self, index: i32)),
+    /// Empty the share list.
+    clear_files: qt_method!(fn(&mut self)),
     trigger_share: qt_method!(fn(&mut self)),
     /// Copy the current share_url to the system clipboard. QML calls
     /// this from a Copy button; it also fires automatically inside
@@ -228,6 +349,23 @@ struct UploaderApi {
     drop_recv_transfer: qt_method!(fn(&mut self, url: QString)),
     /// Open the receiver's out dir in the system file manager.
     open_recv_dir: qt_method!(fn(&mut self)),
+
+    // ---- the Active tab: every send this window has started ----
+    /// JSON-string list, one per send, oldest first. Each entry:
+    /// `{ "id": u64, "name": String, "size": u64, "progress": 0..1,
+    /// "status": "preparing"|"live"|"done"|"error", "phase": String,
+    /// "url": String, "peers": usize, "error": String }`. QML delegate
+    /// `JSON.parse(modelData)` — the same shape the receive list uses.
+    sends: qt_property!(QStringList; NOTIFY sends_changed),
+    sends_changed: qt_signal!(),
+    /// Stop one send by id: the relay session closes and the link stops
+    /// answering. The entry stays in the list, marked stopped.
+    stop_send: qt_method!(fn(&mut self, id: QString)),
+    /// Forget one entry by id (a send that has finished, failed or been
+    /// stopped). A running send is stopped first.
+    drop_send: qt_method!(fn(&mut self, id: QString)),
+    /// Copy any text (a link out of the Active list) to the clipboard.
+    copy_text: qt_method!(fn(&mut self, text: QString) -> bool),
 }
 
 impl UploaderApi {
@@ -237,83 +375,204 @@ impl UploaderApi {
 
         for url_var in urls.into_iter() {
             let url_str = url_var.to_qstring().to_string();
-            // Clean up file:// prefix from Qt URLs
-            let clean_path = url_str.trim_start_matches("file://");
-            let path = PathBuf::from(clean_path);
+            // Qt hands a drop over as QUrl, whose text form percent-encodes
+            // everything that is not plain ASCII: a name with a space, a
+            // bracket or an accent arrives as `Shrek%202%20(2004)` and the
+            // path is then a file that does not exist.
+            let clean_path = file_url_to_path(&url_str);
+            let path = PathBuf::from(&clean_path);
 
-            paths.push(path.clone());
-            list.push(QString::from(clean_path));
+            paths.push(path);
+            list.push(QString::from(clean_path.as_str()));
         }
 
         self.file_list = QStringList::from(list);
         self.file_list_changed();
     }
 
+    fn remove_file(&mut self, index: i32) {
+        let i = index.max(0) as usize;
+        {
+            let mut paths = self.paths.borrow_mut();
+            if i >= paths.len() { return; }
+            paths.remove(i);
+        }
+        let mut list = self.file_list.clone();
+        if i < list.len() {
+            list.remove(i);
+        }
+        self.file_list = QStringList::from(list);
+        self.file_list_changed();
+    }
+
+    fn clear_files(&mut self) {
+        self.paths.borrow_mut().clear();
+        self.file_list = QStringList::default();
+        self.file_list_changed();
+    }
+
     fn trigger_share(&mut self) {
-        log(format!("share: button pressed, {} path(s) in the list", self.paths.borrow().len()));
+        let paths = self.paths.borrow().clone();
+        if paths.is_empty() {
+            self.share_error = QString::from("drop a file or a folder first");
+            self.share_error_changed();
+            return;
+        }
+        log(format!("share: button pressed, {} path(s) in the list", paths.len()));
+
+        // A send is a thing that stays: it gets an id of its own, a row in the
+        // Active tab, and its own stop channel. Nothing about it overlaps with
+        // the send before it, so another one can be started while it runs.
+        let id = {
+            let mut next = self.send_next_id.lock().unwrap();
+            *next += 1;
+            *next
+        };
+        let (name, size) = describe_selection(&paths);
+        {
+            let mut list = self.send_state.lock().unwrap();
+            list.push(SendEntry {
+                id,
+                name,
+                size,
+                progress: 0.0,
+                status: "preparing".into(),
+                phase: "reading the selection".into(),
+                url: String::new(),
+                peers: 0,
+                error: String::new(),
+            });
+        }
+        self.refresh_sends();
         self.is_busy = true;
         self.is_busy_changed();
-        // a new attempt at once: the old link (and any old error) is stale
-        self.share_url = QString::default();
-        self.qr_data_url = QString::default();
+        // The picked files are the ones this send was made from: the list is
+        // emptied so the next drop starts a new send, not a wider first one.
+        self.paths.borrow_mut().clear();
+        self.file_list = QStringList::default();
+        self.file_list_changed();
+        // The last link stays on the Send tab until a new one arrives; the
+        // error under it is about the last attempt, so it goes now.
         self.share_error = QString::default();
-        self.share_url_changed();
-        self.qr_data_url_changed();
         self.share_error_changed();
 
-        let paths = self.paths.borrow().clone();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        if let Ok(mut stops) = self.send_stops.lock() {
+            stops.insert(id, stop_tx);
+        }
+
+        let state = self.send_state.clone();
         let active_urls = self.active_share_urls.clone();
         let qpointer = QPointer::from(&*self);
 
-        // Run async operation
-        qmetaobject::future::execute_async(async move {
-            let result = share(paths).await;
-
-            // Everything that has to reach the UI, done on the main thread:
-            // the clipboard copy can happen from here, the properties may not.
-            let outcome = match result {
-                Ok(url) => {
-                    let url_str = url.to_string();
-                    // The symbol carries the printed spelling of the same 32 bytes.
-                    let qr = qr_data_url_for(&print_text_for(&url_str));
-                    // Register the URL as own-upload so the clipboard watcher
-                    // ignores it if the user copies it and it comes back
-                    // through the poll.
-                    if is_bitmule_link(&url_str) {
-                        if let Ok(mut v) = active_urls.lock() { v.push(url_str.clone()); }
-                    }
-                    // Copy to clipboard before touching the UI so the user
-                    // sees the URL appear and can already paste it. Failures
-                    // (no display, missing xdg utilities) are non-fatal — a
-                    // Copy button in the QML will let the user try again.
-                    copy_to_clipboard(&url_str);
-                    Ok((url_str, qr))
+        // Progress comes from tokio threads, many times a second: it is
+        // marshalled onto the Qt thread, where the property may be touched.
+        let state_ui = state.clone();
+        let qpointer_ui = qpointer.clone();
+        let report_ui = qmetaobject::queued_callback(move |update: SendUpdate| {
+            let finished = matches!(update.status, Some("done" | "error" | "stopped"));
+            update_send_state(&state_ui, id, |s| s.apply(update));
+            refresh_sends_from_bg(&qpointer_ui, &state_ui);
+            if finished {
+                if let Some(api) = qpointer_ui.as_pinned() {
+                    let mut a = api.borrow_mut();
+                    a.is_busy = a.send_state.lock().map(|g| g.iter().any(|s| s.status == "preparing")).unwrap_or(false);
+                    a.is_busy_changed();
                 }
-                Err(e) => Err(e),
-            };
-
-            // Update UI safely on main thread
-                if let Some(api) = qpointer.as_pinned() {
-                    log("share: handing the result to the window");
-                    {
-                        let mut a = api.borrow_mut();
-                        match outcome {
-                            Ok((url_str, qr)) => {
-                                a.share_url = QString::from(url_str);
-                                a.qr_data_url = QString::from(qr);
-                            }
-                            Err(e) => a.share_error = QString::from(e),
-                        }
-                        a.is_busy = false;
-                    }
-                    api.borrow_mut().share_url_changed();
-                    api.borrow_mut().qr_data_url_changed();
-                    api.borrow_mut().share_error_changed();
-                    api.borrow_mut().is_busy_changed();
-                } else {
-                    log("share: the window is gone, dropping the result");
-                }
+            }
         });
+        let report: SendReport = std::sync::Arc::new(report_ui);
+        let report_bg = report.clone();
+
+        // The window's own copy of the link: it arrives on a tokio thread, so
+        // the property is set through the queue as well.
+        let qpointer_link = qpointer.clone();
+        let active_for_link = active_urls.clone();
+        let link_ui = qmetaobject::queued_callback(move |url: String| {
+            if is_bitmule_link(&url) {
+                if let Ok(mut v) = active_for_link.lock() { v.push(url.clone()); }
+            }
+            copy_to_clipboard(&url);
+            if let Some(api) = qpointer_link.as_pinned() {
+                let mut a = api.borrow_mut();
+                let qr = qr_data_url_for(&print_text_for(&url));
+                a.share_url = QString::from(url);
+                a.qr_data_url = QString::from(qr);
+                a.share_url_changed();
+                a.qr_data_url_changed();
+            }
+        });
+
+        qmetaobject::future::execute_async(async move {
+            // A preparing send keeps the Send tab's hint up until it has a
+            // link; the check is on this send, not on the last one.
+            let result = share(paths, report_bg, stop_rx).await;
+            match result {
+                Ok(url) => link_ui(url.to_string()),
+                Err(e) => {
+                    let failed = SendUpdate::failed(e.clone());
+                    report(failed);
+                    if let Some(api) = qpointer.as_pinned() {
+                        let mut a = api.borrow_mut();
+                        a.share_error = QString::from(e);
+                        a.share_error_changed();
+                    }
+                }
+            }
+            if let Some(api) = qpointer.as_pinned() {
+                let mut a = api.borrow_mut();
+                a.send_stops.lock().ok().map(|mut s| s.remove(&id));
+                a.is_busy = a.send_state.lock().map(|g| g.iter().any(|s| s.status == "preparing")).unwrap_or(false);
+                a.is_busy_changed();
+            } else {
+                log("share: the window is gone, dropping the result");
+            }
+        });
+    }
+
+    fn stop_send(&mut self, id: QString) {
+        let Ok(id) = id.to_string().parse::<u64>() else { return };
+        if let Ok(mut stops) = self.send_stops.lock() {
+            if let Some(tx) = stops.remove(&id) {
+                let _ = tx.send(());
+                log(format!("share: stop asked for #{id}"));
+            }
+        }
+        update_send_state(&self.send_state, id, |s| {
+            s.status = "stopped".into();
+            s.phase = "stopped".into();
+        });
+        self.refresh_sends();
+    }
+
+    fn drop_send(&mut self, id: QString) {
+        let Ok(id) = id.to_string().parse::<u64>() else { return };
+        if let Ok(mut stops) = self.send_stops.lock() {
+            if let Some(tx) = stops.remove(&id) {
+                let _ = tx.send(());
+            }
+        }
+        if let Ok(mut list) = self.send_state.lock() {
+            list.retain(|s| s.id != id);
+        }
+        self.refresh_sends();
+    }
+
+    fn copy_text(&mut self, text: QString) -> bool {
+        let text = text.to_string();
+        if text.is_empty() { return false; }
+        copy_to_clipboard(&text)
+    }
+
+    fn refresh_sends(&mut self) {
+        let snap: Vec<QString> = match self.send_state.lock() {
+            Ok(g) => g.iter().map(|s| QString::from(
+                serde_json::to_string(s).unwrap_or_else(|_| "{}".into())
+            )).collect(),
+            Err(_) => Vec::new(),
+        };
+        self.sends = QStringList::from(snap);
+        self.sends_changed();
     }
 
 
@@ -646,9 +905,69 @@ impl UploaderApi {
     }
 }
 
+/// One entry of the Active tab: a send this window started, from the moment
+/// its files were read until it is done, stopped or failed.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct RecvTransferState {
+struct SendEntry {
+    id: u64,
+    /// What it sends: the file's name, or "3 items".
+    name: String,
+    /// Bytes of the selection, when known (0 while a folder is being counted).
+    size: u64,
+    /// 0.0..=1.0 — the receiver that has the most of it.
+    progress: f64,
+    /// "preparing" | "live" | "done" | "error" | "stopped"
+    status: String,
+    /// What it is doing right now, in the sender's words.
+    phase: String,
+    /// The link, once the session exists; empty while preparing.
     url: String,
+    /// How many receivers have joined.
+    peers: usize,
+    /// Why it failed, when it did.
+    error: String,
+}
+
+impl SendEntry {
+    fn apply(&mut self, u: SendUpdate) {
+        if let Some(status) = u.status { self.status = status.into(); }
+        if let Some(phase) = u.phase { self.phase = phase; }
+        if let Some(progress) = u.progress { self.progress = progress; }
+        if let Some(size) = u.size { self.size = size; }
+        if let Some(peers) = u.peers { self.peers = peers; }
+        if let Some(url) = u.url { self.url = url; }
+        if let Some(error) = u.error { self.error = error; }
+    }
+}
+
+/// What a selection is called and how big it is, before it is hashed: a
+/// directory is counted, which is the one place this touches the disk from
+/// the Qt thread (a directory of a few thousand files takes a millisecond).
+fn describe_selection(paths: &[PathBuf]) -> (String, u64) {
+    let mut bytes = 0u64;
+    for path in paths {
+        match std::fs::metadata(path) {
+            Ok(md) if md.is_file() => bytes += md.len(),
+            Ok(md) if md.is_dir() => {
+                for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
+                    if entry.file_type().is_file() {
+                        if let Ok(md) = entry.metadata() { bytes += md.len(); }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let name = match paths {
+        [one] => one.file_name().map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| one.display().to_string()),
+        many => format!("{} items", many.len()),
+    };
+    (name, bytes)
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct RecvTransferState {    url: String,
     name: String,
     /// 0.0..=1.0
     progress: f64,
@@ -662,6 +981,38 @@ struct RecvTransferState {
 
 /// Where recv_file writes downloads. Follows the same
 /// XDG_DOWNLOAD_DIR / $HOME/Downloads convention as most Linux apps.
+/// A `file:` URL as a filesystem path. Qt's drop carries QUrl, whose text
+/// form is percent-encoded — `/home/sebk/Videos/Shrek%202%20(2004)%20[1080p]/…`
+/// — and trimming the scheme alone leaves a path that does not exist. A
+/// string that did not come in as a URL is returned untouched, so a plain
+/// path with a `%` in it is not decoded twice.
+fn file_url_to_path(s: &str) -> String {
+    let Some(rest) = s.strip_prefix("file:") else { return s.to_string() };
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn short_stage_tag(url: &str) -> String {
     // 8 hex chars off a stable hash of the URL — enough to keep
     // concurrent staging dirs from colliding without leaking the
@@ -750,6 +1101,32 @@ fn refresh_from_bg(
     if let Some(mut api) = qpointer.as_pinned() {
         api.borrow_mut().recv_transfers = QStringList::from(snap);
         api.borrow_mut().recv_transfers_changed();
+    }
+}
+
+fn update_send_state<F: FnOnce(&mut SendEntry)>(
+    state: &Arc<Mutex<Vec<SendEntry>>>,
+    id: u64,
+    f: F,
+) {
+    if let Ok(mut g) = state.lock() {
+        if let Some(s) = g.iter_mut().find(|s| s.id == id) { f(s); }
+    }
+}
+
+fn refresh_sends_from_bg(
+    qpointer: &QPointer<UploaderApi>,
+    state: &Arc<Mutex<Vec<SendEntry>>>,
+) {
+    let snap: Vec<QString> = match state.lock() {
+        Ok(g) => g.iter().map(|s| QString::from(
+            serde_json::to_string(s).unwrap_or_else(|_| "{}".into())
+        )).collect(),
+        Err(_) => Vec::new(),
+    };
+    if let Some(mut api) = qpointer.as_pinned() {
+        api.borrow_mut().sends = QStringList::from(snap);
+        api.borrow_mut().sends_changed();
     }
 }
 

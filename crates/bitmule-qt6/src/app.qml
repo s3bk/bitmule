@@ -99,6 +99,15 @@ ApplicationWindow {
     palette.dark: theme.bevelDark
     palette.shadow: theme.bevelShadow
 
+    /// Bytes as a person reads them: "1.4 GB", "812 kB".
+    function humanSize(n) {
+        var units = ["B", "kB", "MB", "GB", "TB"]
+        var v = Number(n) || 0
+        var i = 0
+        while (v >= 1000 && i < units.length - 1) { v /= 1000; i++ }
+        return (i === 0 ? Math.round(v) : (v < 10 ? v.toFixed(1) : Math.round(v))) + " " + units[i]
+    }
+
     UploaderApi {
         id: api
         Component.onCompleted: api.init_from_qml()
@@ -121,7 +130,7 @@ ApplicationWindow {
             // `--account` opens on the account tab: for screenshots, and for
             // the one case where the app starts because an account needs
             // attention.
-            currentIndex: Qt.application.arguments.indexOf("--account") >= 0 ? 2 : 0
+            currentIndex: Qt.application.arguments.indexOf("--account") >= 0 ? 3 : 0
             TabButton {
                 id: tabSend
                 text: "Send"
@@ -130,6 +139,15 @@ ApplicationWindow {
                 // that is a near-black slab with white text on a light theme.
                 // The tab bar gets its own surfaces instead: checked = card,
                 // unchecked = muted, labels from the text roles.
+                palette.dark: theme.surfaceMuted
+                palette.mid: theme.surfaceMuted
+                palette.window: theme.surface
+                palette.brightText: theme.fgMuted
+                palette.windowText: theme.fg
+            }
+            TabButton {
+                id: tabActive
+                text: "Active"
                 palette.dark: theme.surfaceMuted
                 palette.mid: theme.surfaceMuted
                 palette.window: theme.surface
@@ -168,8 +186,8 @@ ApplicationWindow {
                 DropArea {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    enabled: !api.is_busy
-
+                    // Dropping while a share is preparing is how a second one
+                    // starts; the list is never locked by a running send.
                     onDropped: (drop) => {
                         if (drop.hasUrls) api.add_files(drop.urls)
                     }
@@ -187,9 +205,27 @@ ApplicationWindow {
                             clip: true
                             model: api.file_list
                             delegate: ItemDelegate {
-                                text: modelData
                                 width: parent.width
                                 font.pixelSize: 12
+                                // One row is one path; the cross takes it out
+                                // of the share without emptying the list.
+                                contentItem: RowLayout {
+                                    spacing: 4
+                                    Label {
+                                        text: modelData
+                                        elide: Text.ElideMiddle
+                                        font.pixelSize: 12
+                                        Layout.fillWidth: true
+                                    }
+                                    ToolButton {
+                                        text: "\u2715"
+                                        font.pixelSize: 11
+                                        onClicked: api.remove_file(index)
+                                        ToolTip.visible: hovered
+                                        ToolTip.text: "Remove from this share"
+                                        ToolTip.delay: 400
+                                    }
+                                }
                             }
                         }
 
@@ -203,12 +239,22 @@ ApplicationWindow {
                     }
                 }
 
-                Button {
-                    id: shareButton
-                    text: "Share"
-                    Layout.fillWidth: true
-                    enabled: !api.is_busy && api.file_list.length > 0
-                    onClicked: api.trigger_share()
+                RowLayout {
+                    spacing: 8
+                    Button {
+                        id: shareButton
+                        text: "Share"
+                        Layout.fillWidth: true
+                        // A share that is still running is not a reason to
+                        // refuse another one: each gets its own session.
+                        enabled: api.file_list.length > 0
+                        onClicked: api.trigger_share()
+                    }
+                    Button {
+                        text: "Clear"
+                        enabled: api.file_list.length > 0
+                        onClicked: api.clear_files()
+                    }
                 }
 
                 Label {
@@ -341,6 +387,143 @@ ApplicationWindow {
                             visible: theme.mode === "auto"
                         }
                     }
+                }
+            }
+
+            // ---------- Active tab ----------
+            //
+            // Everything this window is sending, oldest first — the sends that
+            // used to be hidden behind the one Send tab, which could only show
+            // the newest link and stopped being useful the moment a second
+            // share was started. A row stays after its transfer ends so the
+            // link can still be copied; "✕" forgets it.
+            ColumnLayout {
+                spacing: 10
+
+                GroupBox {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    title: api.sends.length > 0
+                        ? "Sending (" + api.sends.length + ")"
+                        : "Nothing is being sent"
+
+                    ListView {
+                        id: sendsView
+                        anchors.fill: parent
+                        model: api.sends
+                        spacing: 6
+                        clip: true
+                        delegate: Rectangle {
+                            width: ListView.view.width
+                            height: sendCol.implicitHeight + 12
+                            color: theme.surface
+                            border.color: theme.border
+                            border.width: 1
+                            radius: 6
+
+                            property var send: JSON.parse(modelData || "{}")
+
+                            ColumnLayout {
+                                id: sendCol
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                spacing: 3
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Label {
+                                        Layout.fillWidth: true
+                                        elide: Label.ElideRight
+                                        font.pixelSize: 12
+                                        font.bold: true
+                                        color: theme.fg
+                                        text: send.name || "(preparing…)"
+                                    }
+                                    Label {
+                                        font.pixelSize: 11
+                                        color: send.status === "error" || send.status === "stopped"
+                                            ? theme.danger
+                                            : theme.fgMuted
+                                        text: send.status === "live"
+                                            ? (send.peers > 1 ? send.peers + " receivers" : "shared")
+                                            : send.status === "preparing" ? "preparing"
+                                            : send.status === "done" ? "done"
+                                            : send.status === "stopped" ? "stopped" : "failed"
+                                    }
+                                    Button {
+                                        text: "×"
+                                        visible: send.status === "preparing" || send.status === "live"
+                                        ToolTip.visible: hovered
+                                        ToolTip.text: "Stop this transfer"
+                                        ToolTip.delay: 400
+                                        onClicked: api.stop_send("" + send.id)
+                                    }
+                                    Button {
+                                        text: "✕"
+                                        ToolTip.visible: hovered
+                                        ToolTip.text: "Forget this entry"
+                                        ToolTip.delay: 400
+                                        onClicked: api.drop_send("" + send.id)
+                                    }
+                                }
+
+                                Label {
+                                    Layout.fillWidth: true
+                                    font.pixelSize: 11
+                                    color: theme.fgMuted
+                                    visible: send.status === "preparing"
+                                    text: (send.phase || "working") + "…"
+                                }
+                                ProgressBar {
+                                    Layout.fillWidth: true
+                                    from: 0; to: 1
+                                    value: send.progress || 0
+                                    visible: send.status === "live" || send.status === "done"
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    font.pixelSize: 11
+                                    color: theme.fgMuted
+                                    visible: send.status === "live" || send.status === "done"
+                                    text: Math.round((send.progress || 0) * 100) + "% of "
+                                        + window.humanSize(send.size || 0)
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    font.pixelSize: 11
+                                    wrapMode: Text.Wrap
+                                    color: theme.danger
+                                    visible: send.status === "error" && (send.error || "").length > 0
+                                    text: send.error || ""
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    visible: (send.url || "").length > 0
+                                    TextField {
+                                        Layout.fillWidth: true
+                                        text: send.url || ""
+                                        readOnly: true
+                                        selectByMouse: true
+                                        font.pixelSize: 11
+                                    }
+                                    Button {
+                                        text: "Copy"
+                                        onClicked: api.copy_text(send.url || "")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    color: theme.fgFaint
+                    font.pixelSize: 11
+                    text: "A link keeps working while this window is open. Starting "
+                        + "another share does not stop the ones already running."
                 }
             }
 
