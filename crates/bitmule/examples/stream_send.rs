@@ -13,6 +13,14 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Without a subscriber a `warn!` from the send path goes nowhere, and a
+    // streaming upload that fails would look like a transfer that stalls.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let mut args = std::env::args().skip(1);
     let path = PathBuf::from(args.next().expect("usage: stream_send <file> [server]"));
     let server = Server::parse(&args.next().unwrap_or_else(|| "https://bitmule.net".into()));

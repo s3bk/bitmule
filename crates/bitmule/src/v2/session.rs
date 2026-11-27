@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Result, bail, ensure};
 use bitmule_client_common::transfer::Transfer;
 use bitmule_client_native::{
-    crypto::{IdentityRole, ShareKey, ShareLink},
+    crypto::{BulkKey, IdentityRole, ShareKey, ShareLink},
     websocket::{Owner, connect_ws, connect_ws_owner},
 };
 use bitmule_core::{
@@ -40,7 +40,7 @@ pub async fn send(
 ) -> Result<()> {
     let signature = transfer.commitment();
     let server_owned = server.clone();
-    send_job(server, options, signature, on_link, move |our_id, session_id, relay_token| {
+    send_job(server, options, signature, on_link, move |our_id, session_id, relay_token, _key| {
         Ok(Job::Known(Arc::new(send::Context::new(server_owned, our_id, session_id, relay_token, manifest, transfer, options, on_event))))
     })
     .await
@@ -59,8 +59,8 @@ pub async fn send_stream(
 ) -> Result<()> {
     ensure!(options.relay, "a streaming transfer goes over the relay, which these options leave out");
     let server_owned = server.clone();
-    send_job(server, options, [0u8; 32], on_link, move |our_id, session_id, relay_token| {
-        Ok(Job::Stream(Arc::new(send::StreamContext::new(server_owned, our_id, session_id, relay_token, info, source, options, on_event)?)))
+    send_job(server, options, [0u8; 32], on_link, move |our_id, session_id, relay_token, key| {
+        Ok(Job::Stream(Arc::new(send::StreamContext::new(server_owned, our_id, session_id, relay_token, info, source, key, options, on_event)?)))
     })
     .await
 }
@@ -76,7 +76,7 @@ async fn send_job(
     options: Options,
     signature: [u8; 32],
     on_link: impl FnOnce(&ShareLink),
-    make_job: impl FnOnce(ReceiverId, SessionId, Token) -> Result<Job>,
+    make_job: impl FnOnce(ReceiverId, SessionId, Token, BulkKey) -> Result<Job>,
 ) -> Result<()> {
     // A sender-initiated key *is* the content commitment
     // (`ShareKey::from_data_commitment`), which is how a code — key only, no
@@ -91,14 +91,23 @@ async fn send_job(
     on_link(&link);
 
     let wire = Arc::new(peer::Wire { identity, session_id, to_server });
-    let job = make_job(our_id, session_id, relay_token)?;
+    let job = make_job(our_id, session_id, relay_token, BulkKey(share_key.0))?;
     // routes what the server says about a peer to that peer's worker
     let mut peers: HashMap<ReceiverId, mpsc::Sender<ServerToClient>> = HashMap::new();
     let mut workers = JoinSet::new();
     let mut completed = 0usize;
+    // A streaming send holds its file open and waits for a receiver that may
+    // never come; the prepared path holds only a session. Say so after a while
+    // in the first case instead of sitting there for ever.
+    const NOBODY_WAITS: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    let streaming = matches!(job, Job::Stream(_));
+    let mut idle_until = tokio::time::Instant::now() + NOBODY_WAITS;
 
     loop {
         select! {
+            _ = tokio::time::sleep_until(idle_until), if streaming && peers.is_empty() => {
+                bail!("nobody joined this stream in {} minutes", NOBODY_WAITS.as_secs() / 60);
+            }
             message = from_server.recv() => {
                 let Some(message) = message else { bail!("connection to the server closed") };
                 match message {
@@ -164,6 +173,9 @@ async fn send_job(
                     return Ok(());
                 }
             }
+        }
+        if peers.is_empty() {
+            idle_until = tokio::time::Instant::now() + NOBODY_WAITS;
         }
     }
 }

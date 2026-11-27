@@ -500,6 +500,7 @@ impl StreamContext {
         relay_token: Token,
         info: StreamInfo,
         source: StreamSource,
+        key: BulkKey,
         options: Options,
         events: OnSendEvent,
     ) -> Result<Self> {
@@ -509,7 +510,7 @@ impl StreamContext {
         };
         Ok(StreamContext {
             server, our_id, session_id, relay_token, options, events, info, source, spool,
-            key: BulkKey::random(),
+            key,
             finished: watch::channel(None).0,
             failed: watch::channel(None).0,
             producer: RelayTask::default(),

@@ -157,15 +157,16 @@ async fn share(
     // not worth streaming's extra repair passes, and a zip has to be built
     // before any of it can be sent.
     //
-    // Streaming is not the default yet. It works end to end between two
-    // streaming-aware receivers, and a small file (one block) arrives in the
-    // browser viewer too — but a multi-block stream does not: the viewer joins
-    // the relay after the sender has started, and the file it then assembles
-    // fails its own checksum, while the same file over the prepared path
-    // arrives whole. Until that is understood, `BITMULE_STREAM=1` turns it on
-    // for testing and everybody else keeps the path that works.
+    // Streaming is what a big file takes: the link exists before any of the
+    // data is hashed, and the receiver checks what arrived against a checksum
+    // that follows it. It needs a streaming-aware receiver (the browser viewer
+    // and this build's `recv` are), which is why it is chosen only above a few
+    // megabytes: below that the prepared path costs nothing and works with
+    // every older client.
     const STREAM_ABOVE: u64 = 4 << 20;
-    let may_stream = std::env::var_os("BITMULE_STREAM").is_some();
+    // `BITMULE_STREAM=0` keeps a send on the prepared path, for a receiver too
+    // old to know `JoinRelay`.
+    let may_stream = std::env::var_os("BITMULE_STREAM").map_or(true, |v| v != "0");
 
     enum Job {
         Known(TransferManifest, Transfer),
