@@ -335,15 +335,11 @@ pub fn qr_png_bytes(text: String, pixel_scale: u32) -> Result<Vec<u8>, BitmuleEr
     let printed = bitmule_client_native::crypto::code::print_url_for(&text);
     // Version 3 at ECC L, by construction: a link is `HTTPS://MUL.LI#` and 48
     // alphanumeric digits, 63 characters, 391 of the 440 bits the symbol holds.
-    let code = qrcode::QrCode::with_version(
-        printed.as_bytes(),
-        qrcode::Version::Normal(3),
-        qrcode::EcLevel::L,
-    )
-    .or_else(|_| {
-        qrcode::QrCode::with_error_correction_level(printed.as_bytes(), qrcode::EcLevel::L)
-    })
-    .map_err(|e| BitmuleError::Unknown { reason: format!("qr encode: {e}") })?;
+    // The `qrcode` crate's own layout puts the whole payload in byte mode
+    // because of the `#` and needs version 4; `bitmule_client_common::qr`
+    // segments it, so the link is version 3 and anything longer grows.
+    let code = bitmule_client_common::qr::symbol(&printed)
+        .map_err(|e| BitmuleError::Unknown { reason: format!("qr encode: {e}") })?;
     let image = code
         .render::<image::Luma<u8>>()
         .module_dimensions(scale, scale)

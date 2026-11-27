@@ -15,11 +15,15 @@ mod keyring;
 /// (`https://mul.li#<code>`, no path) and the long host the app itself is
 /// served from. Matching ignores case, because a symbol draws the link
 /// upper-case (`HTTPS://MUL.LI#…`).
-const BITMULE_URL_PREFIXES: [&str; 2] = ["https://mul.li#", "https://bitmule.net/#"];
-
+/// It is the *host* that decides, not the spelling: a link pasted from an
+/// older build carries a slash before the `#` (`https://mul.li/#<code>`) and
+/// is the same link.
 fn is_bitmule_link(s: &str) -> bool {
     let lower = s.trim().to_ascii_lowercase();
-    BITMULE_URL_PREFIXES.iter().any(|p| lower.starts_with(p))
+    let Some((_, rest)) = lower.split_once("://") else { return false };
+    let host = rest.split(['/', '#', '?']).next().unwrap_or("");
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    host == "mul.li" || host == "bitmule.net" || host.ends_with(".bitmule.net")
 }
 
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
@@ -874,7 +878,6 @@ fn print_text_for(url: &str) -> String {
 fn qr_data_url_for(text: &str) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder, Luma};
-    use qrcode::QrCode;
 
     if text.is_empty() { return String::new(); }
     // ECC L is the owner's default for the printed code (2026-11-24): 7%
@@ -884,27 +887,26 @@ fn qr_data_url_for(text: &str) -> String {
     // alphanumeric digits — 63 characters, 391 of the 440 bits version 3
     // holds at ECC L. Anything longer says so and gets the smallest symbol
     // that holds it, rather than silently growing.
-    let code = match QrCode::with_version(
-        text.as_bytes(),
-        qrcode::Version::Normal(3),
-        qrcode::EcLevel::L,
-    ) {
+    // The segments are built by `bitmule_client_common::qr` — the `qrcode`
+    // crate's own layout puts the whole 63 characters in byte mode because of
+    // the `#` and lands on version 4.
+    let code = match bitmule_client_common::qr::symbol(text) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
             eprintln!(
-                "qr: {} characters do not fit version 3 at ECC L (a link is 63: \
-                 HTTPS://MUL.LI# and 48 digits) — growing the symbol",
+                "qr: {} characters do not fit any version at ECC L ({e})",
                 text.chars().count()
             );
-            match QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("qr generation failed: {e}");
-                    return String::new();
-                }
-            }
+            return String::new();
         }
     };
+    if code.width() != 29 {
+        eprintln!(
+            "qr: {} characters do not fit version 3 at ECC L — the symbol grew to {} modules",
+            text.chars().count(),
+            code.width()
+        );
+    }
     // `render::<Luma<u8>>` produces a grayscale ImageBuffer at
     // one pixel per module + configurable quiet-zone/scale. 8 px
     // per module keeps the PNG small while still landing at ~240 px

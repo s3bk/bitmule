@@ -4,6 +4,8 @@ use async_zip::error::ZipError;
 
 pub mod transfer;
 pub mod fountain;
+/// The printed symbol: one QR code, made the same way on every surface.
+pub mod qr;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod blockio;
 /// Where the bundled helper programs (ffmpeg, the PDF linearizer) are found.

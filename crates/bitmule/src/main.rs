@@ -375,8 +375,11 @@ where
     let share_key = ShareKey(signature);
     let session_hex = share_key.session_id_hex();
     let link = ShareLink::new(share_key.clone(), signature);
+    // Machine-facing: this URL names the server the receiver must reach, so it
+    // keeps that host. The link a person is handed is `Server::link_url`
+    // (`https://mul.li#<code>`); no path in either.
     let share_url = format!(
-        "{}/#{}",
+        "{}#{}",
         server.trim_end_matches('/'),
         link.to_link()
     );
@@ -509,12 +512,14 @@ fn print_link(server: &v2::Server, link: &ShareLink) {
     // so instead of quietly growing.
     let printed = bitmule_client_native::crypto::code::print_url_for(&url);
     println!("print:   {printed}");
-    match QrCode::with_version(printed.as_bytes(), qrcode::Version::Normal(3), qrcode::EcLevel::L) {
-        Ok(qr) => println!("{}", qr.render::<unicode::Dense1x2>().build()),
-        Err(_) => match QrCode::with_error_correction_level(printed.as_bytes(), qrcode::EcLevel::L) {
-            Ok(qr) => println!("{}", qr.render::<unicode::Dense1x2>().build()),
-            Err(e) => eprintln!("qr: {e}"),
-        },
+    match bitmule_client_common::qr::symbol(&printed) {
+        Ok(qr) => {
+            if qr.width() != 29 {
+                eprintln!("qr: not version 3 any more, {} modules", qr.width());
+            }
+            println!("{}", qr.render::<unicode::Dense1x2>().build())
+        }
+        Err(e) => eprintln!("qr: {e}"),
     }
     println!("waiting for a receiver…");
 }
