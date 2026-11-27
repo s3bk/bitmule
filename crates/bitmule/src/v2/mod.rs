@@ -97,15 +97,29 @@ impl Server {
         format!("{}://{}{path}", if self.tls { "wss" } else { "ws" }, self.host)
     }
 
-    /// The URL to hand to a receiver.
+    /// The URL on this server that a receiver can be pointed at. Used by
+    /// callers that need the host they are actually talking to — tests, and
+    /// anyone running a server of their own.
     pub fn share_url(&self, link: &ShareLink) -> String {
-        format!("{}/#{}", self.http(""), link.to_link())
+        format!("{}#{}", self.http(""), link.to_link())
+    }
+
+    /// The link to hand to a person: on the production origin the frozen short
+    /// host (`https://mul.li#<code>`, no path), anywhere else this server's
+    /// own address, so a test instance's links come back to it.
+    pub fn link_url(&self, link: &ShareLink) -> String {
+        if self.host == "bitmule.net" || self.host.ends_with(".bitmule.net") {
+            link.share_url()
+        } else {
+            self.share_url(link)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Server;
+    use bitmule_client_native::crypto::{ShareKey, ShareLink};
 
     #[test]
     fn plain_http_needs_permission() {
@@ -117,6 +131,23 @@ mod tests {
         assert!(Server::parse_checked("ws://127.0.0.1:8443", true).is_err());
         let plain = Server::parse_checked("HTTP://127.0.0.1:8443", true).unwrap();
         assert!(!plain.tls && plain.host == "127.0.0.1:8443");
+    }
+
+    #[test]
+    fn a_handed_out_link_is_the_short_host_with_no_path() {
+        let link = ShareLink::new(ShareKey([7u8; 32]), [0u8; 32]);
+        let production = Server::parse_checked("https://bitmule.net", false).unwrap();
+        let url = production.link_url(&link);
+        assert_eq!(url, link.share_url());
+        assert!(url.starts_with("https://mul.li#"), "{url}");
+        assert!(!url.contains("/#"), "no path: {url}");
+        assert_eq!(url.matches('#').count(), 1);
+        let code = url.split_once('#').unwrap().1;
+        assert_eq!(code.chars().count(), bitmule_client_native::crypto::code::CODE_CHARS);
+        // A server anywhere else keeps its own address, so its links reach it.
+        let local = Server::parse_checked("http://127.0.0.1:8443", true).unwrap();
+        assert_eq!(local.link_url(&link), local.share_url(&link));
+        assert!(local.link_url(&link).starts_with("http://127.0.0.1:8443#"));
     }
 }
 

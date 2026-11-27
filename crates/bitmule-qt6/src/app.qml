@@ -354,7 +354,7 @@ ApplicationWindow {
                     TextField {
                         id: recvUrlField
                         Layout.fillWidth: true
-                        placeholderText: "paste bitmule URL (https://bitmule.net/#…)"
+                        placeholderText: "paste bitmule URL (https://mul.li#…)"
                         font.pixelSize: 12
                     }
                     Button {

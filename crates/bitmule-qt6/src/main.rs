@@ -11,7 +11,17 @@ use url::Url;
 mod account;
 mod keyring;
 
-const BITMULE_URL_PREFIX: &str = "https://bitmule.net/#";
+/// The origins a share link can name: the short host a sender is handed
+/// (`https://mul.li#<code>`, no path) and the long host the app itself is
+/// served from. Matching ignores case, because a symbol draws the link
+/// upper-case (`HTTPS://MUL.LI#…`).
+const BITMULE_URL_PREFIXES: [&str; 2] = ["https://mul.li#", "https://bitmule.net/#"];
+
+fn is_bitmule_link(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    BITMULE_URL_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
 
 /// Prepare a bitmule share from `files` and spawn the send task in the
@@ -98,7 +108,7 @@ async fn share(files: Vec<PathBuf>) -> Result<Url, String> {
         let mut link_tx = Some(link_tx);
         let result = v2::run_send(&server, manifest, transfer, Options::default(), move |link| {
             if let Some(tx) = link_tx.take() {
-                let _ = tx.send(server_for_url.share_url(link));
+                let _ = tx.send(server_for_url.link_url(link));
             }
         })
         .await;
@@ -265,7 +275,7 @@ impl UploaderApi {
                     // Register the URL as own-upload so the clipboard watcher
                     // ignores it if the user copies it and it comes back
                     // through the poll.
-                    if url_str.starts_with(BITMULE_URL_PREFIX) {
+                    if is_bitmule_link(&url_str) {
                         if let Ok(mut v) = active_urls.lock() { v.push(url_str.clone()); }
                     }
                     // Copy to clipboard before touching the UI so the user
@@ -363,14 +373,14 @@ impl UploaderApi {
     fn add_recv_url(&mut self, url: QString) {
         let u = url.to_string();
         let u_trim = u.trim().to_string();
-        if !u_trim.starts_with(BITMULE_URL_PREFIX) {
+        if !is_bitmule_link(&u_trim) {
             self.push_recv_transfer(RecvTransferState {
                 url: u_trim,
                 name: String::new(),
                 progress: 0.0,
                 status: "error".into(),
                 path: None,
-                error: Some(format!("URL doesn't start with {BITMULE_URL_PREFIX}")),
+                error: Some("a share link starts with https://mul.li# or https://bitmule.net/#".into()),
             });
             return;
         }
@@ -603,8 +613,7 @@ impl UploaderApi {
                 let trimmed = text.trim().to_string();
                 if trimmed == last { continue; }
                 last = trimmed.clone();
-                if !trimmed.starts_with(BITMULE_URL_PREFIX)
-                    || trimmed.len() <= BITMULE_URL_PREFIX.len() { continue; }
+                if !is_bitmule_link(&trimmed) { continue; }
                 // Own-upload guard.
                 if active_urls.lock().map(|v| v.iter().any(|u| u == &trimmed)).unwrap_or(false) {
                     continue;
@@ -870,13 +879,30 @@ fn qr_data_url_for(text: &str) -> String {
     if text.is_empty() { return String::new(); }
     // ECC L is the owner's default for the printed code (2026-11-24): 7%
     // recovery still scans a clean flat surface, and it is what lets the 63
-    // character URL fit version 3 (29×29) instead of version 4. Surfaces that
-    // need more tolerance get version 4 at M, a render-time choice.
-    let code = match QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L) {
+    // character URL fit version 3 (29×29). The symbol is version 3 by
+    // construction (owner, 2026-11-27): a link is `HTTPS://MUL.LI#` plus 48
+    // alphanumeric digits — 63 characters, 391 of the 440 bits version 3
+    // holds at ECC L. Anything longer says so and gets the smallest symbol
+    // that holds it, rather than silently growing.
+    let code = match QrCode::with_version(
+        text.as_bytes(),
+        qrcode::Version::Normal(3),
+        qrcode::EcLevel::L,
+    ) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("qr generation failed: {e}");
-            return String::new();
+        Err(_) => {
+            eprintln!(
+                "qr: {} characters do not fit version 3 at ECC L (a link is 63: \
+                 HTTPS://MUL.LI# and 48 digits) — growing the symbol",
+                text.chars().count()
+            );
+            match QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("qr generation failed: {e}");
+                    return String::new();
+                }
+            }
         }
     };
     // `render::<Luma<u8>>` produces a grayscale ImageBuffer at

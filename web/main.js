@@ -204,38 +204,50 @@ function renderQrInto(el, text) {
     el.textContent = "";
     return;
   }
-  try {
-    const qr = window.qrcode(0, "L");
+  const draw = (typeNumber) => {
+    const qr = window.qrcode(typeNumber, "L");
     addQrData(qr, text);
     qr.make();
-    el.innerHTML = qr.createSvgTag({
-      cellSize: 5,
-      margin: 2,
-      scalable: true,
-    });
+    return qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true });
+  };
+  // Version 3 (29×29) is the symbol a share link needs: `HTTPS://MUL.LI#` and
+  // 48 digits, 63 characters, 391 of the 440 bits it holds at ECC L. Forced,
+  // so a longer payload says so instead of quietly growing the grid; that
+  // payload still gets the smallest symbol that holds it.
+  try {
+    el.innerHTML = draw(3);
   } catch (err) {
-    el.textContent = "";
-    console.warn("qr render failed:", err);
+    console.warn("qr: not version 3, growing the symbol:", (err && err.message) || err, text.length);
+    try {
+      el.innerHTML = draw(0);
+    } catch (err2) {
+      el.textContent = "";
+      console.warn("qr render failed:", err2);
+    }
   }
 }
 
 // The symbol carries the code the link itself holds: 48 base-42 characters in
 // an upper-case URL (`HTTPS://MUL.LI#…`) — the same 48 a pasted link has.
-// `#` is not in the alphanumeric set, so it is three
-// segments — host 14 chars (90 bits), `#` in byte mode (20), 48 digits (277)
-// — plus a 4-bit terminator: 391 of the 440 bits QR version 3 at ECC L
-// carries, 49 spare, 8 characters of headroom; a base64url spelling would be byte
-// mode throughout (484 bits) and need version 4. `printUrl` in the wasm
-// module is the helper every surface draws from (`code::print_url_for`),
-// and it returns anything that is not a link unchanged. Falls back to the
-// text as given when wasm is not loaded yet.
+// `#` is not in the alphanumeric set, so it is three segments — host 6 chars
+// (33 bits), `#` in byte mode (20), 48 digits (277) — plus a 4-bit
+// terminator: 391 of the 440 bits QR version 3 at ECC L carries. `printUrl`
+// in the wasm module is the helper every surface draws from
+// (`code::print_url_for`); this is the same conversion for the moment before
+// the module answers, so the symbol is version 3 either way.
+const CODE_RE = /^[0-9A-Za-z$*.\/:]{48}$/;
+
 function qrTextFor(text) {
+  let abs = text;
+  try { abs = new URL(text, serverHttpBase(CONFIG.server)).href; } catch {}
   try {
-    const abs = new URL(text, serverHttpBase(CONFIG.server)).href;
-    return window.bitmule.printUrl(abs);
-  } catch (e) {
-    return text;
-  }
+    if (window.bitmule && typeof window.bitmule.printUrl === "function") {
+      return window.bitmule.printUrl(abs);
+    }
+  } catch {}
+  const m = /^(https?):\/\/([^\/?#]+)\/?#(.+)$/i.exec(abs);
+  if (m && CODE_RE.test(m[3])) return `HTTPS://${m[2].toUpperCase()}#${m[3].toUpperCase()}`;
+  return abs;
 }
 
 function renderQr(text) { renderQrInto(els.sessionQr, qrTextFor(text)); }
@@ -320,8 +332,21 @@ async function prepareBlob(files, setState) {
   return { blob, kind: "zip", name: "bitmule-files.zip" };
 }
 
+// The link a sender hands out: the frozen short host, no path, the code after
+// the `#` — `https://mul.li#<code>`. A server that is not the production
+// origin (a test instance, localhost) keeps its own address, so its links come
+// back to it.
+function linkHttpBase() {
+  const base = serverHttpBase(CONFIG.server);
+  try {
+    const host = new URL(base).hostname;
+    if (host === "bitmule.net" || host.endsWith(".bitmule.net")) return "https://mul.li";
+  } catch {}
+  return base;
+}
+
 function shareUrl(link) {
-  return `${serverHttpBase(CONFIG.server)}/#${link}`;
+  return `${linkHttpBase()}#${link}`;
 }
 
 function sessionHexOfLink(link) {
@@ -1081,17 +1106,19 @@ let clipboardWatchTimer = null;
 let lastClipboardText = "";
 const fetchQueueLinks = new Map(); // url → { status: "pending"|"downloading"|"done" }
 
-// Prefix check for clipboard-detected links. Per Seb 2026-09-04: only
-// accept URLs starting with `https://bitmule.qdat.net/#`. Anything
-// else — different origin, http (not https), missing hash — is
-// ignored to keep the queue from filling with random hash-shaped URLs.
-// parseSessionFragment does the definitive validation on the fragment
-// itself; this is just a fast prefilter on the URL.
+// Prefix check for clipboard-detected links: the short host a sender is
+// handed (`https://mul.li#<code>`), the long host, or this page's own origin
+// when it is a test instance. Anything else — a different origin, http,
+// missing hash — is ignored to keep the queue from filling with random
+// hash-shaped URLs. parseSessionFragment does the definitive validation on
+// the fragment itself; this is just a fast prefilter on the URL.
 function isValidBitmuleUrl(text) {
   if (typeof text !== "string") return false;
-  const trimmed = text.trim();
-  return trimmed.startsWith("https://bitmule.qdat.net/#")
-    && trimmed.length > "https://bitmule.qdat.net/#".length;
+  const trimmed = text.trim().toLowerCase();
+  const own = `${serverHttpBase(CONFIG.server).toLowerCase()}/#`;
+  const prefixes = ["https://mul.li#", "https://bitmule.net/#", own];
+  const hit = prefixes.find((p) => trimmed.startsWith(p));
+  return !!hit && trimmed.length > hit.length;
 }
 
 function isOurOwnLink(url) {

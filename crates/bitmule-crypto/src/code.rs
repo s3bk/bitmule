@@ -282,6 +282,17 @@ pub fn url(host: &str, kind: Kind, key: &[u8; 32]) -> Result<String> {
     Ok(format!("https://{host}#{}", encode(kind, key)?))
 }
 
+/// The host a link handed to a person points at: the frozen origin that
+/// serves the viewer for a `#<code>`.
+pub const LINK_HOST: &str = "mul.li";
+
+/// `https://mul.li#<code>` — the link on screen, on paper and in a chat. No
+/// path: the fragment is the whole address, so a link is the host, a `#` and
+/// the 48 characters, and nothing else.
+pub fn link(kind: Kind, key: &[u8; 32]) -> Result<String> {
+    url(LINK_HOST, kind, key)
+}
+
 /// `HTTPS://HOST#<code>` — what goes in a QR symbol. Scheme and host are
 /// case-insensitive, the code is uppercase by construction, and the whole
 /// thing is in QR's alphanumeric mode.

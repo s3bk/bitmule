@@ -31,6 +31,9 @@ SERVER_BIN = os.environ.get("BITMULE_SERVER_BIN", str(ROOT / "target/release/bit
 CLI_BIN = os.environ.get("BITMULE_BIN", str(ROOT / "target/release/bitmule"))
 TIMEOUT = 10  # seconds, for every wait
 BLOCK = 2 * 1024 * 1024 - 16  # fountain block payload
+# A share link's code: 48 characters of base 42 (`0-9 A-Z $*-./:`), the one
+# spelling this tree emits, after the `#`.
+LINK_CODE = r"#([0-9A-Z$*./:-]{48})"
 
 
 def _major(binary):
@@ -321,7 +324,7 @@ def make_file(size, name):
 def test_cli_to_chrome(flags, size):
     path, data = make_file(size, "in.bin")
     cli = Cli(server, "send", *flags, str(path))
-    link = cli.find(r"#([A-Za-z0-9_-]{86})", "cli share link")
+    link = cli.find(LINK_CODE, "cli share link")
     page = Page(server)
     try:
         page.open()
@@ -377,7 +380,7 @@ def test_cli_stream_to_chrome(size):
     """`... | bitmule send -`: the data goes first, the manifest and checksum after it."""
     data = os.urandom(size)
     cli = Cli(server, "send", "-", "--name", "piped.bin", "--relay", stdin_data=data)
-    link = cli.find(r"#([A-Za-z0-9_-]{86})", "cli share link")
+    link = cli.find(LINK_CODE, "cli share link")
     page = Page(server)
     try:
         page.open()
@@ -446,7 +449,7 @@ def test_ui_receive(flags):
     path, data = make_file(BLOCK + 4321, "quarterly report.bin")
     downloads = Path(tempfile.mkdtemp(dir=tmp))
     cli = Cli(server, "send", *flags, str(path))
-    link = cli.find(r"#([A-Za-z0-9_-]{86})", "cli share link")
+    link = cli.find(LINK_CODE, "cli share link")
     page = Page(server, downloads=downloads)
     try:
         page.open("/app", ready="window.bitmule")
@@ -484,7 +487,7 @@ def test_ui_zip_from_cli():
     b, data_b = make_file(BLOCK // 2, "b.bin")
     downloads = Path(tempfile.mkdtemp(dir=tmp))
     cli = Cli(server, "send", "--relay", str(a), str(b))
-    link = cli.find(r"#([A-Za-z0-9_-]{86})", "cli share link")
+    link = cli.find(LINK_CODE, "cli share link")
     page = Page(server, downloads=downloads)
     try:
         page.open("/app", ready="window.bitmule")

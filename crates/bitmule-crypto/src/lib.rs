@@ -355,6 +355,13 @@ impl ShareLink {
             .expect("any 32-byte key is a code")
     }
 
+    /// The link a sender hands out: `https://mul.li#<code>` — the frozen
+    /// origin, no path, the whole address in the fragment.
+    pub fn share_url(&self) -> String {
+        code::link(code::Kind::Live, &self.share_key.0)
+            .expect("any 32-byte key is a code")
+    }
+
     /// Parse a share link in any format this tree has emitted. The length
     /// picks the format, so no version byte is needed and nothing has to be
     /// tried twice:

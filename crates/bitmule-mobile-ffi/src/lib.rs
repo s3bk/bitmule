@@ -313,7 +313,7 @@ async fn send_file_inner(
     let server_for_url = server.clone();
     v2::run_send(&server, manifest, transfer, Options::default(), move |link| {
         // fires before the transfer starts, so the shell can show the URL / QR at once
-        let url = server_for_url.share_url(link);
+        let url = server_for_url.link_url(link);
         let session_hex = link.share_key.session_id_hex();
         *listener_state.lock().unwrap() = Some((url.clone(), session_hex.clone()));
         on_url.on_url(url, session_hex, file_name, file_size);
@@ -333,10 +333,16 @@ async fn send_file_inner(
 pub fn qr_png_bytes(text: String, pixel_scale: u32) -> Result<Vec<u8>, BitmuleError> {
     let scale = pixel_scale.max(1).min(32);
     let printed = bitmule_client_native::crypto::code::print_url_for(&text);
-    let code = qrcode::QrCode::with_error_correction_level(
+    // Version 3 at ECC L, by construction: a link is `HTTPS://MUL.LI#` and 48
+    // alphanumeric digits, 63 characters, 391 of the 440 bits the symbol holds.
+    let code = qrcode::QrCode::with_version(
         printed.as_bytes(),
+        qrcode::Version::Normal(3),
         qrcode::EcLevel::L,
     )
+    .or_else(|_| {
+        qrcode::QrCode::with_error_correction_level(printed.as_bytes(), qrcode::EcLevel::L)
+    })
     .map_err(|e| BitmuleError::Unknown { reason: format!("qr encode: {e}") })?;
     let image = code
         .render::<image::Luma<u8>>()

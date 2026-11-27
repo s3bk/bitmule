@@ -500,18 +500,21 @@ async fn cmd_send_stdin(server: &str, name: String, mode: TransportMode) -> Resu
 }
 
 fn print_link(server: &v2::Server, link: &ShareLink) {
-    let url = server.share_url(link);
+    let url = server.link_url(link);
     println!("share:   {url}");
     // The symbol carries the code of the same link — the 48 alphanumeric
-    // characters a pasted link carries. Three segments (`HTTPS://HOST`, `#` as
-    // one byte, the digits) come to 391 of the 440 bits a version 3 symbol at
-    // ECC L holds; a base64url spelling would be byte mode throughout and need
-    // a bigger symbol for the same key.
+    // characters a pasted link carries, inside `HTTPS://MUL.LI#`. Three
+    // segments plus a 4-bit terminator come to 391 of the 440 bits a version 3
+    // symbol at ECC L holds; the symbol is version 3, and anything longer says
+    // so instead of quietly growing.
     let printed = bitmule_client_native::crypto::code::print_url_for(&url);
     println!("print:   {printed}");
-    match QrCode::with_error_correction_level(printed.as_bytes(), qrcode::EcLevel::L) {
+    match QrCode::with_version(printed.as_bytes(), qrcode::Version::Normal(3), qrcode::EcLevel::L) {
         Ok(qr) => println!("{}", qr.render::<unicode::Dense1x2>().build()),
-        Err(e) => eprintln!("qr: {e}"),
+        Err(_) => match QrCode::with_error_correction_level(printed.as_bytes(), qrcode::EcLevel::L) {
+            Ok(qr) => println!("{}", qr.render::<unicode::Dense1x2>().build()),
+            Err(e) => eprintln!("qr: {e}"),
+        },
     }
     println!("waiting for a receiver…");
 }
