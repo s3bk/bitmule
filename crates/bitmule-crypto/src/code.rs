@@ -405,6 +405,24 @@ mod tests {
     }
 
     /// Base 42 and no `+`: the owner's ruling of 2026-11-27 (43 is what QR
+    /// Three codes pinned by hand. The same three strings are asserted in
+    /// `bitmule-proto/src/link.rs`, which is the half that parses the fragment
+    /// the deployed viewer is handed: what this crate prints and what that
+    /// decoder reads have to be the same 48 characters, or a link the app
+    /// mints opens as "not a key".
+    #[test]
+    fn the_code_is_the_same_in_the_viewers_decoder() {
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let live = "5*$G*6PO85B//K01AW1.$V83V*OU/IK55ZUS$.PDJT*0TIEZ";
+        let hosted = "BXUR1-13$QGAHW3H5/NCE58E2203I9:KSGUXTV9L./G$C0F9";
+        let invite = "HTO*8RIPN5KL*26X172QXL8OE8HH-1K$8.U-MMZUI8-T$OFP";
+        assert_eq!(encode(Kind::Live, &k).unwrap(), live);
+        assert_eq!(encode(Kind::Hosted, &k).unwrap(), hosted);
+        assert_eq!(encode(Kind::Invite, &k).unwrap(), invite);
+    }
     /// offers, 42 is the least that holds a code, and `+` is the one symbol a
     /// form-urlencoded parser rewrites to a space).
     #[test]
