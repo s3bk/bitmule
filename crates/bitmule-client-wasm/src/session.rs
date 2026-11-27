@@ -87,6 +87,16 @@ impl Core {
         Core::new(Role::Creator, bx::ShareKey::random(), caps)
     }
 
+    /// Move our own session under `share_key`. A sender does this once its
+    /// data is committed: the key a code carries *is* the content commitment
+    /// (`bitmule-crypto`), so the session has to live under that key. Only
+    /// before anybody can have joined — the browser sets its transfer before
+    /// it opens the link, and a session that is already open keeps its key.
+    pub fn rekey(&mut self, share_key: bx::ShareKey) {
+        self.session_id = SessionId(share_key.session_id());
+        self.share_key = share_key;
+    }
+
     /// The session behind `share_key`, which somebody else created.
     pub fn join(share_key: bx::ShareKey, caps: PeerCaps) -> Self {
         Core::new(Role::Joiner, share_key, caps)

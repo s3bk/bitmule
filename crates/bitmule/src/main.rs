@@ -366,13 +366,14 @@ where
         .with_context(|| format!("stat {}", send_path.display()))?
         .len();
 
-    // Mint share_key (URL secret) + bulk_key (file-encryption key) up front.
-    // Then hash the file with the bulk_key to produce the URL signature
-    // commitment. The share URL fragment = base64url(share_key || signature).
-    let share_key = ShareKey::random();
+    // Mint the bulk_key (file-encryption key) up front and hash the file with
+    // it: that commitment is the URL signature, and the sender-initiated key
+    // is that same commitment (`ShareKey::from_data_commitment`), so the code
+    // alone — key, no signature — still names the data.
     let bulk_key = BulkKey::random();
-    let session_hex = share_key.session_id_hex();
     let signature = commit_file(&send_path, &bulk_key).await?;
+    let share_key = ShareKey(signature);
+    let session_hex = share_key.session_id_hex();
     let link = ShareLink::new(share_key.clone(), signature);
     let share_url = format!(
         "{}/#{}",
@@ -501,10 +502,10 @@ async fn cmd_send_stdin(server: &str, name: String, mode: TransportMode) -> Resu
 fn print_link(server: &v2::Server, link: &ShareLink) {
     let url = server.share_url(link);
     println!("share:   {url}");
-    // The symbol carries the printed form of the same link — 48 alphanumeric
-    // characters instead of 44 base64url ones. Three segments (`HTTPS://HOST`,
-    // `#` as one byte, the digits) come to 391 of the 440 bits a version 3
-    // symbol at ECC L holds; the text form is byte mode throughout and needs
+    // The symbol carries the code of the same link — the 48 alphanumeric
+    // characters a pasted link carries. Three segments (`HTTPS://HOST`, `#` as
+    // one byte, the digits) come to 391 of the 440 bits a version 3 symbol at
+    // ECC L holds; a base64url spelling would be byte mode throughout and need
     // a bigger symbol for the same key.
     let printed = bitmule_client_native::crypto::code::print_url_for(&url);
     println!("print:   {printed}");

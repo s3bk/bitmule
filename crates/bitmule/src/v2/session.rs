@@ -78,7 +78,13 @@ async fn send_job(
     on_link: impl FnOnce(&ShareLink),
     make_job: impl FnOnce(ReceiverId, SessionId, Token) -> Result<Job>,
 ) -> Result<()> {
-    let share_key = ShareKey::random();
+    // A sender-initiated key *is* the content commitment
+    // (`ShareKey::from_data_commitment`), which is how a code — key only, no
+    // signature — still binds the data it names: the receiver recomputes the
+    // commitment and holds it against the key. A streaming transfer has no
+    // commitment yet, so its key is random.
+    let share_key =
+        if signature == [0u8; 32] { ShareKey::random() } else { ShareKey(signature) };
     let link = ShareLink::new(share_key.clone(), signature);
     let Created { our_id, identity, session_id, to_server, mut from_server, relay_token, .. } =
         create(server, &share_key, options).await?;

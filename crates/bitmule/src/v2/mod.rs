@@ -321,7 +321,8 @@ pub async fn run_send_to(
 
 /// Receive the transfer behind `link` into `out` (which must be readable and
 /// writable). Returns once the data has been written and checked against the
-/// link's signature.
+/// link: its signature half if it has one, else its key, which a
+/// sender-initiated transfer mints as the content commitment.
 pub async fn run_recv(
     server: &Server,
     link: &ShareLink,

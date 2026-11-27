@@ -256,14 +256,16 @@ async fn a_restartable_stream_is_opened_again_for_repairs() {
 
 // ---- what happens to the file --------------------------------------------
 
-/// `url` with its signature (the second half of the fragment) changed, so
-/// the data cannot match it.
+/// `url` with its signature changed, so the data cannot match it. A code
+/// carries no signature, so the link is handed over in the 90-character
+/// base64url form, which does (`to_b64_url`): the key still opens the
+/// session, and the signature half is wrong.
 fn with_wrong_signature(url: &str) -> String {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use bitmule::internals::native::crypto::ShareLink;
     let (base, fragment) = url.split_once('#').unwrap();
-    let mut raw = URL_SAFE_NO_PAD.decode(fragment).unwrap();
-    raw[63] ^= 1;
-    format!("{base}#{}", URL_SAFE_NO_PAD.encode(raw))
+    let mut link = ShareLink::from_link(fragment).unwrap();
+    link.signature[31] ^= 1;
+    format!("{base}#{}", link.to_b64_url())
 }
 
 async fn sender_of(client: &Client, name: &str, data: &[u8]) -> (bitmule::SendHandle, tempfile::TempDir) {

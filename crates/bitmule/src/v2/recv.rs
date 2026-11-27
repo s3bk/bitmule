@@ -9,7 +9,9 @@
 //! When the data channel opens it takes over and the relay download is
 //! stopped; if the data channel dies, the relay download starts again. The
 //! transfer is finished when either has delivered everything. The result is
-//! checked against the signature in the share link in any case.
+//! checked against the link in any case: its signature if it has one, and
+//! otherwise its key — which for a sender-initiated transfer *is* the content
+//! commitment (`ShareLink::commits_to`).
 
 use std::{collections::{HashMap, HashSet, VecDeque}, sync::Arc};
 
@@ -401,14 +403,15 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
     if let Some(mem) = &mem { // TEMP-INSTR: the data channel wrote into memory; check it there
         let mut hasher = CommitmentHasher::new();
         hasher.update(mem);
-        if hasher.finalize(&manifest.bulk_key) != ctx.link.signature {
-            return Err(VerifyFailed("data does not match the share link's signature").into());
+        if !ctx.link.commits_to(&hasher.finalize(&manifest.bulk_key)) {
+            return Err(VerifyFailed("data does not match the share link").into());
         }
         tx.send(Peer2Peer::Complete).await?;
         return Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, udp_bytes, relay_time, data_channel_time, udp_time });
     }
-    if commitment_of(out.clone(), size, manifest.bulk_key.clone()).await? != ctx.link.signature {
-        return Err(VerifyFailed("data does not match the share link's signature").into());
+    let actual = commitment_of(out.clone(), size, manifest.bulk_key.clone()).await?;
+    if !ctx.link.commits_to(&actual) {
+        return Err(VerifyFailed("data does not match the share link").into());
     }
     tx.send(Peer2Peer::Complete).await?;
     Ok(Report { manifest, transport, relay_bytes, data_channel_bytes: dc_bytes, udp_bytes, relay_time, data_channel_time, udp_time })

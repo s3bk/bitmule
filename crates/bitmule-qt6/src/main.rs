@@ -691,9 +691,10 @@ fn split_share_url(url: &str) -> Option<(String, String)> {
 }
 
 fn parse_fragment(fragment: &str) -> Option<bitmule_client_native::crypto::ShareLink> {
-    // Every spelling the tree has emitted: the 32-byte code (44 characters),
-    // its printed form (48), the base32 forms of 2026-11-10 and the base64url
-    // links from before them. `from_link` tells them apart by length.
+    // Every spelling the tree has emitted: the 32-byte code (48 base-42
+    // characters), its base64url text codes of 44 and 43, the base32 forms of
+    // 2026-11-10 and the base64url links before them. `from_link` tells them
+    // apart by length.
     bitmule_client_native::crypto::ShareLink::from_link(fragment).ok()
 }
 
@@ -842,9 +843,9 @@ fn copy_to_clipboard(text: &str) -> bool {
     true
 }
 
-/// What goes in the symbol: the printed spelling of the same 32 bytes — 48
-/// base-43 alphanumeric characters instead of 44 base64url ones — inside an
-/// upper-case link, `HTTPS://MUL.LI#…`, so a camera can still open it. The
+/// What goes in the symbol: the code itself — 48 base-42 alphanumeric
+/// characters, the same 48 a pasted link carries — inside an upper-case link,
+/// `HTTPS://MUL.LI#…`, so a camera can still open it. The
 /// three segments cost 391 of the 440 bits QR version 3 at ECC L carries
 /// (`code::print_url_for` has the arithmetic and the 56-digit cap).
 ///

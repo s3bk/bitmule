@@ -1,40 +1,46 @@
-//! The 32-byte code (owner, 2026-11-24): one size for every kind of link.
+//! The 32-byte code (owner, 2026-11-24): one size for every kind of link, and
+//! since 2026-11-27 one spelling of it — 48 characters of base 42,
+//! `MUL.LI#…`, on screen and on paper alike (owner: "43char MUL.li#code
+//! everywhere").
 //!
 //! A link fragment is immutable the moment it is sent, so it can hold the
 //! kind and the key material and nothing else — no version byte, no checksum,
-//! no signature. The key is all 256 bits; the kind rides in the surplus of
-//! the printed alphabet instead of taking bits from the key (owner,
-//! 2026-11-24: "the key stays 256 bits"):
+//! no signature. The key is all 256 bits; the kind sits above the key instead
+//! of taking bits from it (owner, 2026-11-24: "the key stays 256 bits"):
 //!
 //! ```text
-//! print:  value = kind · 2²⁵⁶ + key            259 bits, 48 base-43 digits
-//! text:   [ kind : 3 | 00000 ][ key, 256 bits ]  33 bytes, 44 base64url
+//! value = kind · 2²⁵⁶ + key      258 bits at most, 48 base-42 digits
 //! ```
 //!
-//! Two spellings of the same code, because a code is pasted *and* printed:
+//! The alphabet is 42 of the 43 symbols QR packs in alphanumeric mode — the
+//! uppercase alphanumeric charset minus `space` (does not survive a fragment
+//! or an auto-link), minus `%` (opens a percent-encoded escape in every
+//! RFC 3986 parser) and minus `+` (a form-urlencoded parser turns it into a
+//! space). 42⁴⁸ = 2^258.83 against the 2^258 needed; 41⁴⁸ = 2^257.16 is short,
+//! so 42 is the smallest alphabet that writes a code in 48 digits. That is the
+//! point of it: the 0.83 bits left over are not payload. A decoder refuses a
+//! value ≥ 2²⁵⁸, so a random 48-digit string is refused more often than not
+//! instead of naming a code — and past that there is no margin at all.
 //!
-//! * **text** — 44 characters of unpadded base64url, exactly 33 bytes with no
-//!   spare bits. 43 characters hold 258 bits, one short of the 259 the kind
-//!   and the key need, so the text form grew by one character when the key
-//!   took back its top three bits.
-//! * **print** — 48 alphanumeric characters, base 43, left-padded with `0`.
-//!   43⁴⁸ = 2^260.46 against the 259 needed; 48 digits is the shortest length
-//!   that holds them. The alphabet is QR's alphanumeric charset minus `space`
-//!   (does not survive a fragment or an auto-link) and minus `%` (opens a
-//!   percent-encoded escape in every RFC 3986 parser), leaving 43 symbols.
-//!   The printed form did not change length: the kind fits in the slack.
+//! The code is uppercase *by construction* — QR's alphanumeric mode has no
+//! lower case — and a decoder folds case before converting, so
+//! `HTTPS://MUL.LI#…` scans to the URL it was drawn as. There is no base64
+//! spelling any more: the base64url text forms are read, never written.
 //!
-//! The print form is uppercase *by construction* — QR's alphanumeric mode
-//! has no lower case — so a decoder folds case before converting. The text
-//! form is base64url and stays case-sensitive: the two are told apart by
-//! length (44 against 48), never by tries.
+//! What this module still reads, so links already pasted or printed keep
+//! working:
 //!
-//! What this module still reads, so links already printed or pasted keep
-//! working: the earlier 43-character text code and the earlier printed code,
-//! which put the kind in the top three bits of byte 0 and left the key 253
-//! bits. Their values are disjoint from the current ones (< 2²⁵⁶ against
-//! ≥ 2²⁵⁶ for print; 43 against 44 characters for text), so a decoder can
-//! tell them apart without a flag. Nothing in this tree emits them any more.
+//! * 48 characters — the code. A value below 2²⁵⁶ is the printed code of
+//!   2026-11-24, when the kind sat in the key's top three bits and the key was
+//!   253 bits; at or above it, `kind · 2²⁵⁶ + key`.
+//! * 44 characters — the base64url text code of 2026-11-24: 33 bytes, kind in
+//!   the top three bits of byte 0, spare bits zero.
+//! * 43 characters — the base64url text code of before it: 32 bytes, the same
+//!   kind layout.
+//!
+//! Length picks the decoder and a value out of range is refused rather than
+//! tried against another layout, so no spelling is ambiguous. Nothing in this
+//! tree emits the base64url forms any more.
 //!
 //! Why the kind is in the code at all rather than in the path: a live session
 //! and a hosted download carry the same key, so only the code can tell them
@@ -79,16 +85,23 @@ impl Kind {
     }
 }
 
-/// Text form: 44 base64url characters, 33 bytes.
-pub const CODE_CHARS: usize = 44;
-/// The earlier text form: 43 characters, 32 bytes, kind in the top three bits
-/// of byte 0. Read, never written.
+/// A code: 48 characters of base 42, uppercase. One spelling, on screen and
+/// on paper (owner, 2026-11-27).
+pub const CODE_CHARS: usize = 48;
+/// The printed code, which is the code: the same 48 characters.
+pub const PRINT_CHARS: usize = CODE_CHARS;
+/// The text code of 2026-11-24: 44 base64url characters, 33 bytes. Read,
+/// never written.
+pub const LEGACY_TEXT_CHARS: usize = 44;
+/// The text code of before that: 43 base64url characters, 32 bytes, the kind
+/// in the top three bits of byte 0. Read, never written.
 pub const LEGACY_CODE_CHARS: usize = 43;
-/// Print form: 48 base-43 characters.
-pub const PRINT_CHARS: usize = 48;
-/// The base-43 alphabet: QR alphanumeric without space and `%`, in ASCII
+/// The base-42 alphabet: QR alphanumeric without space, `%` and `+`, in ASCII
 /// order within each run so a human can find a digit or a letter.
-pub const PRINT_ALPHABET: &[u8; 43] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$*+-./:";
+pub const PRINT_ALPHABET: &[u8; 42] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$*-./:";
+/// The base the digits are written in: the size of [`PRINT_ALPHABET`]. 41 is
+/// too few — 41⁴⁸ = 2^257.16 does not hold a 258-bit value in 48 digits.
+pub const CODE_BASE: u64 = PRINT_ALPHABET.len() as u64;
 
 /// A decoded code: what it opens, and the whole 256-bit key it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,33 +110,28 @@ pub struct Code {
     pub key: [u8; 32],
 }
 
-/// Encode for a text surface: 44 unpadded base64url characters.
-///
-/// The payload is 33 bytes: one byte of kind, then the key. The kind byte's
-/// low five bits are zero, so every code has exactly one spelling.
+/// Encode a code — the base-42 spelling, [`encode_print`], because a code has
+/// one spelling now: what is pasted is what is printed.
 pub fn encode(kind: Kind, key: &[u8; 32]) -> Result<String> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let mut buf = [0u8; 33];
-    buf[0] = kind.as_bits() << 5;
-    buf[1..].copy_from_slice(key);
-    let s = URL_SAFE_NO_PAD.encode(buf);
-    debug_assert_eq!(s.chars().count(), CODE_CHARS);
-    Ok(s)
+    encode_print(kind, key)
 }
 
-/// Decode the text form — 44 characters, or the 43-character form of before
-/// 2026-11-24, which put the kind in the key's top three bits.
-pub fn decode_text(s: &str) -> Result<Code> {
+/// Read a base64url text code: 44 characters (33 bytes, kind in the top three
+/// bits of byte 0), or the 43-character form of before 2026-11-24 (32 bytes,
+/// the same layout). Nothing emits either any more.
+pub fn decode_legacy_text(s: &str) -> Result<Code> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let cleaned = clean(s);
     let n = cleaned.chars().count();
     if n == LEGACY_CODE_CHARS {
         return decode_text_legacy(&cleaned);
     }
-    if n != CODE_CHARS {
+    if n != LEGACY_TEXT_CHARS {
         bail!(
-            "a code is {CODE_CHARS} characters (or {PRINT_CHARS} printed), not {n} — \
-             it was probably cut short or has stray characters; copy the whole code"
+            "a code is {CODE_CHARS} characters; {n} is neither that nor one of the \
+             base64url text codes of before 2026-11-27 ({LEGACY_TEXT_CHARS} or \
+             {LEGACY_CODE_CHARS}) — it was probably cut short or has stray \
+             characters; copy the whole code"
         );
     }
     if !cleaned.is_ascii() {
@@ -161,8 +169,8 @@ fn decode_text_legacy(cleaned: &str) -> Result<Code> {
     let raw = URL_SAFE_NO_PAD.decode(cleaned.as_bytes()).map_err(|_| {
         anyhow::anyhow!(
             "{LEGACY_CODE_CHARS} characters is the text form of before 2026-11-24, \
-             and this is not one of those — a cut {CODE_CHARS}-character code ends \
-             up this length; copy the whole code"
+             and this is not one of those — a cut code of {CODE_CHARS} characters \
+             ends up this length; copy the whole code"
         )
     })?;
     let bytes: [u8; 32] = raw
@@ -187,11 +195,11 @@ fn from_bytes(bytes: [u8; 32]) -> Result<Code> {
     Ok(Code { kind, key })
 }
 
-/// Encode for paper: 48 base-43 characters, `HTTPS://MUL.LI#…`-friendly and
-/// therefore uppercase.
+/// The code itself: 48 base-42 characters, `HTTPS://MUL.LI#…`-friendly and
+/// therefore uppercase. What [`encode`] returns, and what a symbol carries.
 ///
 /// The printed value is `kind · 2²⁵⁶ + key`, so the kind sits above the whole
-/// key instead of in its top bits. 259 bits against the 2^260.46 of 48 digits:
+/// key instead of in its top bits. 258 bits against the 2^258.83 of 48 digits:
 /// the symbol's length does not change while the key keeps all 256 bits.
 pub fn encode_print(kind: Kind, key: &[u8; 32]) -> Result<String> {
     let mut limbs = [0u64; 5];
@@ -199,15 +207,15 @@ pub fn encode_print(kind: Kind, key: &[u8; 32]) -> Result<String> {
     limbs[..4].copy_from_slice(&to_limbs(key));
     let mut digits = [0u8; PRINT_CHARS];
     for i in (0..PRINT_CHARS).rev() {
-        digits[i] = div_rem_small(&mut limbs, 43) as u8;
+        digits[i] = div_rem_small(&mut limbs, CODE_BASE) as u8;
     }
-    debug_assert!(limbs == [0; 5], "259 bits must fit in 48 base-43 digits");
+    debug_assert!(limbs == [0; 5], "258 bits must fit in 48 base-42 digits");
     Ok(digits.iter().map(|d| PRINT_ALPHABET[*d as usize] as char).collect())
 }
 
-/// Decode the print form. Case is folded (the printed form is uppercase by
-/// construction), and the value is checked against the range the format can
-/// produce, so exactly one 48-digit spelling decodes to each code.
+/// Decode a code. Case is folded (the code is uppercase by construction), and
+/// the value is checked against the range the format can produce, so exactly
+/// one 48-digit spelling decodes to each code.
 ///
 /// A value below 2²⁵⁶ is a code of the earlier layout (kind in the key's top
 /// three bits); at or above it, `kind · 2²⁵⁶ + key`. The two ranges cannot
@@ -217,7 +225,8 @@ pub fn decode_print(s: &str) -> Result<Code> {
     let n = cleaned.chars().count();
     if n != PRINT_CHARS {
         bail!(
-            "a printed code is {PRINT_CHARS} characters (or {CODE_CHARS} as text), not {n}"
+            "a code is {CODE_CHARS} characters, not {n} — it was probably cut short \
+             or has stray characters; copy the whole code"
         );
     }
     let mut limbs = [0u64; 5];
@@ -228,16 +237,15 @@ pub fn decode_print(s: &str) -> Result<Code> {
             .position(|a| *a as char == up)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "{c:?} is not a code character; the alphabet is 0-9 A-Z and $*+-./:"
+                    "{c:?} is not a code character; the alphabet is 0-9 A-Z and $*-./:"
                 )
             })? as u8;
-        // 43^48 < 2^261, so five limbs never overflow here.
-        mul_add_small(&mut limbs, 43, digit as u64);
+        // 42^48 < 2^259, so five limbs never overflow here.
+        mul_add_small(&mut limbs, CODE_BASE, digit as u64);
     }
     if limbs[4] > 3 {
         bail!(
-            "the printed code is worth 2^258 or more — it was not produced by \
-             this format"
+            "the code is worth 2^258 or more — it was not produced by this format"
         );
     }
     let low = [limbs[0], limbs[1], limbs[2], limbs[3]];
@@ -255,27 +263,28 @@ pub fn decode_print(s: &str) -> Result<Code> {
     Ok(Code { kind, key: from_limbs(&low) })
 }
 
-/// Decode either spelling. Length picks it: 44 is text, 48 is print, 43 is the
-/// text form of before 2026-11-24.
+/// Decode a code in any spelling this tree has emitted. Length picks it: 48 is
+/// the code, 44 and 43 are the base64url text codes of before 2026-11-27.
 pub fn decode(s: &str) -> Result<Code> {
     let cleaned = clean(s);
     match cleaned.chars().count() {
-        CODE_CHARS | LEGACY_CODE_CHARS => decode_text(&cleaned),
-        PRINT_CHARS => decode_print(&cleaned),
+        CODE_CHARS => decode_print(&cleaned),
+        LEGACY_TEXT_CHARS | LEGACY_CODE_CHARS => decode_legacy_text(&cleaned),
         n => bail!(
-            "a code is {CODE_CHARS} characters as text or {PRINT_CHARS} printed, not {n}"
+            "a code is {CODE_CHARS} characters, not {n} — it was probably cut short \
+             or has stray characters; copy the whole code"
         ),
     }
 }
 
-/// `https://host#<text code>`.
+/// `https://host#<code>` — the same 48 characters a symbol carries.
 pub fn url(host: &str, kind: Kind, key: &[u8; 32]) -> Result<String> {
     Ok(format!("https://{host}#{}", encode(kind, key)?))
 }
 
-/// `HTTPS://HOST#<printed code>` — what goes in a QR symbol. Scheme and host
-/// are case-insensitive, the printed code is uppercase by construction, and
-/// the whole thing is in QR's alphanumeric mode.
+/// `HTTPS://HOST#<code>` — what goes in a QR symbol. Scheme and host are
+/// case-insensitive, the code is uppercase by construction, and the whole
+/// thing is in QR's alphanumeric mode.
 pub fn print_url(host: &str, kind: Kind, key: &[u8; 32]) -> Result<String> {
     Ok(format!(
         "HTTPS://{}#{}",
@@ -285,14 +294,14 @@ pub fn print_url(host: &str, kind: Kind, key: &[u8; 32]) -> Result<String> {
 }
 
 /// What a client puts in the symbol for a link it already holds:
-/// `https://host/#<text code>` becomes `HTTPS://HOST#<printed code>`, the kind
+/// `https://host/#<code>` becomes `HTTPS://HOST#<code>`, the kind
 /// carried over from the link.
 ///
 /// This is the one place a surface turns a link into symbol content, so every
 /// client draws the same symbol: 63 characters in three QR segments — host 14
 /// alphanumeric, `#` one byte, code 48 alphanumeric — 391 of the 440 bits a
-/// version 3 symbol at ECC L holds. The text form would be byte mode
-/// throughout (59 bytes, 484 bits) and need a version 4 symbol.
+/// version 3 symbol at ECC L holds. A base64url spelling of the same key was
+/// byte mode throughout (59 bytes, 484 bits) and needed a version 4 symbol.
 ///
 /// Anything that is not a code comes back unchanged, so a caller can pass its
 /// URL through without checking first. Already-printed input comes back as it
@@ -384,26 +393,53 @@ mod tests {
         b
     }
 
+    /// Base 42 and no `+`: the owner's ruling of 2026-11-27 (43 is what QR
+    /// offers, 42 is the least that holds a code, and `+` is the one symbol a
+    /// form-urlencoded parser rewrites to a space).
     #[test]
-    fn text_is_44_chars_and_roundtrips() {
+    fn the_alphabet_is_42_without_plus() {
+        assert_eq!(PRINT_ALPHABET.len(), 42);
+        assert!(!PRINT_ALPHABET.contains(&b'+'));
+        assert_eq!(CODE_BASE, 42);
+        // A digit string with `+` in it is not a code (the interim base-43
+        // alphabet had one, and nothing outside this tree ever emitted it).
+        let mut s: String = "0".repeat(23);
+        s.push('+');
+        s.push_str(&"0".repeat(24));
+        assert_eq!(s.chars().count(), PRINT_CHARS);
+        let err = decode_print(&s).expect_err("+ is not a code character");
+        assert!(err.to_string().contains("not a code character"), "{err}");
+    }
+
+    /// One spelling since 2026-11-27: what is pasted is what is printed.
+    #[test]
+    fn the_code_is_48_chars_and_roundtrips() {
         for k in Kind::iter() {
             for seed in 0..8u8 {
                 let k0 = key(seed);
                 let s = encode(k, &k0).unwrap();
                 assert_eq!(s.chars().count(), CODE_CHARS);
-                let code = decode_text(&s).unwrap();
+                assert_eq!(s, encode_print(k, &k0).unwrap(), "one spelling, not two");
+                assert!(s.chars().all(|c| PRINT_ALPHABET.contains(&(c as u8))));
+                let code = decode(&s).unwrap();
                 assert_eq!(code, Code { kind: k, key: k0 });
+                // A chat client lowercases a link; a phone reads the symbol.
+                assert_eq!(decode(&s.to_lowercase()).unwrap(), Code { kind: k, key: k0 });
             }
         }
     }
 
-    /// A zero key shows only the kind: byte 0 is `kind << 5`, which is the
-    /// base64url character at index 8, 16 or 24, then 33 zero bytes.
+    /// With a zero key the leading digit is the kind and nothing else:
+    /// `kind · 2²⁵⁶ / 42⁴⁷` truncated is 5, 11 and 17. (It is not zero-padded
+    /// away — only `decode_print`'s range check makes a code unique.)
     #[test]
-    fn zero_key_is_kind_then_a() {
-        assert_eq!(encode(Kind::Live, &[0u8; 32]).unwrap(), format!("I{}", "A".repeat(43)));
-        assert_eq!(encode(Kind::Hosted, &[0u8; 32]).unwrap(), format!("Q{}", "A".repeat(43)));
-        assert_eq!(encode(Kind::Invite, &[0u8; 32]).unwrap(), format!("Y{}", "A".repeat(43)));
+    fn a_zero_key_still_shows_its_kind() {
+        for (k, lead) in [(Kind::Live, '5'), (Kind::Hosted, 'B'), (Kind::Invite, 'H')] {
+            let s = encode(k, &[0u8; 32]).unwrap();
+            assert_eq!(s.chars().count(), CODE_CHARS);
+            assert_eq!(s.chars().next(), Some(lead), "{s}");
+            assert_eq!(decode(&s).unwrap(), Code { kind: k, key: [0u8; 32] });
+        }
     }
 
     #[test]
@@ -421,13 +457,23 @@ mod tests {
         }
     }
 
+    /// The second spelling until 2026-11-27: 44 base64url characters, 33
+    /// bytes with the kind in byte 0's top three bits. Pasted ones still open;
+    /// none is written any more.
     #[test]
-    fn both_spellings_are_the_same_code() {
-        let k0 = key(9);
-        let text = encode(Kind::Hosted, &k0).unwrap();
-        let print = encode_print(Kind::Hosted, &k0).unwrap();
-        assert_eq!(decode(&text).unwrap(), decode(&print).unwrap());
-        assert_eq!(decode(&format!("#{text}\n")).unwrap().key, k0);
+    fn the_44_char_text_form_still_reads() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        for k in Kind::iter() {
+            let k0 = key(11);
+            let mut bytes = [0u8; 33];
+            bytes[0] = k.as_bits() << 5;
+            bytes[1..].copy_from_slice(&k0);
+            let s = URL_SAFE_NO_PAD.encode(bytes);
+            assert_eq!(s.chars().count(), LEGACY_TEXT_CHARS);
+            assert_eq!(decode(&s).unwrap(), Code { kind: k, key: k0 });
+        }
+        let s = encode(Kind::Hosted, &key(9)).unwrap();
+        assert_eq!(decode(&format!("#{s}\n")).unwrap().key, key(9));
     }
 
     /// The whole point of the 2026-11-24 change: a key with all 256 bits set
@@ -437,7 +483,7 @@ mod tests {
         let k0 = [0xffu8; 32];
         for k in Kind::iter() {
             let text = encode(k, &k0).unwrap();
-            assert_eq!(decode_text(&text).unwrap(), Code { kind: k, key: k0 });
+            assert_eq!(decode(&text).unwrap(), Code { kind: k, key: k0 });
             let print = encode_print(k, &k0).unwrap();
             assert_eq!(print.chars().count(), PRINT_CHARS);
             assert_eq!(decode_print(&print).unwrap(), Code { kind: k, key: k0 });
@@ -449,7 +495,7 @@ mod tests {
 
     #[test]
     fn a_value_above_2_258_is_refused() {
-        // 48 digits of the largest base-43 digit is ~2^260.46: not a code.
+        // 48 digits of the largest base-42 digit is 42^48 − 1 = 2^258.83: not a code.
         let s = ":".repeat(PRINT_CHARS);
         let err = decode_print(&s).expect_err("2^260 is not a code");
         assert!(err.to_string().contains("2^258"), "{err}");
@@ -457,29 +503,34 @@ mod tests {
 
     #[test]
     fn kind_zero_is_refused() {
-        // "A" repeated is all zero bits: kind 000, in either spelling.
-        let err = decode_text(&"A".repeat(CODE_CHARS)).expect_err("kind 0 is not a kind");
+        // All zeros is kind 000, which no code has.
+        let err = decode(&"0".repeat(CODE_CHARS)).expect_err("kind 0 is not a kind");
         assert!(err.to_string().contains("kind bits"), "{err}");
-        let err = decode_print(&"0".repeat(PRINT_CHARS)).expect_err("kind 0 is not a kind");
+        // And in the base64url text code of before 2026-11-27.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let s = URL_SAFE_NO_PAD.encode([0u8; 33]);
+        assert_eq!(s.chars().count(), LEGACY_TEXT_CHARS);
+        let err = decode(&s).expect_err("kind 0 is not a kind");
         assert!(err.to_string().contains("kind bits"), "{err}");
     }
 
     #[test]
     fn a_cut_code_is_named() {
         let s = encode(Kind::Live, &key(3)).unwrap();
-        let err = decode(&s[..s.len() - 1]).expect_err("43 characters is not this code");
-        assert!(err.to_string().contains("44"), "{err}");
+        let err = decode(&s[..s.len() - 1]).expect_err("47 characters is not this code");
+        assert!(err.to_string().contains("48"), "{err}");
     }
 
     #[test]
     fn spare_bits_in_the_kind_byte_are_refused() {
-        // 33 bytes of base64url by hand: the kind byte's low bits are padding.
+        // 33 bytes of base64url by hand: in the 44-char form, the kind byte's
+        // low five bits were padding and had to be zero.
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let mut buf = [0u8; 33];
         buf[0] = (Kind::Live.as_bits() << 5) | 1;
         let s = URL_SAFE_NO_PAD.encode(buf);
-        assert_eq!(s.chars().count(), CODE_CHARS);
-        let err = decode_text(&s).expect_err("padding bits set is not canonical");
+        assert_eq!(s.chars().count(), LEGACY_TEXT_CHARS);
+        let err = decode(&s).expect_err("padding bits set is not canonical");
         assert!(err.to_string().contains("spare bits"), "{err}");
     }
 
@@ -502,12 +553,12 @@ mod tests {
             assert_eq!(text.chars().count(), LEGACY_CODE_CHARS);
             assert_eq!(decode(&text).unwrap(), Code { kind: k, key: k0 });
 
-            // The same 32 bytes as 48 base-43 digits: a value below 2^256.
+            // The same 32 bytes as 48 base-42 digits: a value below 2^256.
             let mut limbs = [0u64; 5];
             limbs[..4].copy_from_slice(&to_limbs(&bytes));
             let mut digits = [0u8; PRINT_CHARS];
             for i in (0..PRINT_CHARS).rev() {
-                digits[i] = div_rem_small(&mut limbs, 43) as u8;
+                digits[i] = div_rem_small(&mut limbs, CODE_BASE) as u8;
             }
             let print: String = digits.iter().map(|d| PRINT_ALPHABET[*d as usize] as char).collect();
             assert_eq!(decode_print(&print).unwrap(), Code { kind: k, key: k0 });

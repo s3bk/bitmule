@@ -126,8 +126,8 @@ pub fn print_url(url: &str) -> String {
 #[wasm_bindgen]
 impl ShareLink {
     /// Parse the fragment of a share URL: the 32-byte code this tree emits
-    /// (44 characters as text, 48 printed) or any older spelling — base32
-    /// from 2026-11-10, base64url from before it.
+    /// (48 base-42 characters, on screen and on paper) or any older spelling —
+    /// base64url text codes, base32 from 2026-11-10, base64url before it.
     #[wasm_bindgen(js_name = fromLink)]
     pub fn from_link(s: &str) -> Result<ShareLink, JsError> {
         let link = bx::ShareLink::from_link(s).map_err(js_err)?;
@@ -151,7 +151,7 @@ impl ShareLink {
         self.to_link()
     }
 
-    /// The printed spelling of the same 32 bytes: 48 base-43 characters, what
+    /// The printed spelling of the same 32 bytes: 48 base-42 characters, what
     /// a QR symbol carries (version 3 at ECC L). No scheme and no host — the
     /// page shows the URL beside the symbol.
     #[wasm_bindgen(js_name = printLink)]
@@ -311,7 +311,12 @@ impl Session {
     /// The data to send. Must be finished. Consumes the transfer.
     #[wasm_bindgen(js_name = setTransfer)]
     pub fn set_transfer(&mut self, transfer: Transfer) -> Result<(), JsError> {
-        self.signature = Some(transfer.0.signature().ok_or_else(|| JsError::new("transfer is not finished"))?);
+        let signature = transfer.0.signature().ok_or_else(|| JsError::new("transfer is not finished"))?;
+        // the code the receiver gets carries this key, and a code has no
+        // signature half: the key is the content commitment, so the session
+        // moves under it (nothing has joined yet — the link opens after this)
+        self.core.rekey(bx::ShareKey(signature));
+        self.signature = Some(signature);
         self.transfer = Some(transfer.0);
         Ok(())
     }
@@ -388,20 +393,23 @@ impl Session {
         Ok(RelayDecoder(data::Incoming::new(manifest).map_err(js_err)?))
     }
 
-    /// Checks the received data (fed in order) against the share link's
-    /// signature, or, for a streaming transfer, against the `checksum` the sender
-    /// sent after the data.
+    /// Checks the received data (fed in order) against the share link — its
+    /// signature, or, for a code, the key it carries, which for a
+    /// sender-initiated transfer *is* the content commitment — or, for a
+    /// streaming transfer, against the `checksum` the sender sent after the
+    /// data.
     pub fn verifier(&self, checksum: Option<Vec<u8>>) -> Result<Verifier, JsError> {
         let manifest = self.core.manifest.as_ref().ok_or_else(|| JsError::new("no manifest received yet"))?;
-        let signature = match checksum {
+        let expected = match checksum {
             Some(checksum) => array_32(&checksum, "checksum")?,
-            None => self.signature.ok_or_else(|| JsError::new("the link has no signature"))?,
+            None => {
+                // a link made for a stream has no signature, and its key is
+                // random: its checksum comes after the data
+                let signature = self.signature.unwrap_or([0u8; 32]);
+                if signature == [0u8; 32] { self.core.share_key().0 } else { signature }
+            }
         };
-        // a link made for a stream has no signature to check against
-        if signature == [0u8; 32] {
-            return Err(JsError::new("there is nothing to check the data against: no signature, no checksum"));
-        }
-        Ok(Verifier(Some(data::Verifier::new(manifest, signature))))
+        Ok(Verifier(Some(data::Verifier::new(manifest, expected))))
     }
 }
 
