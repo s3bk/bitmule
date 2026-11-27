@@ -71,9 +71,15 @@ impl Context {
 struct RelayTask(std::sync::Mutex<Option<JoinHandle<()>>>);
 
 impl RelayTask {
+    /// Start the upload unless one is already running. An upload that has
+    /// *ended* — the relay drops it when the last receiver leaves, or the proxy
+    /// in front closes it after the sender has been idle 30 s — does not count:
+    /// a receiver that comes later gets a fresh one, so the share outlives the
+    /// receiver that first woke it.
     fn start_once(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
         let mut handle = self.0.lock().unwrap();
-        if handle.is_none() {
+        let running = handle.as_ref().is_some_and(|h| !h.is_finished());
+        if !running {
             *handle = Some(tokio::spawn(task));
         }
     }
