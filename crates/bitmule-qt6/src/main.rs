@@ -89,8 +89,9 @@ async fn share(
     report: SendReport,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<Url, String> {
-    use bitmule::v2::{self, Options, Server};
-    use bitmule_client_common::transfer::{Storage, TransferBuilder};
+    use bitmule::v2::{self, Options, Server, StreamInfo, StreamSource};
+    use bitmule_client_common::transfer::{Storage, Transfer, TransferBuilder};
+    use bitmule_core::protocol::websocket::TransferManifest;
 
     // The host the web app lives on, and the only one that answers /pow and
     // /ws/create: https://bitmule.qdat.net no longer terminates TLS, so no
@@ -144,14 +145,57 @@ async fn share(
         if zipped { " as a zip" } else { "" }
     ));
 
-    // hashes the data for the link's signature (and builds the zip, if any)
-    report(SendUpdate { size: Some(total_bytes), ..SendUpdate::phase("hashing the data for the link signature") });
-    let phase = Phase::start("hashing the data for the link signature");
-    let (manifest, transfer) = match builder.commit_async().await {
-        Ok(v) => v,
-        Err(e) => return Err(format!("prepare: {e:#}")),
+    // Two ways to send, and the size decides which. A single big file is
+    // streamed: the link is made before a byte is read, the data goes as it is
+    // read, and the checksum follows it (validation is after the transfer, so
+    // nothing has to be known in advance). That is the difference between a
+    // link in a second and a link after three passes over the file — the old
+    // path copied it to a temporary file, then hashed it twice for the same
+    // answer the receiver computes at the end anyway.
+    //
+    // Everything else is prepared as before: below a few megabytes the wait is
+    // not worth streaming's extra repair passes, and a zip has to be built
+    // before any of it can be sent.
+    const STREAM_ABOVE: u64 = 4 << 20;
+
+    enum Job {
+        Known(TransferManifest, Transfer),
+        Stream(StreamInfo, StreamSource),
+    }
+
+    let phase = Phase::start("preparing the data");
+    let job = if !zipped && total_bytes > STREAM_ABOVE {
+        let path = files[0].clone();
+        let shown = path.display().to_string();
+        log(format!("share: streaming {shown} as it is read, no pre-hash"));
+        report(SendUpdate { size: Some(total_bytes), ..SendUpdate::phase("streaming the file as it is read") });
+        let info = StreamInfo {
+            typ: bitmule_core::protocol::websocket::TransferType::SingleFile { compression: None },
+            name: path.file_name().map(|n| n.to_string_lossy().into_owned()),
+            size_hint: Some(total_bytes),
+        };
+        // Opened again for every pass (a repair pass reads the file anew), so
+        // a file that changes under the transfer is caught by the block hashes
+        // instead of being sent as two different files.
+        let source = StreamSource::restartable(move || {
+            let path = path.clone();
+            Box::pin(async move {
+                tokio::fs::File::open(&path).await.map(|f| Box::new(f) as v2::Reader)
+            })
+        });
+        Job::Stream(info, source)
+    } else {
+        // hashes the data for the link's signature (and builds the zip, if any)
+        report(SendUpdate { size: Some(total_bytes), ..SendUpdate::phase("hashing the data for the link signature") });
+        phase.set("hashing the data for the link signature");
+        match builder.commit_async().await {
+            Ok((manifest, transfer)) => {
+                log("share: hashed, the data is ready to send");
+                Job::Known(manifest, transfer)
+            }
+            Err(e) => return Err(format!("prepare: {e:#}")),
+        }
     };
-    log("share: hashed, the data is ready to send");
 
     let server = Server::parse(SERVER);
     let (link_tx, link_rx) = tokio::sync::oneshot::channel::<String>();
@@ -206,7 +250,16 @@ async fn share(
             }
         };
 
-        let running = v2::run_send_events(&server, manifest, transfer, Options::default(), on_link, on_event);
+        let running = async move {
+            match job {
+                Job::Known(manifest, transfer) => {
+                    v2::run_send_events(&server, manifest, transfer, Options::default(), on_link, on_event).await
+                }
+                Job::Stream(info, source) => {
+                    v2::run_send_stream(&server, info, source, Options::default(), on_link, on_event).await
+                }
+            }
+        };
         tokio::pin!(running);
         tokio::select! {
             result = &mut running => match result {
