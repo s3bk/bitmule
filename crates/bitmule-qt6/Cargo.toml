@@ -33,3 +33,7 @@ secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 # Not called directly: `secret-service` leaves the D-Bus runtime to the
 # application, and this one already runs tokio, so zbus must too.
 zbus = { version = "4", default-features = false, features = ["tokio"] }
+
+[build-dependencies]
+# Compiles src/winicon.cpp: the one window-icon call Qt Quick doesn't expose.
+cc = "1"

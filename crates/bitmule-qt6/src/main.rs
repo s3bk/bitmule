@@ -1224,6 +1224,47 @@ impl OptionsSnapshot {
     }
 }
 
+/// The app's mark: the loop from `web/site/icons/favicon.svg`, rendered at
+/// 256 px. Qt's window icon (`ApplicationWindow.icon`) takes a file, not
+/// bytes, so the binary carries the PNG and writes it to the user's cache
+/// dir on first use — 20 KB, and only when what is there differs, so an
+/// updated mark replaces the old one on the next start.
+const ICON_PNG: &[u8] = include_bytes!("icon.png");
+
+unsafe extern "C" {
+    /// `src/winicon.cpp` (or its no-op stub): sets the application's window
+    /// icon, which every `QWindow` without one of its own inherits.
+    fn bm_set_window_icon(path: *const std::ffi::c_char);
+}
+
+fn app_icon_file() -> String {
+    static PATH_ONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH_ONCE
+        .get_or_init(|| {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::env::var("HOME")
+                        .map(|h| PathBuf::from(h).join(".cache"))
+                        .unwrap_or_else(|_| std::env::temp_dir())
+                });
+            let dir = base.join("bitmule");
+            let path = dir.join("icon.png");
+            if std::fs::read(&path)
+                .map(|have| have != ICON_PNG)
+                .unwrap_or(true)
+            {
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    if let Err(e) = std::fs::write(&path, ICON_PNG) {
+                        eprintln!("icon: couldn't write {}: {e}", path.display());
+                    }
+                }
+            }
+            path.to_string_lossy().into_owned()
+        })
+        .clone()
+}
+
 fn options_path() -> PathBuf {
     // Prefer XDG_CONFIG_HOME/bitmule/, fall back to $HOME/.config/bitmule/.
     let base = std::env::var("XDG_CONFIG_HOME")
@@ -1389,6 +1430,14 @@ async fn main() {
     qml_register_type::<account::AccountApi>(c_str!("Uploader"), 1, 0, c_str!("AccountApi"));
 
     let mut engine = QmlEngine::new();
+    // Qt Quick has no QML property for the window icon (`ApplicationWindow`
+    // has no `icon`), so one C++ call sets it for every window the app
+    // opens. The mark is the loop from `web/site/icons/favicon.svg`.
+    if let Ok(path) = std::ffi::CString::new(app_icon_file()) {
+        // SAFETY: a NUL-terminated path, read only for the length of the
+        // call; Qt copies what it needs.
+        unsafe { bm_set_window_icon(path.as_ptr()) };
+    }
     engine.load_data(include_str!("app.qml").into());
     engine.exec();
 }
