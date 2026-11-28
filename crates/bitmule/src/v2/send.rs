@@ -640,6 +640,23 @@ pub async fn serve_stream_peer(ctx: Arc<StreamContext>, id: ReceiverId, peer_cap
     );
 
     tx.send(Peer2Peer::JoinRelay).await?;
+    // What a receiver can be told before a byte has been read: the block size,
+    // the key, the name and the size the caller claims. It can then open its
+    // output and decode as the bytes come, instead of keeping the ciphertext
+    // until the last of it has arrived. The manifest that follows the data is
+    // the final word — the real size and the block hashes — and this one is a
+    // promise: a file that grows or shrinks while it is sent fails there.
+    if let Some(size) = ctx.info.size_hint.filter(|size| *size > 0) {
+        let announced = TransferManifest {
+            transfer_typ: ctx.info.typ.clone(),
+            block_size: fountain::BLOCK_PLAIN as u32,
+            transfer_size: size,
+            bulk_key: ctx.key.clone(),
+            block_hashes: Vec::new(),
+            name: ctx.info.name.clone(),
+        };
+        tx.send(Peer2Peer::Manifest(announced)).await?;
+    }
     ctx.peer_joined(id);
     // However this ends — complete, gone, failed — the receiver stops counting
     // as one to code for.

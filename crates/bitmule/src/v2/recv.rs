@@ -431,11 +431,11 @@ pub async fn receive(mut ctx: Context, sender_caps: PeerCaps, app: PeerLink, sig
 }
 
 /// A streaming transfer (the sender's first message was `JoinRelay`, not
-/// `Manifest`): the data comes first over the relay, encrypted with a key we
-/// do not have yet, so it is kept as it arrives. The manifest (key, size,
-/// name) and the checksum come when the sender has read all its data. Then
-/// the kept data and what still arrives are decoded into the output file,
-/// which is opened only now, and checked against the checksum.
+/// `Manifest`): the data comes first over the relay. A sender that knows its
+/// size announces it straight after `JoinRelay` — a promise that lets the
+/// output be opened and decoded as the bytes come — and every sender makes it
+/// good with a final `Manifest` and a `Checksum` after the data. The data is
+/// checked against the checksum, and the size was fixed by the first manifest.
 async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sender<Peer2Peer>, mut rx: mpsc::Receiver<Peer2Peer>) -> Result<Report> {
     ensure!(
         ctx.options.relay && sender_caps.contains(PeerCaps::RELAY),
@@ -462,8 +462,20 @@ async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sende
     while !(downloaded && checksum.is_some()) {
         tokio::select! {
             message = rx.recv() => match message {
-                Some(Peer2Peer::Manifest(manifest)) if started.is_none() => {
+                Some(Peer2Peer::Manifest(manifest)) => {
                     ensure!(manifest.block_size as usize == fountain::BLOCK_PLAIN, "sender uses an unsupported block size");
+                    if let Some((first, _)) = &started {
+                        // the manifest the sender promised before its data, made
+                        // good after it: the same size, or the source changed
+                        // under it and the bytes here are not what was named
+                        ensure!(
+                            manifest.transfer_size == first.transfer_size,
+                            "the sender's file changed while it was sending: {} bytes, then {}",
+                            first.transfer_size,
+                            manifest.transfer_size
+                        );
+                        continue;
+                    }
                     let out = Arc::new((ctx.open.take().expect("the output is opened once"))(&manifest)?);
                     let bump = bump_for(progress.clone(), manifest.transfer_size, tx.clone());
                     started = Some((manifest.clone(), out.clone()));
