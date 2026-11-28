@@ -451,19 +451,19 @@ ApplicationWindow {
                                             : send.status === "stopped" ? "stopped" : "failed"
                                     }
                                     Button {
+                                        // One x, whose meaning follows the row: while
+                                        // the share is still going it stops it, and
+                                        // once it is over it forgets the row. Two x's
+                                        // side by side said the same thing twice.
                                         text: "×"
-                                        visible: send.status === "preparing" || send.status === "live"
                                         ToolTip.visible: hovered
-                                        ToolTip.text: "Stop this transfer"
+                                        ToolTip.text: send.status === "preparing" || send.status === "live"
+                                            ? "Stop this transfer"
+                                            : "Forget this entry"
                                         ToolTip.delay: 400
-                                        onClicked: api.stop_send("" + send.id)
-                                    }
-                                    Button {
-                                        text: "✕"
-                                        ToolTip.visible: hovered
-                                        ToolTip.text: "Forget this entry"
-                                        ToolTip.delay: 400
-                                        onClicked: api.drop_send("" + send.id)
+                                        onClicked: send.status === "preparing" || send.status === "live"
+                                            ? api.stop_send("" + send.id)
+                                            : api.drop_send("" + send.id)
                                     }
                                 }
 
