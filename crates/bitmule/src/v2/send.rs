@@ -5,7 +5,7 @@
 //! upload worker for all receivers, fountain coded) and a WebRTC data channel
 //! (a worker of its own per receiver, plus one that reads ranges for it).
 
-use std::{future::Future, pin::Pin, sync::{Arc, Mutex}};
+use std::{collections::{HashMap, HashSet}, future::Future, pin::Pin, sync::{Arc, Mutex}};
 
 use anyhow::{Result, bail, ensure};
 use bitmule_client_common::{blockio::{RangeData, read_blocks, read_ranges}, fountain, transfer::Transfer};
@@ -488,8 +488,23 @@ pub struct StreamContext {
     finished: watch::Sender<Option<Arc<Finished>>>,
     /// Set when the upload failed (say, the source changed between passes).
     failed: watch::Sender<Option<String>>,
+    /// The receivers served now and what each has: how far it has got, and
+    /// which blocks it could not decode. The upload codes for these, so it
+    /// stops when the last missing block has been sent — not on a timeout.
+    peers: Mutex<HashMap<ReceiverId, Peer>>,
+    /// Told whenever `peers` changes (a receiver joins, reports, asks, leaves).
+    peers_changed: watch::Sender<u64>,
     /// The upload to the relay, one for all receivers.
     producer: RelayTask,
+}
+
+/// What one receiver of a streaming transfer has told us.
+#[derive(Default, Clone)]
+struct Peer {
+    /// Bytes of the data it has decoded so far.
+    got: u64,
+    /// Blocks it asked for again since the last pass coded them.
+    need: Vec<u32>,
 }
 
 impl StreamContext {
@@ -513,8 +528,59 @@ impl StreamContext {
             key,
             finished: watch::channel(None).0,
             failed: watch::channel(None).0,
+            peers: Mutex::default(),
+            peers_changed: watch::channel(0).0,
             producer: RelayTask::default(),
         })
+    }
+
+    /// A receiver is being served from now on.
+    fn peer_joined(&self, id: ReceiverId) {
+        self.peers.lock().unwrap().entry(id).or_default();
+        self.peers_changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// That receiver has gone (or is done): it no longer decides what is coded.
+    fn peer_left(&self, id: ReceiverId) {
+        self.peers.lock().unwrap().remove(&id);
+        self.peers_changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// How far that receiver has got, in bytes decoded.
+    fn peer_got(&self, id: ReceiverId, bytes: u64) {
+        if let Some(peer) = self.peers.lock().unwrap().get_mut(&id) {
+            peer.got = peer.got.max(bytes);
+        }
+        self.peers_changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// The blocks that receiver could not decode and wants coded again.
+    fn peer_needed(&self, id: ReceiverId, blocks: Vec<u32>) {
+        if let Some(peer) = self.peers.lock().unwrap().get_mut(&id) {
+            peer.need = blocks;
+        }
+        self.peers_changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Whether anybody is listening at all: with the last receiver gone there
+    /// is nothing left to code for.
+    fn served(&self) -> bool {
+        !self.peers.lock().unwrap().is_empty()
+    }
+
+    /// The blocks some receiver asked for again, taken off its list: one pass
+    /// codes them. `None` — nobody asked — ends the upload, or lets it wait.
+    fn asked_for(&self) -> Option<Vec<u32>> {
+        let mut wanted: Vec<u32> = Vec::new();
+        for peer in self.peers.lock().unwrap().values_mut() {
+            wanted.append(&mut peer.need);
+        }
+        if wanted.is_empty() {
+            return None;
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        Some(wanted)
     }
 
     /// The size once it is known, else the caller's idea of it, else 0.
@@ -574,6 +640,10 @@ pub async fn serve_stream_peer(ctx: Arc<StreamContext>, id: ReceiverId, peer_cap
     );
 
     tx.send(Peer2Peer::JoinRelay).await?;
+    ctx.peer_joined(id);
+    // However this ends — complete, gone, failed — the receiver stops counting
+    // as one to code for.
+    let _served = Served(ctx.clone(), id);
     let upload = ctx.clone();
     ctx.producer.start_once(async move {
         if let Err(e) = stream_upload(&upload).await {
@@ -609,13 +679,25 @@ pub async fn serve_stream_peer(ctx: Arc<StreamContext>, id: ReceiverId, peer_cap
                     return Ok(());
                 }
                 Some(Peer2Peer::Progress(bytes)) => {
+                    ctx.peer_got(id, bytes);
                     let total = ctx.total();
                     (ctx.events)(SendEvent::Progress { receiver: receiver.clone(), bytes: if total > 0 { bytes.min(total) } else { bytes }, total });
                 }
+                // the blocks it could not decode: the upload codes those again
+                Some(Peer2Peer::Need(blocks)) => ctx.peer_needed(id, blocks),
                 // signaling and the like: there is no data channel in a streaming transfer
                 Some(_) => {}
             }
         }
+    }
+}
+
+/// A receiver on the upload's list, for as long as it is served.
+struct Served(Arc<StreamContext>, ReceiverId);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.0.peer_left(self.1);
     }
 }
 
@@ -627,7 +709,7 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
         "/session/{}/{}?token={}",
         ctx.session_id.as_hex(), ctx.our_id.as_hex(), ctx.relay_token.as_hex(),
     ));
-    let (tx, post) = open_upload(url);
+    let (tx, mut post) = open_upload(url);
     let mut stats = SendStats::new("relay");
     let encoder = Arc::new(fountain::Encoder::new());
     let parallel = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
@@ -644,7 +726,49 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
     // other bytes this time, the two encryptions would give away the XOR of
     // the two plaintexts (and the authentication key). So any change is fatal.
     let hashes: Arc<Mutex<Vec<u64>>> = Arc::default();
-    for pass in 0u32.. {
+    // The first pass codes the whole data once. After that the relay holds all
+    // of it and every receiver reads it at its own pace: there is nothing to
+    // code unless a receiver says a block did not decode. So a later pass codes
+    // only the blocks that were asked for, and the upload ends as soon as
+    // nobody is left to ask — when the last missing block has been sent.
+    let mut pass = 0u32;
+    loop {
+        if !ctx.served() {
+            return Ok(()); // the last receiver has gone
+        }
+        let wanted: Option<HashSet<u32>> = if pass == 0 {
+            None
+        } else {
+            let mut asked = ctx.asked_for();
+            if asked.is_none() {
+                // Nobody asked. Wait for a question, or for the last receiver
+                // to go, instead of coding passes nobody wants.
+                let mut changed = ctx.peers_changed.subscribe();
+                loop {
+                    if !ctx.served() {
+                        return Ok(());
+                    }
+                    if let Some(blocks) = ctx.asked_for() {
+                        asked = Some(blocks);
+                        break;
+                    }
+                    tokio::select! {
+                        woken = changed.changed() => {
+                            woken.map_err(|_| anyhow::anyhow!("the upload ended"))?;
+                        }
+                        closed = &mut post => {
+                            // the relay drops an upload that sends nothing: with
+                            // the data all there is to send, that is the end
+                            if let Ok(Ok(response)) = closed {
+                                info!("relay closed the idle upload: {}", response.status());
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            asked.map(|blocks| blocks.into_iter().collect())
+        };
         let mut reader = ctx.open(pass).await?;
         let mut encoding = FuturesOrdered::new();
         let (mut block_nr, mut offset) = (0u32, 0u64);
@@ -661,6 +785,14 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
                 ended = len < fountain::BLOCK_PLAIN;
                 if let Some(hasher) = hasher.as_mut() {
                     hasher.update(&buf[..len]);
+                }
+                // a pass that only answers questions codes nothing else
+                if let Some(wanted) = &wanted {
+                    if !wanted.contains(&block_nr) {
+                        block_nr += 1;
+                        offset += len as u64;
+                        continue;
+                    }
                 }
                 let (encoder, key) = (encoder.clone(), ctx.key.clone());
                 let (nr, at) = (block_nr, offset);
@@ -679,6 +811,9 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
                 offset += len as u64;
             }
             let Some(frames) = encoding.next().await else { break };
+            if !ctx.served() {
+                return Ok(()); // the last receiver left mid-pass
+            }
             for frame in frames?? {
                 let len = frame.len() as u64;
                 if tx.send(Ok(frame)).await.is_err() {
@@ -709,8 +844,8 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
         } else {
             ensure!(offset == size, "the source gave {offset} bytes on pass {pass}, {size} on the first");
         }
+        pass += 1;
     }
-    Ok(())
 }
 
 #[cfg(test)]

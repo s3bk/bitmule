@@ -360,6 +360,12 @@ use serde::{Deserialize, Serialize};
         // `Manifest`: SHA256(data || bulk_key), the data's commitment. A
         // normal transfer carries it in the share link instead.
         Checksum([u8; 32]),
+
+        // receiver -> sender, a streaming transfer: the blocks it could not
+        // decode from what was sent, by number. The sender codes those again
+        // and nothing else, and stops as soon as nobody asks for more — so it
+        // never has to guess from a timeout whether a receiver is still there.
+        Need(Vec<u32>),
     }
 
     /// The addresses (`ip:port`) a peer's UDP sockets can be reached at: its

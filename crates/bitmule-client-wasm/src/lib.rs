@@ -572,6 +572,10 @@ fn message_to_js(message: &Peer2Peer) -> JsValue {
             ty("Checksum");
             set(&o, "checksum", Uint8Array::from(&sum[..]));
         }
+        Peer2Peer::Need(blocks) => {
+            ty("Need");
+            set(&o, "blocks", blocks.iter().map(|b| JsValue::from_f64(*b as f64)).collect::<Array>());
+        }
     }
     o.into()
 }
@@ -621,6 +625,14 @@ fn message_from_js(message: &JsValue) -> Result<Peer2Peer, JsError> {
         "Checksum" => {
             let bytes = Uint8Array::new(&field(message, "checksum")?).to_vec();
             Peer2Peer::Checksum(bytes.try_into().map_err(|_| JsError::new("a checksum is 32 bytes"))?)
+        }
+        "Need" => {
+            let list = Array::from(&field(message, "blocks")?);
+            let mut blocks = Vec::with_capacity(list.length() as usize);
+            for b in list.iter() {
+                blocks.push(b.as_f64().filter(|n| *n >= 0.0 && n.fract() == 0.0).ok_or_else(|| JsError::new("a block number is a whole number"))? as u32);
+            }
+            Peer2Peer::Need(blocks)
         }
         other => return Err(JsError::new(&format!("unknown message type {other:?}"))),
     })
