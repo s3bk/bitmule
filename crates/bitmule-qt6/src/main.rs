@@ -221,13 +221,12 @@ async fn share(
     // megabytes: below that the prepared path costs nothing and works with
     // every older client.
     const STREAM_ABOVE: u64 = 4 << 20;
-    // Streaming is off by default: a share made that way from this app reads the
-    // whole file but nothing arrives at the receiver over the live relay (the
-    // CLI sending the same file the same way does arrive, so the difference is
-    // in this app's run, not in the server). Until that is understood, the
-    // prepared path — hash, then send — is what a share uses, for every size.
-    // `BITMULE_STREAM=1` turns streaming back on for experiments.
-    let may_stream = std::env::var_os("BITMULE_STREAM").is_some_and(|v| v != "0");
+    // A big file is streamed, always: the link comes before the data has been
+    // read, and nobody waits for a hash they did not ask for. (It was switched
+    // off for a while because a stream from this app did not arrive; that was
+    // a bug in the streaming path here, and turning the feature off is not a
+    // fix. `BITMULE_STREAM=0` remains as a way to force the prepared path.)
+    let may_stream = std::env::var_os("BITMULE_STREAM").is_none_or(|v| v != "0");
 
     enum Job {
         Known(TransferManifest, Transfer),
@@ -1553,6 +1552,14 @@ async fn main() {
     }
 
     log("bitmule-qt6 starting");
+    // The library talks through `tracing`, and a window with no subscriber
+    // swallows all of it: a relay that closes an upload, a receiver that goes
+    // away, a streaming pass that fails — none of it reached the terminal
+    // before, so a transfer that did nothing looked like a transfer that did
+    // nothing for no reason. `RUST_LOG=debug` shows the details.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "bitmule=info,bitmule_qt6=info".into());
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
     qml_register_type::<UploaderApi>(c_str!("Uploader"), 1, 0, c_str!("UploaderApi"));
     qml_register_type::<account::AccountApi>(c_str!("Uploader"), 1, 0, c_str!("AccountApi"));
 

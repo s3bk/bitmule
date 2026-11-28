@@ -732,6 +732,7 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
     // only the blocks that were asked for, and the upload ends as soon as
     // nobody is left to ask — when the last missing block has been sent.
     let mut pass = 0u32;
+    let mut told_bytes = 0u64;
     loop {
         if !ctx.served() {
             return Ok(()); // the last receiver has gone
@@ -820,6 +821,15 @@ async fn stream_upload(ctx: &StreamContext) -> Result<()> {
                     bail!("relay closed the upload: {:?}", post.await?.map(|r| r.status()));
                 }
                 stats.sent(len);
+            }
+            // A first pass over a big file is a long silence otherwise: say how
+            // far it has got, so a pass that crawls is visible while it does.
+            if pass == 0 && offset - told_bytes >= 4 << 20 {
+                told_bytes = offset;
+                match ctx.info.size_hint {
+                    Some(total) if total > 0 => info!("streaming: {} MiB of {} MiB coded", offset >> 20, total >> 20),
+                    _ => info!("streaming: {} MiB coded", offset >> 20),
+                }
             }
         }
 
