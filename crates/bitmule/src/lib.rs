@@ -639,11 +639,15 @@ impl RecvBuilder {
         let link = ShareLink::from_link(&frag)
             .map_err(|_| Error::BadShareUrl(format!("fragment {frag:?} is not a share link")))?;
 
-        // Prefer the server explicitly baked into the share URL (so
-        // the receiver doesn't need to match `.server()` at
-        // construction) — but fall back to the client's own if the
-        // URL is fragment-only.
-        let server = self.client.parse_server(&extract_server_from_url(&self.share_url).unwrap_or_else(|| (*self.client.server).clone()))?;
+        // Prefer the origin baked into the share URL (so the receiver doesn't
+        // need to match `.server()` at construction), but a printed link names
+        // the short host, which carries pages and no room: that one falls back
+        // to the client's own server (see `v2::room_for_link`). A fragment-only
+        // URL names no origin at all.
+        let fallback = (*self.client.server).clone();
+        let origin = extract_server_from_url(&self.share_url);
+        let room = crate::v2::room_for_link(origin.as_deref(), &fallback).to_string();
+        let server = self.client.parse_server(&room)?;
         let options = Options::from_mode(self.mode);
         let dest = self.dest.clone();
         std::fs::create_dir_all(&dest)?;

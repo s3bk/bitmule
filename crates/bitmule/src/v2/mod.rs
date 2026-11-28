@@ -116,10 +116,56 @@ impl Server {
     }
 }
 
+/// Is `origin` the frozen short host (`https://mul.li`, `mul.li:443`, a bare
+/// `mul.li`)? That name carries the pages a person opens and nothing else.
+pub fn names_short_host(origin: &str) -> bool {
+    let rest = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => host,
+    };
+    name.eq_ignore_ascii_case(bitmule_client_native::crypto::code::LINK_HOST)
+}
+
+/// The room a receiver joins, given the origin its link names and the server
+/// it was told to use.
+///
+/// A printed link points at the short host (`https://mul.li#<code>`), which
+/// serves pages only: it has no rooms, and a websocket join there is a 404
+/// ("session not found" from whatever answers the page server). The room is
+/// the long host the client knows — `--server`, production when nothing says
+/// otherwise; a browser learns the same origin from the page it was served.
+/// A link on any other origin (`https://bitmule.net#…`, a test instance on
+/// loopback) names its own room and is taken as it stands.
+pub fn room_for_link<'a>(link_origin: Option<&'a str>, configured: &'a str) -> &'a str {
+    match link_origin {
+        Some(origin) if !names_short_host(origin) => origin,
+        _ => configured,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Server;
+    use super::{names_short_host, room_for_link, Server};
     use bitmule_client_native::crypto::{ShareKey, ShareLink};
+
+    #[test]
+    fn the_short_host_is_a_page_server_and_the_room_is_the_long_one() {
+        // The link a person is handed names mul.li; the room is bitmule.net.
+        assert!(names_short_host("https://mul.li"));
+        assert!(names_short_host("MUL.LI"));
+        assert!(names_short_host("https://mul.li:443"));
+        assert!(!names_short_host("https://bitmule.net"));
+        assert!(!names_short_host("http://127.0.0.1:8443"));
+        assert!(!names_short_host("https://mul.li.example"));
+        assert_eq!(room_for_link(Some("https://mul.li"), "https://bitmule.net"), "https://bitmule.net");
+        // Any other origin in the link is its own room.
+        assert_eq!(room_for_link(Some("https://bitmule.net"), "https://elsewhere"), "https://bitmule.net");
+        assert_eq!(room_for_link(Some("http://127.0.0.1:8443"), "https://bitmule.net"), "http://127.0.0.1:8443");
+        // A bare fragment names no origin: the client's server stands.
+        assert_eq!(room_for_link(None, "https://bitmule.net"), "https://bitmule.net");
+    }
 
     #[test]
     fn plain_http_needs_permission() {

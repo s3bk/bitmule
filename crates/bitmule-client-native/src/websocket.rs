@@ -232,6 +232,22 @@ where
     }
 }
 
+/// A refused handshake says why in the body ("invalid session id", "session
+/// not found", "pow required", or a proxy's complaint), and tungstenite's
+/// Display throws it away, leaving a bare "HTTP error: 500 Internal Server
+/// Error" that names neither the URL nor the reason.
+fn refused(url: &str, e: tungstenite::Error) -> anyhow::Error {
+    if let tungstenite::Error::Http(response) = &e {
+        let status = response.status();
+        let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or(b"")).trim().to_string();
+        return anyhow::anyhow!(
+            "{url} refused the websocket: {status}{}",
+            if body.is_empty() { String::new() } else { format!(" — {body}") }
+        );
+    }
+    anyhow::anyhow!("{url}: {e}")
+}
+
 /// Connect to `url`, honouring the selected network interface.
 async fn open(url: &str) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, anyhow::Error> {
     let ws = if crate::nic::get().is_some() {
@@ -239,9 +255,9 @@ async fn open(url: &str) -> Result<tokio_tungstenite::WebSocketStream<tokio_tung
         let host = uri.host().ok_or_else(|| anyhow::anyhow!("no host in {url}"))?;
         let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
         let stream = crate::nic::connect_tcp(host, port).await?;
-        tokio_tungstenite::client_async_tls(url, stream).await?.0
+        tokio_tungstenite::client_async_tls(url, stream).await.map_err(|e| refused(url, e))?.0
     } else {
-        connect_async(url).await?.0
+        connect_async(url).await.map_err(|e| refused(url, e))?.0
     };
     Ok(ws)
 }

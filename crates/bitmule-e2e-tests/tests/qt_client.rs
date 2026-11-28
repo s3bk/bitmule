@@ -282,6 +282,76 @@ async fn the_qt_client_shares_and_the_cli_receives() -> Result<()> {
     Ok(())
 }
 
+/// The same link, spelled the way a person is handed it and pastes it back:
+/// on the frozen short host, which serves pages and no room.
+fn as_printed_link(link: &str) -> String {
+    let key = link.split_once('#').map(|(_, k)| k).unwrap_or("");
+    format!("https://mul.li#{key}")
+}
+
+/// A link on the short host names pages, not a room: the receiver that joined
+/// `wss://mul.li/ws/join` was refused by the page server, and the proxy in
+/// front turned its 404 into a 500 the CLI could only report as "HTTP error:
+/// 500 Internal Server Error" — while the session waited on the long host it
+/// had been told about (`--server`). This is the CLI half of that rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_host_link_reaches_the_room_behind_it() -> Result<()> {
+    let Some(qt) = need_qt()? else { return Ok(()) };
+    let env = Env::bring_up_server_only().await?;
+    let src = Scratch::new("files")?;
+    let dst = Scratch::new("files")?;
+    let (file, want) = make_random_file(src.path(), random_size_bytes())?;
+
+    let app = QtApp::start(&qt, &env.server_url, &[("BITMULE_QT_SHARE", file.to_str().unwrap())])?;
+    let link = app.wait_for_link().await.context("the window made no link")?;
+    let link = as_printed_link(&link);
+    eprintln!("[e2e] the link as printed: {link}");
+
+    let mut receiver = spawn_cli_with_stderr(
+        &env.server_url,
+        &["recv", "--out", dst.path().to_str().unwrap(), &link],
+        true,
+    )?;
+    let status = tokio::time::timeout(WAIT, receiver.wait()).await??;
+    if !status.success() {
+        let se = drain_stderr(&mut receiver).await;
+        bail!("recv via a short-host link failed\n--- receiver stderr ---\n{}", se.trim_end());
+    }
+    let saved = only_file(dst.path())?;
+    assert_eq!(sha256_file(&saved)?, want);
+    Ok(())
+}
+
+/// The other half: the window is handed a short-host link and must paste the
+/// code into the room it is set up for, not into the page server that served
+/// the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_qt_client_receives_via_a_short_host_link() -> Result<()> {
+    let Some(qt) = need_qt()? else { return Ok(()) };
+    let env = Env::bring_up_server_only().await?;
+    let src = Scratch::new("files")?;
+    let (file, want) = make_random_file(src.path(), random_size_bytes())?;
+
+    let mut sender = spawn_cli_with_stderr(&env.server_url, &["send", "--multi", file.to_str().unwrap()], true)?;
+    let link = match read_stdout_for_share(&mut sender, WAIT).await {
+        Ok(l) => l,
+        Err(e) => {
+            let se = drain_stderr(&mut sender).await;
+            bail!("no link from the sender: {e:#}\n--- sender stderr ---\n{}", se.trim_end());
+        }
+    };
+    let link = as_printed_link(&link);
+
+    let mut app = QtApp::start(&qt, &env.server_url, &[("BITMULE_QT_RECV", &link)])?;
+    let line = app.wait_for_download(WAIT).await.context("the window did not finish the download")?;
+    assert!(line.contains("recv: complete"), "the window did not get the file: {line}\n--- it said ---\n{}", app.transcript());
+    let dir = app.home.path().join("downloads/bitmule");
+    let saved = only_file(&dir)
+        .with_context(|| format!("nothing usable landed in {}\n--- the window said ---\n{}", dir.display(), app.transcript()))?;
+    assert_eq!(sha256_file(&saved)?, want);
+    Ok(())
+}
+
 /// The other direction, and the one the owner does by hand: a link from
 /// somewhere else, fetched by the window. The file must land in the download
 /// folder the window was given, and the window must say it arrived.

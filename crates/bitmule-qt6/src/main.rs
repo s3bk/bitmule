@@ -1227,10 +1227,16 @@ fn recv_out_dir() -> PathBuf {
 fn split_share_url(url: &str) -> Option<(String, String)> {
     let hash_at = url.find('#')?;
     let (before, after) = url.split_at(hash_at);
-    let server = before.trim_end_matches('/').to_string();
+    let named = before.trim_end_matches('/');
     let fragment = after.trim_start_matches('#').to_string();
-    if server.is_empty() || fragment.is_empty() { return None; }
-    Some((server, fragment))
+    if named.is_empty() || fragment.is_empty() { return None; }
+    // The link names where its pages live. A printed link names the short host
+    // (`https://mul.li#<code>`), which serves pages and no rooms — a websocket
+    // join there is a 404 — so the room is the server this window is set up
+    // for. Any other origin is its own room (`bitmule::v2::room_for_link`).
+    let configured = share_server();
+    let room = bitmule::v2::room_for_link(Some(named), &configured);
+    Some((room.to_string(), fragment))
 }
 
 fn parse_fragment(fragment: &str) -> Option<bitmule_client_native::crypto::ShareLink> {

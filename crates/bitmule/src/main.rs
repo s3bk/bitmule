@@ -48,7 +48,7 @@ fn parse_server(url: &str) -> Result<v2::Server> {
 #[command(name = "bitmule", version, about, long_about = None)]
 struct Cli {
     /// Signaling+relay server URL.
-    #[arg(long, default_value = "https://bitmule.qdat.net")]
+    #[arg(long, default_value = "https://bitmule.net")]
     server: String,
 
     /// Use only this network interface (e.g. eth0): WebRTC candidates, the
@@ -208,16 +208,10 @@ async fn main() -> Result<()> {
             cmd_send(&cli.server, paths, resolve_mode(webrtc, relay), multi, to).await
         }
         Command::Recv { session, out, webrtc, relay, on_conflict, keep_failed } => {
-            // Infer the server from the share URL when possible so the
-            // receiver doesn't need `--server` to match the sender's
-            // published origin. Falls back to `--server` (default
-            // http://localhost:8443) if the arg is a bare hex/b64
-            // fragment with no scheme.
-            let inferred = session
-                .as_deref()
-                .and_then(extract_server_from_url);
-            let server = inferred.as_deref().unwrap_or(&cli.server);
-            cmd_recv(server, session, out, resolve_mode(webrtc, relay), on_conflict, keep_failed).await
+            // `cmd_recv` reads the origin out of the link (a printed link names
+            // mul.li, whose pages carry no room) and falls back to `--server`
+            // for it, so the client's own server is what goes in here.
+            cmd_recv(&cli.server, session, out, resolve_mode(webrtc, relay), on_conflict, keep_failed).await
         }
         Command::Identity { action } => match action {
             IdentityAction::Add { name, contact_base } => identity_add(name, contact_base).await,
@@ -576,7 +570,12 @@ async fn cmd_recv(
                 .ok_or_else(|| anyhow!("couldn't extract share fragment from {raw:?}"))?;
             let link = ShareLink::from_link(&frag)
                 .map_err(|e| anyhow!("share fragment {frag:?} is not a share link: {e}"))?;
-            (link, parse_server(&extract_server_from_url(&raw).unwrap_or_else(|| server.to_string()))?)
+            // The link names where its pages live, which is not always where
+            // its room is: `https://mul.li#<code>` serves pages and has no
+            // rooms, so the room comes from `--server` (see `room_for_link`).
+            let origin = extract_server_from_url(&raw);
+            let room = v2::room_for_link(origin.as_deref(), server).to_string();
+            (link, parse_server(&room)?)
         }
         None => {
             // receiver-initiated: hand out a link, the sender answers with its share link

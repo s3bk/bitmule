@@ -35,7 +35,7 @@ use bitmule_core::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{Options, Report, Server, Span, Transport, VerifyFailed, dcproto, need, peer::PeerLink, send::AbortOnDrop};
 
@@ -535,8 +535,9 @@ async fn relay_download_stream(
     seen: Arc<Mutex<HashSet<u32>>>,
 ) -> Result<RelayEnd> {
     use tokio::io::AsyncWriteExt;
-    let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
+    let response = relay_get(&url).await?;
     let mut stream: ByteStream = Box::pin(response.bytes_stream());
+    debug!("relay stream: {url}");
     let mut spool = tokio::fs::File::from_std(spool);
     let mut spooled = 0u64;
     let mut stream_over = false;
@@ -662,12 +663,31 @@ fn spawn_decoder(
 ///
 /// Blocks are written where they belong in the order they complete. Decoding
 /// runs on a thread of its own, the writer (io_uring on Linux) on another;
+/// Open the relay's GET for a receiver. A relay refusal is a short plain-text
+/// sentence ("Session ID not found", "sender went idle", "Invalid relay
+/// token"); `error_for_status` throws it away and leaves the caller with a bare
+/// `500 Internal Server Error`, so read it and put it in the message.
+async fn relay_get(url: &str) -> Result<reqwest::Response> {
+    let response = bitmule_client_native::nic::http_client().get(url).send().await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let body = body.trim();
+    Err(anyhow::anyhow!(
+        "relay refused the download: {status}{}",
+        if body.is_empty() { String::new() } else { format!(" — {body}") }
+    ))
+}
+
 /// blocks still short of symbols when memory runs out are spilled into their
 /// gap in `out`. Dropping the future stops it all; `stop` ends it gracefully:
 /// the frames already taken are decoded, the blocks written, and the blocks
 /// that are in `out` are reported.
 async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, stop: oneshot::Receiver<()>, bump: Bump) -> Result<RelayEnd> {
-    let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
+    let response = relay_get(&url).await?;
+    debug!("relay download: {url}");
     decode_download(Box::pin(response.bytes_stream()), None, manifest, out, stop, bump, None).await
 }
 
