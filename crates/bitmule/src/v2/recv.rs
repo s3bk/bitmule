@@ -13,7 +13,10 @@
 //! otherwise its key — which for a sender-initiated transfer *is* the content
 //! commitment (`ShareLink::commits_to`).
 
-use std::{collections::{HashMap, HashSet, VecDeque}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Result, bail, ensure};
 use bitmule_client_common::{
@@ -130,6 +133,16 @@ type Bump = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// How often the sender is told how far we are.
 const REPORT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// After the first pass of a streaming transfer ends (`Checksum`), how long to
+/// wait before asking for the blocks that did not decode: the ones still in
+/// flight get that much time to land.
+const ASK_AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Between one ask for missing blocks and the next, and how many in all: a
+/// sender that does not answer the first time is asked again, but not forever.
+const ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+const MAX_ASKS: u32 = 3;
 
 fn bump_for(progress: Option<Progress>, size: u64, sender: mpsc::Sender<Peer2Peer>) -> Bump {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -432,8 +445,11 @@ async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sende
     let (start_tx, start_rx) = oneshot::channel::<(TransferManifest, Arc<std::fs::File>, Bump)>();
     let mut start_tx = Some(start_tx);
     let spool = tempfile::tempfile()?;
+    // The blocks decoded so far: when the sender says its first pass is
+    // through, whatever is not in here is what it has to code again.
+    let seen: Arc<Mutex<HashSet<u32>>> = Arc::default();
     let mut download = Relay {
-        task: tokio::spawn(relay_download_stream(ctx.relay_url(), spool, start_rx, progress.clone())),
+        task: tokio::spawn(relay_download_stream(ctx.relay_url(), spool, start_rx, progress.clone(), seen.clone())),
         stop: None,
     };
 
@@ -441,6 +457,8 @@ async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sende
     let mut checksum: Option<[u8; 32]> = None;
     let mut relay_time = Span::default();
     let mut downloaded = false;
+    let mut asks = 0u32;
+    let mut next_ask: Option<tokio::time::Instant> = None;
     while !(downloaded && checksum.is_some()) {
         tokio::select! {
             message = rx.recv() => match message {
@@ -451,11 +469,35 @@ async fn receive_stream(mut ctx: Context, sender_caps: PeerCaps, tx: mpsc::Sende
                     started = Some((manifest.clone(), out.clone()));
                     let _ = start_tx.take().expect("started once").send((manifest, out, bump));
                 }
-                Some(Peer2Peer::Checksum(sum)) => checksum = Some(sum),
-                Some(Peer2Peer::JoinRelay) | Some(Peer2Peer::Progress(_)) => {}
+                Some(Peer2Peer::Checksum(sum)) => {
+                    checksum = Some(sum);
+                    // the first pass is through: ask for what did not decode,
+                    // once the frames still in flight have had their time
+                    next_ask = Some(tokio::time::Instant::now() + ASK_AFTER);
+                }
+                Some(Peer2Peer::JoinRelay) | Some(Peer2Peer::Progress(_)) | Some(Peer2Peer::Need(_)) => {}
                 Some(_) => bail!("unexpected message during a streaming transfer"),
                 None => bail!("sender went away"),
             },
+            _ = tokio::time::sleep_until(next_ask.unwrap_or_else(|| tokio::time::Instant::now() + ASK_EVERY)), if next_ask.is_some() => {
+                next_ask = None;
+                // with the download finished nothing can be missing any more
+                if let (Some((manifest, _)), false) = (&started, downloaded) {
+                    let total = fountain::num_blocks(manifest.transfer_size);
+                    let missing: Vec<u32> = {
+                        let seen = seen.lock().unwrap();
+                        (0..total).filter(|block| !seen.contains(block)).collect()
+                    };
+                    if missing.is_empty() {
+                        asks = MAX_ASKS;
+                    } else if asks < MAX_ASKS {
+                        asks += 1;
+                        tracing::debug!("asking for {} block(s) again", missing.len());
+                        tx.send(Peer2Peer::Need(missing)).await?;
+                        next_ask = Some(tokio::time::Instant::now() + ASK_EVERY);
+                    }
+                }
+            }
             result = async { (&mut download.task).await }, if !downloaded => {
                 downloaded = true;
                 match result?? {
@@ -490,6 +532,7 @@ async fn relay_download_stream(
     spool: std::fs::File,
     mut start: oneshot::Receiver<(TransferManifest, Arc<std::fs::File>, Bump)>,
     progress: Option<Progress>,
+    seen: Arc<Mutex<HashSet<u32>>>,
 ) -> Result<RelayEnd> {
     use tokio::io::AsyncWriteExt;
     let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
@@ -519,7 +562,7 @@ async fn relay_download_stream(
     spool.flush().await?;
     let spool = spool.into_std().await;
     let (_keep, stop) = oneshot::channel();
-    decode_download(stream, Some((spool, spooled)), manifest, out, stop, bump).await
+    decode_download(stream, Some((spool, spooled)), manifest, out, stop, bump, Some(seen)).await
 }
 
 /// `SHA256(file || bulk_key)`, read back from the finished file.
@@ -625,7 +668,7 @@ fn spawn_decoder(
 /// that are in `out` are reported.
 async fn relay_download(url: String, manifest: TransferManifest, out: Arc<std::fs::File>, stop: oneshot::Receiver<()>, bump: Bump) -> Result<RelayEnd> {
     let response = bitmule_client_native::nic::http_client().get(url).send().await?.error_for_status()?;
-    decode_download(Box::pin(response.bytes_stream()), None, manifest, out, stop, bump).await
+    decode_download(Box::pin(response.bytes_stream()), None, manifest, out, stop, bump, None).await
 }
 
 type ByteStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
@@ -639,9 +682,13 @@ async fn decode_download(
     out: Arc<std::fs::File>,
     stop: oneshot::Receiver<()>,
     bump: Bump,
+    // Where to note the blocks decoded as they complete, when someone is
+    // watching: the streaming receiver asks the sender for the rest.
+    seen: Option<Arc<Mutex<HashSet<u32>>>>,
 ) -> Result<RelayEnd> {
     let mut splitter = fountain::FrameSplitter::default();
-    let (tx, mut decode) = spawn_decoder(&manifest, out, bump, None)?;
+    let (finished_tx, mut finished) = mpsc::unbounded_channel::<u32>();
+    let (tx, mut decode) = spawn_decoder(&manifest, out, bump, seen.is_some().then_some(finished_tx))?;
     let size = manifest.transfer_size;
 
     let mut tx = Some(tx);
@@ -698,6 +745,11 @@ async fn decode_download(
                         }
                     }
                     None => tx = None,
+                }
+            }
+            Some(block) = finished.recv(), if seen.is_some() => {
+                if let Some(seen) = &seen {
+                    seen.lock().unwrap().insert(block);
                 }
             }
             result = &mut decode => {
