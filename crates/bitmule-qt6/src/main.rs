@@ -221,9 +221,13 @@ async fn share(
     // megabytes: below that the prepared path costs nothing and works with
     // every older client.
     const STREAM_ABOVE: u64 = 4 << 20;
-    // `BITMULE_STREAM=0` keeps a send on the prepared path, for a receiver too
-    // old to know `JoinRelay`.
-    let may_stream = std::env::var_os("BITMULE_STREAM").map_or(true, |v| v != "0");
+    // Streaming is off by default: a share made that way from this app reads the
+    // whole file but nothing arrives at the receiver over the live relay (the
+    // CLI sending the same file the same way does arrive, so the difference is
+    // in this app's run, not in the server). Until that is understood, the
+    // prepared path — hash, then send — is what a share uses, for every size.
+    // `BITMULE_STREAM=1` turns streaming back on for experiments.
+    let may_stream = std::env::var_os("BITMULE_STREAM").is_some_and(|v| v != "0");
 
     enum Job {
         Known(TransferManifest, Transfer),
@@ -284,6 +288,7 @@ async fn share(
             std::sync::Arc::new(move |event: v2::SendEvent| match event {
                 v2::SendEvent::Connected { .. } => {
                     let n = peers.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    log(format!("share: a receiver is connected ({n} now)"));
                     report(SendUpdate::peers(n));
                 }
                 v2::SendEvent::Progress { receiver, bytes, total } => {
