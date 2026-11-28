@@ -1,6 +1,10 @@
 //! Shared helpers for the e2e tests: server auto-start, webdriver auto-start,
 //! random-file generation, sha256 verification.
 
+// Each test binary compiles this module whole and uses the part it needs; the
+// rest is not dead, it is another suite's half.
+#![allow(dead_code)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};

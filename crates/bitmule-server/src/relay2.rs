@@ -320,11 +320,44 @@ pub async fn post(
     run_session(session, body.into_data_stream()).await
 }
 
+/// An aspect of the room that a page needs to know before it may read the
+/// stream: this GET is cross-origin by design. A link printed on the short host
+/// (`mul.li#…`) is opened there, while the room and the relay live on the long
+/// host (`bitmule.net`, §5.1a), so without `Access-Control-Allow-Origin` the
+/// browser refuses the bytes before the transfer begins — and the page can only
+/// report "Failed to fetch", not what the relay said.
+///
+/// `*` is enough and is safe: the URL carries the receiver's own token, which
+/// authorizes that one stream, and the reply is the sender's ciphertext, not
+/// anything a page could ask for by guessing.
+fn cors(mut res: axum::response::Response) -> axum::response::Response {
+    res.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    res
+}
+
 /// Receiver download. `receiver_id` must be in the room, with its own token.
 pub async fn get(
     Path((session_hex, receiver_hex)): Path<(String, String)>,
     Query(args): Query<TokenArgs>,
     State(state): State<Arc<AppState>>
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    cors(match get_stream(session_hex, receiver_hex, args, state).await {
+        // A refusal is worth reading too: it is the difference between "the
+        // sender went away" and "this browser is not allowed to fetch".
+        Ok(body) => body.into_response(),
+        Err(e) => e.into_response(),
+    })
+}
+
+async fn get_stream(
+    session_hex: String,
+    receiver_hex: String,
+    args: TokenArgs,
+    state: Arc<AppState>,
 ) -> Result<Body, Error> {
     let session_id = parse_session(&session_hex)?;
     let receiver_id = ReceiverId::from_hex(&receiver_hex).map_err(|_| Error::BadReceiverId)?;
@@ -342,6 +375,20 @@ mod tests {
     use super::*;
     use crate::room::PeerEntry;
     use bitmule_core::crypto::SessionMac;
+
+    /// A page on the short host (`mul.li`) fetches this stream from the long one
+    /// (`bitmule.net`), so the header has to be there: without it the browser
+    /// refuses the bytes before the transfer starts, and the page can only say
+    /// "Failed to fetch" — which is what a real browser test found.
+    #[test]
+    fn the_relay_stream_is_readable_from_another_origin() {
+        use axum::response::IntoResponse;
+        let res = cors(axum::body::Body::empty().into_response());
+        assert_eq!(
+            res.headers().get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&axum::http::HeaderValue::from_static("*"))
+        );
+    }
 
     fn session(owner: ReceiverId) -> Arc<SessionState> {
         let (sink, _) = mpsc::channel(1);
