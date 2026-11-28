@@ -459,7 +459,7 @@ fn resolve_mode(webrtc: bool, relay: bool) -> TransportMode {
     }
 }
 
-async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi: bool, to: Option<String>) -> Result<()> {
+async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, multi: bool, to: Option<String>) -> Result<()> {
     let mut transfer = TransferBuilder::new();
     for path in paths {
         if path.is_file() {
@@ -480,7 +480,12 @@ async fn cmd_send(server: &str, paths: Vec<PathBuf>, mode: TransportMode, _multi
         return Ok(());
     }
     let server = parse_server(server)?;
-    v2::run_send_events(&server, manifest, transfer, options_for(mode), |link| print_link(&server, link), send_events()).await?;
+    // `--multi` is the promise the link keeps answering: the session outlives
+    // the receivers that use it (`keep_open`), so the same link serves the next
+    // one until the process is stopped.
+    let mut options = options_for(mode);
+    options.keep_open = multi;
+    v2::run_send_events(&server, manifest, transfer, options, |link| print_link(&server, link), send_events()).await?;
     Ok(())
 }
 

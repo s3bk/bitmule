@@ -260,13 +260,18 @@ async fn share(
             }
         };
 
+        // A share is a link that keeps answering: after a receiver finishes,
+        // the session stays up (`keep_open`) instead of closing with it, and
+        // the next person to open the link gets the same files — the app's
+        // transfer ends on Stop, or by turning the share into a hosted one.
+        let options = Options { keep_open: true, ..Options::default() };
         let running = async move {
             match job {
                 Job::Known(manifest, transfer) => {
-                    v2::run_send_events(&server, manifest, transfer, Options::default(), on_link, on_event).await
+                    v2::run_send_events(&server, manifest, transfer, options, on_link, on_event).await
                 }
                 Job::Stream(info, source) => {
-                    v2::run_send_stream(&server, info, source, Options::default(), on_link, on_event).await
+                    v2::run_send_stream(&server, info, source, options, on_link, on_event).await
                 }
             }
         };

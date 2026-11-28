@@ -102,7 +102,6 @@ async fn send_job(
     const NOBODY_WAITS: std::time::Duration = std::time::Duration::from_secs(15 * 60);
     let streaming = matches!(job, Job::Stream(_));
     let mut idle_until = tokio::time::Instant::now() + NOBODY_WAITS;
-
     loop {
         select! {
             _ = tokio::time::sleep_until(idle_until), if streaming && peers.is_empty() => {
@@ -169,7 +168,10 @@ async fn send_job(
                     Err(e) if e.is::<send::UploadFailed>() => return Err(e),
                     Err(e) => warn!("receiver {id:?}: {e}"),
                 }
-                if peers.is_empty() && completed > 0 {
+                if peers.is_empty() && completed > 0 && !options.keep_open {
+                    // The one-shot send is over. A share (`keep_open`) stays
+                    // here instead: its link has to keep answering for the
+                    // next receiver, and only Stop or an idle session ends it.
                     return Ok(());
                 }
             }

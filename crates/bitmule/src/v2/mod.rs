@@ -160,20 +160,26 @@ pub struct Options {
     /// first when both sides allow it; the other transports take over if no
     /// path is found.
     pub udp: bool,
+    /// Keep the session answering after its receivers have finished, so the
+    /// same link still works for whoever comes next (the app's shares do this;
+    /// a one-shot `bitmule send` does not — it exits when the transfer is
+    /// over). A kept-open session ends on Stop, or when nobody has joined for
+    /// [`NOBODY_WAITS`](session::send_job).
+    pub keep_open: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { webrtc: true, relay: true, udp: false }
+        Options { webrtc: true, relay: true, udp: false, keep_open: false }
     }
 }
 
 impl Options {
     pub fn from_mode(mode: TransportMode) -> Self {
         match mode {
-            TransportMode::Auto => Options { webrtc: true, relay: true, udp: false },
-            TransportMode::Webrtc => Options { webrtc: true, relay: false, udp: false },
-            TransportMode::Relay => Options { webrtc: false, relay: true, udp: false },
+            TransportMode::Auto => Options { webrtc: true, relay: true, udp: false, keep_open: false },
+            TransportMode::Webrtc => Options { webrtc: true, relay: false, udp: false, keep_open: false },
+            TransportMode::Relay => Options { webrtc: false, relay: true, udp: false, keep_open: false },
         }
     }
 

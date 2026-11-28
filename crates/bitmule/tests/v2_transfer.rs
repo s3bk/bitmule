@@ -11,9 +11,9 @@ use bitmule_client_common::{
 use bitmule_server::{AppState, router};
 use tokio::sync::oneshot;
 
-const RELAY: Options = Options { webrtc: false, relay: true, udp: false };
-const WEBRTC: Options = Options { webrtc: true, relay: false, udp: false };
-const UDP: Options = Options { webrtc: false, relay: false, udp: true };
+const RELAY: Options = Options { webrtc: false, relay: true, udp: false, keep_open: false };
+const WEBRTC: Options = Options { webrtc: true, relay: false, udp: false, keep_open: false };
+const UDP: Options = Options { webrtc: false, relay: false, udp: true, keep_open: false };
 
 async fn start_server() -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -75,6 +75,28 @@ async fn small_file() {
     assert_eq!(roundtrip(1000, RELAY).await, Transport::Relay);
 }
 
+/// A share (`keep_open`) outlives its receivers: the second one to open the
+/// link gets the same data, off the session the first one already finished
+/// with. Without it the sender returns as soon as one receiver is done, its
+/// room closes, and the next joiner is told the sender is not online.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_share_answers_a_second_receiver() {
+    const SHARE: Options = Options { webrtc: false, relay: true, udp: false, keep_open: true };
+    let server = start_server().await;
+    let data = payload(300_000);
+    let (link, sender) = start_sender(&server, &data, SHARE).await;
+
+    for _ in 0..2 {
+        let (out, file) = output();
+        let report = run_recv(&server, &link, file, RELAY).await.unwrap();
+        assert_eq!(report.manifest.transfer_size, data.len() as u64);
+        assert_eq!(std::fs::read(out.path()).unwrap(), data);
+    }
+    // the sender is still there, waiting for the next one
+    assert!(!sender.is_finished());
+    sender.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_piece_file() {
     roundtrip(300_000, RELAY).await;
@@ -116,7 +138,7 @@ async fn an_empty_file_with_udp_on() {
 /// UDP first, the relay as the way back; here UDP works.
 #[tokio::test(flavor = "multi_thread")]
 async fn udp_with_the_relay_behind_it() {
-    let both = Options { webrtc: false, relay: true, udp: true };
+    let both = Options { webrtc: false, relay: true, udp: true, keep_open: false };
     assert_eq!(roundtrip(BLOCK_PLAIN + 99, both).await, Transport::Udp);
 }
 
@@ -125,7 +147,7 @@ async fn udp_with_the_relay_behind_it() {
 async fn udp_only_on_one_side_uses_the_relay() {
     let server = start_server().await;
     let data = payload(BLOCK_PLAIN + 1);
-    let (link, sender) = start_sender(&server, &data, Options { webrtc: false, relay: true, udp: true }).await;
+    let (link, sender) = start_sender(&server, &data, Options { webrtc: false, relay: true, udp: true, keep_open: false }).await;
 
     let (out, file) = output();
     let report = run_recv(&server, &link, file, RELAY).await.unwrap();
