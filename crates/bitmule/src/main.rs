@@ -626,6 +626,30 @@ async fn cmd_recv(
         Err(e) => return Err(e),
     };
     println!("done, over {:?} ({} bytes via relay, {} via data channel, {} via udp)", report.transport, report.relay_bytes, report.data_channel_bytes, report.udp_bytes);
+    // A folder goes as one zip. What was sent is the folder, so what lands is
+    // the folder: unpack it next to where the zip was written and take the zip
+    // away — the same thing the Qt client and the browser do. A zip that
+    // cannot be unpacked is left in place, whole, with a warning rather than a
+    // failure: the bytes did arrive.
+    if matches!(
+        report.manifest.transfer_typ,
+        bitmule_core::protocol::websocket::TransferType::MultiFileZip { .. }
+    ) {
+        let zip = landed.lock().unwrap().clone();
+        if let Some(zip) = zip {
+            let into = zip.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+            let limit = bitmule::unzip::unpack_limit(&report.manifest);
+            let zip_for_task = zip.clone();
+            match tokio::task::spawn_blocking(move || bitmule::unzip::unpack_zip(&zip_for_task, &into, limit)).await {
+                Ok(Ok(dir)) => {
+                    let _ = std::fs::remove_file(&zip);
+                    println!("unpacked into {}", dir.display());
+                }
+                Ok(Err(e)) => eprintln!("warning: unpacking the zip failed: {e:#} — left it as one file: {}", zip.display()),
+                Err(e) => eprintln!("warning: unpacking the zip failed: {e} — left it as one file: {}", zip.display()),
+            }
+        }
+    }
     if let Some(line) = report.udp_time.describe(report.udp_bytes) {
         println!("udp:          {line}");
     }

@@ -23,7 +23,65 @@ fn is_bitmule_link(s: &str) -> bool {
     let Some((_, rest)) = lower.split_once("://") else { return false };
     let host = rest.split(['/', '#', '?']).next().unwrap_or("");
     let host = host.strip_prefix("www.").unwrap_or(host);
-    host == "mul.li" || host == "bitmule.net" || host.ends_with(".bitmule.net")
+    if host == "mul.li" || host == "bitmule.net" || host.ends_with(".bitmule.net") {
+        return true;
+    }
+    // The port is not part of a host's name: a link may carry one
+    // (`http://127.0.0.1:8080/#…`), and so may the list below.
+    let name = host_port(host).0;
+    // A share link may name a server of its own, and the e2e suite keeps one on
+    // loopback: `BITMULE_QT_HOSTS` lists the extra hosts something else has
+    // vouched for. Unset in the app, so a URL the clipboard happens to carry is
+    // still judged by its host alone.
+    extra_hosts().iter().any(|h| h == name || h == host)
+}
+
+/// `host:port` → (`host`, Some(port)); a bare host keeps its name. Only a
+/// numeric suffix counts as a port, so an IPv6 literal is left alone.
+fn host_port(host: &str) -> (&str, Option<&str>) {
+    match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (name, Some(port))
+        }
+        _ => (host, None),
+    }
+}
+
+/// The hosts named in `BITMULE_QT_HOSTS`, lower-case, read once. Empty unless
+/// a test (or an operator pointing the app elsewhere) says otherwise.
+fn extra_hosts() -> &'static [String] {
+    static HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HOSTS.get_or_init(|| {
+        std::env::var("BITMULE_QT_HOSTS")
+            .map(|v| {
+                v.split(',')
+                    .map(|h| h.trim().trim_start_matches("www.").to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// The server a share is made through. `https://bitmule.net` is what the web
+/// app is served from and the host that answers `/pow` and `/ws/create`; the
+/// CLI has always taken `--server`, and the app reads the same choice from
+/// `BITMULE_SERVER` — a build no longer decides for the user, and the e2e
+/// suite can point it at a server of its own.
+fn share_server() -> String {
+    std::env::var("BITMULE_SERVER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://bitmule.net".to_string())
+}
+
+/// Whether a plain-`http` server may be used: the CLI's `--unsafe`, by
+/// environment. The bytes are encrypted end to end either way, but over plain
+/// `http`/`ws` anyone on the path sees who talks to whom; it exists for a
+/// server on loopback (`BITMULE_INSECURE=1`), never for a deployment.
+fn allow_insecure() -> bool {
+    std::env::var_os("BITMULE_INSECURE").is_some()
 }
 
 const OPTIONS_FILE_NAME: &str = "bitmule-qt6-options.json";
@@ -93,10 +151,9 @@ async fn share(
     use bitmule_client_common::transfer::{Storage, Transfer, TransferBuilder};
     use bitmule_core::protocol::websocket::TransferManifest;
 
-    // The host the web app lives on, and the only one that answers /pow and
-    // /ws/create: https://bitmule.qdat.net no longer terminates TLS, so no
-    // session can be made there and the UI would wait for a link forever.
-    const SERVER: &str = "https://bitmule.net";
+    // The host the app shares through: bitmule.net unless `BITMULE_SERVER`
+    // says otherwise (see `share_server`).
+    let server_url = share_server();
 
     if files.is_empty() {
         return Err("no file selected".into());
@@ -207,10 +264,10 @@ async fn share(
         }
     };
 
-    let server = Server::parse(SERVER);
+    let server = Server::parse(&server_url);
     let (link_tx, link_rx) = tokio::sync::oneshot::channel::<String>();
-    phase.set("waiting for bitmule.net (proof of work, then the session)");
-    report(SendUpdate::phase(format!("waiting for {SERVER} (proof of work, then the session)")));
+    phase.set(&format!("waiting for {server_url} (proof of work, then the session)"));
+    report(SendUpdate::phase(format!("waiting for {server_url} (proof of work, then the session)")));
     tokio::spawn(async move {
         let server_for_url = server.clone();
         let mut link_tx = Some(link_tx);
@@ -300,8 +357,8 @@ async fn share(
     // minute here is generous — and better than the tab waiting forever.
     let outcome = match tokio::time::timeout(Duration::from_secs(60), link_rx).await {
         Ok(Ok(url)) => Url::parse(&url).map_err(|e| format!("bad share URL from the server: {e}")),
-        Ok(Err(_)) => Err(format!("couldn't reach {SERVER}")),
-        Err(_) => Err(format!("{SERVER} didn't answer within 60 s")),
+        Ok(Err(_)) => Err(format!("couldn't reach {server_url}")),
+        Err(_) => Err(format!("{server_url} didn't answer within 60 s")),
     };
     drop(phase);
     match &outcome {
@@ -544,6 +601,12 @@ impl UploaderApi {
             if finished {
                 if let Some(api) = qpointer_ui.as_pinned() {
                     let mut a = api.borrow_mut();
+                    // The session this stop channel belongs to has ended, so
+                    // the channel can go. It must not go a moment earlier: the
+                    // session lives in a task of its own and a dropped sender
+                    // *is* a stop, which is why a share used to die the instant
+                    // it printed its link.
+                    a.send_stops.lock().ok().map(|mut s| s.remove(&id));
                     a.is_busy = a.send_state.lock().map(|g| g.iter().any(|s| s.status == "preparing")).unwrap_or(false);
                     a.is_busy_changed();
                 }
@@ -589,7 +652,11 @@ impl UploaderApi {
             }
             if let Some(api) = qpointer.as_pinned() {
                 let mut a = api.borrow_mut();
-                a.send_stops.lock().ok().map(|mut s| s.remove(&id));
+                // The stop channel is *not* dropped here: `share` returns as
+                // soon as the link is made, and the session it started keeps
+                // running in its own task. Dropping the sender would end that
+                // session — the link would be dead the moment it appeared. It
+                // goes when the send reports itself finished (see `report_ui`).
                 a.is_busy = a.send_state.lock().map(|g| g.iter().any(|s| s.status == "preparing")).unwrap_or(false);
                 a.is_busy_changed();
             } else {
@@ -699,12 +766,38 @@ impl UploaderApi {
         if opts.clipboard_watch {
             self.spawn_clipboard_watcher();
         }
+        self.init_automation();
+    }
+
+    /// Test hooks, applied once the window is up. A test cannot click a button,
+    /// so the two things a person does by hand — drop a file and press Share,
+    /// paste a link — are named in the environment instead:
+    /// `BITMULE_QT_SHARE=<path>` shares at startup, and `BITMULE_QT_RECV=<link>`
+    /// receives at startup. Both unset in the app: the suite in
+    /// `bitmule-e2e-tests/tests/qt_client.rs` is the only caller. It follows the
+    /// window through the log lines below and kills it when the case is done,
+    /// rather than asking the app to exit itself.
+    fn init_automation(&mut self) {
+        if let Ok(path) = std::env::var("BITMULE_QT_SHARE") {
+            let path = PathBuf::from(file_url_to_path(path.trim()));
+            log(format!("automation: sharing {} at startup", path.display()));
+            self.paths.borrow_mut().push(path.clone());
+            self.file_list = QStringList::from(vec![QString::from(path.to_string_lossy().into_owned())]);
+            self.file_list_changed();
+            self.trigger_share();
+        }
+        if let Ok(url) = std::env::var("BITMULE_QT_RECV") {
+            let url = url.trim().to_string();
+            log(format!("automation: receiving {url} at startup"));
+            self.add_recv_url(QString::from(url));
+        }
     }
 
     fn add_recv_url(&mut self, url: QString) {
         let u = url.to_string();
         let u_trim = u.trim().to_string();
         if !is_bitmule_link(&u_trim) {
+            log(format!("recv: rejected {u_trim} — not a bitmule share link"));
             self.push_recv_transfer(RecvTransferState {
                 url: u_trim,
                 name: String::new(),
@@ -778,6 +871,7 @@ impl UploaderApi {
             let (server, fragment) = match split_share_url(&url) {
                 Some(v) => v,
                 None => {
+                    log(format!("recv: error — {url}: not a server and a code"));
                     update_recv_state(&state, &url, |s| {
                         s.status = "error".into();
                         s.error = Some("couldn't split URL into server + fragment".into());
@@ -789,6 +883,7 @@ impl UploaderApi {
             let link = match parse_fragment(&fragment) {
                 Some(v) => v,
                 None => {
+                    log(format!("recv: error — {url}: the code does not decode"));
                     update_recv_state(&state, &url, |s| {
                         s.status = "error".into();
                         s.error = Some("couldn't parse URL fragment as ShareLink".into());
@@ -846,8 +941,9 @@ impl UploaderApi {
                     on_progress_ui((name, prog));
                 }
             };
-            // a share link can name any server: not one without TLS
-            let result = match bitmule::v2::Server::parse_checked(&server, false) {
+            // a share link can name any server: not one without TLS, unless
+            // `BITMULE_INSECURE` says the server is on loopback
+            let result = match bitmule::v2::Server::parse_checked(&server, allow_insecure()) {
                 Ok(server) => bitmule::v2::run_recv_progress(&server, &link, open, progress, bitmule::v2::Options::default()).await,
                 Err(e) => Err(e),
             };
@@ -918,6 +1014,21 @@ impl UploaderApi {
                 }
             }
             refresh_from_bg(&qpointer, &state);
+            // One line per finished download, in the words the window shows:
+            // a GUI has no console, and a test (or the owner with a terminal)
+            // needs to know how it ended and where the bytes went.
+            let (status, name, detail) = match state.lock() {
+                Ok(g) => match g.iter().find(|s| s.url == url) {
+                    Some(s) => (
+                        s.status.clone(),
+                        s.name.clone(),
+                        s.path.clone().or_else(|| s.error.clone()).unwrap_or_default(),
+                    ),
+                    None => (String::from("gone"), String::new(), String::new()),
+                },
+                Err(_) => (String::from("gone"), String::new(), String::new()),
+            };
+            log(format!("recv: {status} — {name} {detail}"));
         });
     }
 
@@ -1465,14 +1576,14 @@ fn log(msg: impl AsRef<str>) {
 /// all silent; without this the terminal is silent too and the user cannot
 /// tell work from a hang. Dropping the guard stops the ticker.
 struct Phase {
-    text: Arc<Mutex<&'static str>>,
+    text: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
     ticker: tokio::task::JoinHandle<()>,
 }
 
 impl Phase {
-    fn start(what: &'static str) -> Self {
-        let text = Arc::new(Mutex::new(what));
+    fn start(what: &str) -> Self {
+        let text = Arc::new(Mutex::new(what.to_string()));
         let stop = Arc::new(AtomicBool::new(false));
         let ticker = {
             let text = text.clone();
@@ -1483,7 +1594,7 @@ impl Phase {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    let what = *text.lock().unwrap();
+                    let what = text.lock().unwrap().clone();
                     log(format!("still {what}…"));
                 }
             })
@@ -1492,8 +1603,8 @@ impl Phase {
         Self { text, stop, ticker }
     }
 
-    fn set(&self, what: &'static str) {
-        *self.text.lock().unwrap() = what;
+    fn set(&self, what: &str) {
+        *self.text.lock().unwrap() = what.to_string();
         log(what);
     }
 }

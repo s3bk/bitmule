@@ -198,6 +198,15 @@ pub struct GroupChild(Child);
 /// The CLI child — same guard, named for what it is at the call site.
 pub type Cli = GroupChild;
 
+impl GroupChild {
+    /// Wrap a child the caller started itself (with `process_group(0)`), so it
+    /// gets the same drop guarantee as the helpers here: killed with its whole
+    /// group and reaped. The Qt suite starts the window this way.
+    pub fn new(child: Child) -> Self {
+        GroupChild(child)
+    }
+}
+
 impl Deref for GroupChild {
     type Target = Child;
     fn deref(&self) -> &Child {
