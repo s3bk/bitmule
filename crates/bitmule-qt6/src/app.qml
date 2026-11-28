@@ -1045,12 +1045,18 @@ ApplicationWindow {
                     font.pixelSize: 11
                     wrapMode: Text.Wrap
                 }
+                Button {
+                    Layout.fillWidth: true
+                    visible: api.converting.length > 0
+                    text: "Don't wait — send it now"
+                    onClicked: api.cancel_conversion()
+                }
 
                 // ---- the question ----
                 Label {
                     Layout.fillWidth: true
                     visible: api.converting.length === 0
-                    text: "Convert this video?"
+                    text: "Convert it first, or send it now?"
                     color: theme.fg
                     font.pixelSize: 15
                     font.bold: true
@@ -1068,8 +1074,9 @@ ApplicationWindow {
                 Label {
                     Layout.fillWidth: true
                     visible: api.converting.length === 0
-                    text: "Converted to AV1 first, every browser can play it — the link comes when the conversion is done. "
-                        + "Sending it as it is starts the link at once and sends exactly these bytes."
+                    text: "Converting first means waiting: the file is re-encoded in full, so the link only appears when that is done — "
+                        + "minutes for a clip, longer for a film. It is worth it when the other side is a browser and cannot play "
+                        + (videoCard.videoOffer.codec || "this codec") + ". Sending it now starts the link at once and sends exactly these bytes."
                     color: theme.fgMuted
                     font.pixelSize: 11
                     wrapMode: Text.Wrap
@@ -1078,14 +1085,14 @@ ApplicationWindow {
                     model: api.converting.length === 0 ? videoCard.videoOffer.profiles || [] : []
                     delegate: Button {
                         Layout.fillWidth: true
-                        text: "Convert — " + modelData.label
+                        text: "Convert first — " + modelData.label
                         onClicked: api.decide_video(modelData.key)
                     }
                 }
                 Button {
                     Layout.fillWidth: true
                     visible: api.converting.length === 0
-                    text: "Send as it is"
+                    text: "Send now, as it is"
                     onClicked: api.decide_video("as-is")
                 }
             }

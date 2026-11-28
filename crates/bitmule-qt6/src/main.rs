@@ -452,6 +452,10 @@ struct UploaderApi {
     /// One channel per running send: dropping the sender (or sending on it)
     /// is what stops the transfer.
     send_stops: Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<()>>>>,
+    /// Set while a video conversion should stop: the encoder is killed, the
+    /// half-written output removed, and the share starts from the original
+    /// bytes. The person asked for it now instead.
+    convert_cancel: Arc<AtomicBool>,
 
     // Invokable methods from QML
     add_files: qt_method!(fn(&mut self, urls: QVariantList)),
@@ -463,6 +467,9 @@ struct UploaderApi {
     /// Answer the video question: `"as-is"` or a profile key (`fast`,
     /// `balanced`, `quality`). Converting and then sharing happen on their own.
     decide_video: qt_method!(fn(&mut self, mode: QString)),
+    /// Give up on the conversion and send the file as it is, now: the encoder
+    /// is killed and the share starts from the original bytes.
+    cancel_conversion: qt_method!(fn(&mut self)),
     /// Copy the current share_url to the system clipboard. QML calls
     /// this from a Copy button; it also fires automatically inside
     /// trigger_share the moment the URL is produced.
@@ -600,10 +607,14 @@ impl UploaderApi {
         let name = input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into());
         let out = std::env::temp_dir().join(format!("{}-{}.av1.mp4", sanitized_stem(&name), profile.key()));
         log(format!("video: converting {name} ({}) to AV1", profile.label()));
-        self.converting = QString::from(format!("converting {name} ({})…", profile.label()));
+        let label = format!("converting {name} ({})", profile.label());
+        self.converting = QString::from(format!("{label}…"));
         self.converting_changed();
         self.convert_progress = 0.0;
         self.convert_progress_changed();
+        self.convert_cancel.store(false, Ordering::Relaxed);
+        let cancel = self.convert_cancel.clone();
+        let started = Instant::now();
 
         let qpointer = QPointer::from(&*self);
         let progress_ui = {
@@ -613,10 +624,27 @@ impl UploaderApi {
                     let mut a = api.borrow_mut();
                     a.convert_progress = f;
                     a.convert_progress_changed();
+                    // How long the rest will take, from what this encode has
+                    // managed so far: what a person deciding whether to wait
+                    // needs to know, and the only honest number there is.
+                    let text = if f >= 0.02 && f < 1.0 {
+                        let elapsed = started.elapsed().as_secs_f64();
+                        let left = (elapsed / f * (1.0 - f)).max(0.0);
+                        let left = human_duration(left);
+                        if left.is_empty() { format!("{label}…") } else { format!("{label}… about {left} left") }
+                    } else {
+                        format!("{label}…")
+                    };
+                    let text = QString::from(text);
+                    if a.converting != text {
+                        a.converting = text;
+                        a.converting_changed();
+                    }
                 }
             })
         };
         qmetaobject::future::execute_async(async move {
+            let out_path = out.clone();
             let done = async {
                 let media = video::probe(&ffmpeg, &input)?;
                 let encoders = video::encoders(&ffmpeg)?;
@@ -626,7 +654,7 @@ impl UploaderApi {
                     anyhow::bail!("already AV1");
                 };
                 let progress = progress_ui.clone();
-                video::convert(&ffmpeg, &args, media.duration, move |f| progress(f)).await?;
+                video::convert_until(&ffmpeg, &args, media.duration, move |f| progress(f), &cancel).await?;
                 anyhow::Ok(to)
             }
             .await;
@@ -634,27 +662,54 @@ impl UploaderApi {
                 let mut a = api.borrow_mut();
                 a.converting = QString::default();
                 a.converting_changed();
-                match done {
-                    Ok(to) => {
-                        log(format!("video: converted to {}", to.display()));
-                        // The list now holds the converted file: that is what
-                        // the send is made from, and the original stays as it
-                        // was, untouched, on disk.
-                        a.paths.borrow_mut().clear();
-                        a.paths.borrow_mut().push(to.clone());
-                        a.file_list = QStringList::from(vec![QString::from(to.display().to_string())]);
-                        a.file_list_changed();
-                        a.begin_share(vec![to]);
-                    }
-                    Err(e) => {
-                        log(format!("video: not converted: {e:#}"));
-                        a.share_error = QString::from(format!("could not convert the video ({e:#}); sending it as it is"));
-                        a.share_error_changed();
-                        a.begin_share(vec![input]);
+                if cancel.load(Ordering::Relaxed) {
+                    // The person chose to send it now instead; the card has
+                    // already started that share (see `cancel_conversion`), so
+                    // there is nothing to start here — only the stump to clear.
+                    log("video: conversion cancelled, sending the original");
+                    let _ = std::fs::remove_file(&out_path);
+                } else {
+                    match done {
+                        Ok(to) => {
+                            log(format!("video: converted to {}", to.display()));
+                            // The list now holds the converted file: that is what
+                            // the send is made from, and the original stays as it
+                            // was, untouched, on disk.
+                            a.paths.borrow_mut().clear();
+                            a.paths.borrow_mut().push(to.clone());
+                            a.file_list = QStringList::from(vec![QString::from(to.display().to_string())]);
+                            a.file_list_changed();
+                            a.begin_share(vec![to]);
+                        }
+                        Err(e) => {
+                            log(format!("video: not converted: {e:#}"));
+                            a.share_error = QString::from(format!("could not convert the video ({e:#}); sending it as it is"));
+                            a.share_error_changed();
+                            a.begin_share(vec![input]);
+                        }
                     }
                 }
             }
         });
+    }
+
+    /// Stop converting and send the file as it is, now. The encode is killed
+    /// and the share starts from the original bytes — the same thing the
+    /// "send as it is" answer does, only later, when the wait has turned out
+    /// to be longer than the person wanted to give.
+    fn cancel_conversion(&mut self) {
+        if self.converting.is_empty() {
+            return;
+        }
+        self.convert_cancel.store(true, Ordering::Relaxed);
+        self.converting = QString::default();
+        self.converting_changed();
+        log("video: asked to send now; stopping the conversion");
+        let paths = self.paths.borrow().clone();
+        if paths.is_empty() {
+            return;
+        }
+        self.begin_share(paths);
     }
 
     fn begin_share(&mut self, paths: Vec<PathBuf>) {

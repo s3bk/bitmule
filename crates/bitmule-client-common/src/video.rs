@@ -294,10 +294,29 @@ pub fn plan(input: &Path, media: &Media, profile: Profile, encoders: &Encoders, 
 
 /// Run a conversion, calling `progress` with the fraction done (0..1) as
 /// ffmpeg reports it. `duration` is the source's length, from [`probe`].
-pub async fn convert<F>(ffmpeg: &Path, args: &[String], duration: f64, mut progress: F) -> Result<()>
+pub async fn convert<F>(ffmpeg: &Path, args: &[String], duration: f64, progress: F) -> Result<()>
 where
     F: FnMut(f64),
 {
+    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    convert_until(ffmpeg, args, duration, progress, &NEVER).await
+}
+
+/// [`convert`], but the caller may change its mind: once `cancel` turns true
+/// the encoder is killed where it stands and the error says so. The partial
+/// output is left on disk for the caller to remove — a half-written MP4 is
+/// not a file anybody should send.
+pub async fn convert_until<F>(
+    ffmpeg: &Path,
+    args: &[String],
+    duration: f64,
+    mut progress: F,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()>
+where
+    F: FnMut(f64),
+{
+    use std::sync::atomic::Ordering::Relaxed;
     let mut child = tokio::process::Command::new(ffmpeg)
         .args(args)
         .stdin(Stdio::null())
@@ -321,6 +340,13 @@ where
         tail.join("\n")
     });
     while let Some(line) = lines.next_line().await? {
+        if cancel.load(Relaxed) {
+            // The encoder is a child process of ours: killing it is enough to
+            // stop the work, and the wait reaps it so nothing is left behind.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            bail!("the conversion was cancelled");
+        }
         // `out_time_us=1234567` and `progress=continue|end`
         if let Some(value) = line.strip_prefix("out_time_us=") {
             if duration > 0.0 {
@@ -329,6 +355,11 @@ where
                 }
             }
         }
+    }
+    if cancel.load(Relaxed) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        bail!("the conversion was cancelled");
     }
     let status = child.wait().await?;
     let tail = errors.await.unwrap_or_default();
