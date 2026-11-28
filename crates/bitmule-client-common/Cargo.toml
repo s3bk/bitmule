@@ -23,7 +23,7 @@ uuid = { workspace = true }
 qrcode = { version = "0.14.1", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt", "sync", "macros"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt", "sync", "macros", "process"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 tempfile = "3"

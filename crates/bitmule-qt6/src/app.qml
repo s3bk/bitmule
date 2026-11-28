@@ -979,4 +979,116 @@ ApplicationWindow {
             }
         }
     }
+
+    // A video that is not AV1 yet is offered a conversion before it goes out.
+    // The question is a card over the window rather than a dialog: it is one
+    // decision with three answers, and it belongs to the Send tab that is
+    // already in front of the person. `api.video_offer` is JSON from Rust
+    // (`video_offer_for`); while a conversion runs the same card shows its
+    // progress, then the share starts by itself.
+    Rectangle {
+        id: videoCard
+        anchors.fill: parent
+        z: 50
+        // One answer to "is there anything to show", so no binding has to
+        // reach into a possibly empty object.
+        property var videoOffer: {
+            if (api.video_offer.length === 0) return ({})
+            try { return JSON.parse(api.video_offer) } catch (e) { return ({}) }
+        }
+        property bool hasOffer: api.video_offer.length > 0
+        visible: hasOffer || api.converting.length > 0
+        color: "#99000000"
+
+        // clicks behind the card do nothing: the share is waiting for an answer
+        MouseArea { anchors.fill: parent }
+
+        Rectangle {
+            id: videoPanel
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 56, 420)
+            height: videoBody.height + 32
+            radius: 10
+            color: theme.surface
+            border.width: 1
+            border.color: theme.borderStrong
+
+            ColumnLayout {
+                id: videoBody
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 16
+                spacing: 10
+
+                // ---- converting ----
+                Label {
+                    Layout.fillWidth: true
+                    visible: api.converting.length > 0
+                    text: api.converting
+                    color: theme.fg
+                    font.pixelSize: 14
+                    wrapMode: Text.Wrap
+                }
+                ProgressBar {
+                    Layout.fillWidth: true
+                    visible: api.converting.length > 0
+                    from: 0
+                    to: 1
+                    value: api.convert_progress
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: api.converting.length > 0
+                    text: "The link appears when the conversion is done. The original file stays as it is."
+                    color: theme.fgMuted
+                    font.pixelSize: 11
+                    wrapMode: Text.Wrap
+                }
+
+                // ---- the question ----
+                Label {
+                    Layout.fillWidth: true
+                    visible: api.converting.length === 0
+                    text: "Convert this video?"
+                    color: theme.fg
+                    font.pixelSize: 15
+                    font.bold: true
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: api.converting.length === 0
+                    text: (videoCard.videoOffer.name || "video") + " — "
+                        + (videoCard.videoOffer.sizeText || "") + (videoCard.videoOffer.durationText ? ", " + videoCard.videoOffer.durationText : "")
+                        + (videoCard.videoOffer.codec ? " (" + videoCard.videoOffer.codec + ")" : "")
+                    color: theme.fgMuted
+                    font.pixelSize: 12
+                    wrapMode: Text.Wrap
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: api.converting.length === 0
+                    text: "Converted to AV1 first, every browser can play it — the link comes when the conversion is done. "
+                        + "Sending it as it is starts the link at once and sends exactly these bytes."
+                    color: theme.fgMuted
+                    font.pixelSize: 11
+                    wrapMode: Text.Wrap
+                }
+                Repeater {
+                    model: api.converting.length === 0 ? videoCard.videoOffer.profiles || [] : []
+                    delegate: Button {
+                        Layout.fillWidth: true
+                        text: "Convert — " + modelData.label
+                        onClicked: api.decide_video(modelData.key)
+                    }
+                }
+                Button {
+                    Layout.fillWidth: true
+                    visible: api.converting.length === 0
+                    text: "Send as it is"
+                    onClicked: api.decide_video("as-is")
+                }
+            }
+        }
+    }
 }

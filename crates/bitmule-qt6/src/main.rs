@@ -1,4 +1,5 @@
 use c_str_macro::c_str;
+use bitmule_client_common::video;
 use qmetaobject::*;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -389,6 +390,15 @@ struct UploaderApi {
     /// Empty string when no URL is set.
     qr_data_url: qt_property!(QString; NOTIFY qr_data_url_changed),
     file_list: qt_property!(QStringList; NOTIFY file_list_changed),
+    /// A video the next share would convert, as JSON: `{name, size, codec,
+    /// duration, seconds, profiles: [{key, label}]}`, or empty. While it is
+    /// set, QML shows the conversion dialog and `decide_video` answers it.
+    video_offer: qt_property!(QString; NOTIFY video_offer_changed),
+    /// What is being converted right now ("converting Shrek.mkv (balanced)…"),
+    /// empty when nothing is. The share starts by itself when it is over.
+    converting: qt_property!(QString; NOTIFY converting_changed),
+    /// Fraction of the conversion, 0..1, from ffmpeg's own progress.
+    convert_progress: qt_property!(f64; NOTIFY convert_progress_changed),
 
     // F00 options (persisted to `<config>/bitmule-qt6-options.json`)
     opt_multi_send: qt_property!(bool; NOTIFY opt_multi_send_changed),
@@ -411,6 +421,9 @@ struct UploaderApi {
     share_error_changed: qt_signal!(),
     qr_data_url_changed: qt_signal!(),
     file_list_changed: qt_signal!(),
+    video_offer_changed: qt_signal!(),
+    converting_changed: qt_signal!(),
+    convert_progress_changed: qt_signal!(),
     opt_multi_send_changed: qt_signal!(),
     opt_upnp_changed: qt_signal!(),
     opt_clipboard_watch_changed: qt_signal!(),
@@ -447,6 +460,9 @@ struct UploaderApi {
     /// Empty the share list.
     clear_files: qt_method!(fn(&mut self)),
     trigger_share: qt_method!(fn(&mut self)),
+    /// Answer the video question: `"as-is"` or a profile key (`fast`,
+    /// `balanced`, `quality`). Converting and then sharing happen on their own.
+    decide_video: qt_method!(fn(&mut self, mode: QString)),
     /// Copy the current share_url to the system clipboard. QML calls
     /// this from a Copy button; it also fires automatically inside
     /// trigger_share the moment the URL is produced.
@@ -540,6 +556,10 @@ impl UploaderApi {
         self.file_list_changed();
     }
 
+    /// Share what is in the list — unless it is a video this client could
+    /// convert: then the question comes first (`video_offer`), because a
+    /// conversion that nobody wanted is minutes of the sender's life, and a
+    /// conversion nobody was told about is a link that behaves oddly.
     fn trigger_share(&mut self) {
         let paths = self.paths.borrow().clone();
         if paths.is_empty() {
@@ -547,7 +567,101 @@ impl UploaderApi {
             self.share_error_changed();
             return;
         }
-        log(format!("share: button pressed, {} path(s) in the list", paths.len()));
+        if let Some(offer) = video_offer_for(&paths) {
+            log(format!("share: {offer}"));
+            self.video_offer = QString::from(offer);
+            self.video_offer_changed();
+            return;
+        }
+        self.begin_share(paths);
+    }
+
+    /// The answer to the video question: `"as-is"`, or one of the profiles
+    /// (`video::Profile::key`). A conversion happens first and the result is
+    /// what goes out; a failure to convert does not swallow the share — the
+    /// file is sent as it is, and the error says why nothing was converted.
+    fn decide_video(&mut self, mode: QString) {
+        let mode = mode.to_string();
+        self.video_offer = QString::default();
+        self.video_offer_changed();
+        let paths = self.paths.borrow().clone();
+        if paths.is_empty() {
+            return;
+        }
+        let Some(profile) = video::Profile::parse(&mode) else {
+            self.begin_share(paths); // "as-is", or a mode this build does not know
+            return;
+        };
+        let Some(ffmpeg) = video::available() else {
+            self.begin_share(paths);
+            return;
+        };
+        let input = paths[0].clone();
+        let name = input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into());
+        let out = std::env::temp_dir().join(format!("{}-{}.av1.mp4", sanitized_stem(&name), profile.key()));
+        log(format!("video: converting {name} ({}) to AV1", profile.label()));
+        self.converting = QString::from(format!("converting {name} ({})…", profile.label()));
+        self.converting_changed();
+        self.convert_progress = 0.0;
+        self.convert_progress_changed();
+
+        let qpointer = QPointer::from(&*self);
+        let progress_ui = {
+            let qpointer = qpointer.clone();
+            qmetaobject::queued_callback(move |f: f64| {
+                if let Some(api) = qpointer.as_pinned() {
+                    let mut a = api.borrow_mut();
+                    a.convert_progress = f;
+                    a.convert_progress_changed();
+                }
+            })
+        };
+        qmetaobject::future::execute_async(async move {
+            let done = async {
+                let media = video::probe(&ffmpeg, &input)?;
+                let encoders = video::encoders(&ffmpeg)?;
+                let video::Plan::Convert { args, out: to } =
+                    video::plan(&input, &media, profile, &encoders, out.clone())
+                else {
+                    anyhow::bail!("already AV1");
+                };
+                let progress = progress_ui.clone();
+                video::convert(&ffmpeg, &args, media.duration, move |f| progress(f)).await?;
+                anyhow::Ok(to)
+            }
+            .await;
+            if let Some(api) = qpointer.as_pinned() {
+                let mut a = api.borrow_mut();
+                a.converting = QString::default();
+                a.converting_changed();
+                match done {
+                    Ok(to) => {
+                        log(format!("video: converted to {}", to.display()));
+                        // The list now holds the converted file: that is what
+                        // the send is made from, and the original stays as it
+                        // was, untouched, on disk.
+                        a.paths.borrow_mut().clear();
+                        a.paths.borrow_mut().push(to.clone());
+                        a.file_list = QStringList::from(vec![QString::from(to.display().to_string())]);
+                        a.file_list_changed();
+                        a.begin_share(vec![to]);
+                    }
+                    Err(e) => {
+                        log(format!("video: not converted: {e:#}"));
+                        a.share_error = QString::from(format!("could not convert the video ({e:#}); sending it as it is"));
+                        a.share_error_changed();
+                        a.begin_share(vec![input]);
+                    }
+                }
+            }
+        });
+    }
+
+    fn begin_share(&mut self, paths: Vec<PathBuf>) {
+        log(format!("share: {} path(s) to send", paths.len()));
+        if paths.len() == 1 {
+            log(format!("share: {}", paths[0].display()));
+        }
 
         // A send is a thing that stays: it gets an id of its own, a row in the
         // Active tab, and its own stop channel. Nothing about it overlaps with
@@ -789,6 +903,14 @@ impl UploaderApi {
             self.file_list = QStringList::from(vec![QString::from(path.to_string_lossy().into_owned())]);
             self.file_list_changed();
             self.trigger_share();
+            // A headless run cannot press the video card's buttons, so the
+            // answer comes from the environment: `as-is`, `fast`, `balanced`
+            // or `quality`.
+            if let Ok(mode) = std::env::var("BITMULE_QT_CONVERT") {
+                let mode = mode.trim().to_string();
+                log(format!("automation: answering the video question with {mode:?}"));
+                self.decide_video(QString::from(mode));
+            }
         }
         if let Ok(url) = std::env::var("BITMULE_QT_RECV") {
             let url = url.trim().to_string();
@@ -1147,6 +1269,113 @@ fn describe_selection(paths: &[PathBuf]) -> (String, u64) {
         many => format!("{} items", many.len()),
     };
     (name, bytes)
+}
+
+/// Whether this selection is a video that would have to be converted, as the
+/// JSON the dialog needs — `None` when there is nothing to ask: not a single
+/// file, not a video by its name, no ffmpeg that can encode AV1, or already AV1
+/// (then a conversion would only lose).
+fn video_offer_for(paths: &[PathBuf]) -> Option<String> {
+    /// The extensions worth asking ffmpeg about. A file with one of these that
+    /// ffmpeg cannot open is sent as it is, quietly.
+    const VIDEO: [&str; 17] = [
+        "mp4", "m4v", "mkv", "mov", "avi", "webm", "mpg", "mpeg", "ts", "m2ts", "mts", "wmv",
+        "flv", "3gp", "ogv", "vob", "mxf",
+    ];
+    let [path] = paths else { return None };
+    if !path.is_file() {
+        return None;
+    }
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    if !VIDEO.contains(&ext.as_str()) {
+        return None;
+    }
+    let ffmpeg = video_tool()?;
+    // A probe that fails is not a reason to stop a share: the file goes as it is.
+    let media = bitmule_client_common::video::probe(&ffmpeg, path).ok()?;
+    if media.is_playable_av1() {
+        return None;
+    }
+    let size = std::fs::metadata(path).map(|md| md.len()).unwrap_or(0);
+    let profiles: Vec<String> = bitmule_client_common::video::Profile::ALL
+        .iter()
+        .map(|p| format!("{{\"key\":\"{}\",\"label\":\"{}\"}}", p.key(), p.label()))
+        .collect();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(format!(
+        "{{\"name\":{},\"size\":{},\"sizeText\":{},\"codec\":{},\"seconds\":{:.1},\"durationText\":{},\"profiles\":[{}]}}",
+        json_string(&name),
+        size,
+        json_string(&human_size(size)),
+        json_string(&media.video_codec),
+        media.duration,
+        json_string(&human_duration(media.duration)),
+        profiles.join(","),
+    ))
+}
+
+/// Bytes as a person reads them (binary units, one decimal above a kibibyte).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)];
+    for (unit, scale) in UNITS {
+        if bytes >= scale || scale == 1 {
+            return if scale == 1 { format!("{bytes} B") } else { format!("{:.1} {unit}", bytes as f64 / scale as f64) };
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// Seconds as "1 h 33 min" / "4 min 12 s" / "38 s".
+fn human_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h} h {m} min")
+    } else if m > 0 {
+        format!("{m} min {s} s")
+    } else if total > 0 {
+        format!("{s} s")
+    } else {
+        String::new()
+    }
+}
+
+/// The ffmpeg that can encode AV1, looked for once: the search touches the
+/// disk and runs `ffmpeg -encoders`, and the answer does not change while the
+/// window is open.
+fn video_tool() -> Option<PathBuf> {
+    static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(bitmule_client_common::video::available).clone()
+}
+
+/// A JSON string literal, with the characters JSON forbids escaped. A file name
+/// is the only untrusted part of the dialog's payload.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A file name's stem, safe to put into a temporary file name.
+fn sanitized_stem(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let cleaned: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if cleaned.is_empty() { "video".into() } else { cleaned.chars().take(80).collect() }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

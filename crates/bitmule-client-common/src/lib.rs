@@ -11,6 +11,10 @@ pub mod blockio;
 /// Where the bundled helper programs (ffmpeg, the PDF linearizer) are found.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sidecar;
+/// Converting a video before it is sent: AV1 in an MP4, with the ffmpeg
+/// sidecar. Optional — a client without it sends the file as it is.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod video;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 pub mod fs;

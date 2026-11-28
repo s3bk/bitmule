@@ -72,6 +72,29 @@ Hardware encoders are chosen only after probing the actual ffmpeg build;
 macOS always uses `libsvtav1`; a probe failure falls back to Balanced, never to
 hardware.
 
+## What the client does with a video
+
+`bitmule_client_common::video` is the one implementation: it asks ffmpeg what a
+file holds (`-i`, parsed, no ffprobe needed), and decides.
+
+* A file that already holds AV1 at 8 or 10 bits 4:2:0 is **not** converted —
+  it is sent as it is. A re-encode would only lose.
+* Anything else is offered a conversion before the share. The Qt client asks
+  once, per share, with the file's name, size, length and codec and three
+  profile buttons plus "send as it is"; a conversion that fails does not
+  swallow the share — the original goes, with the reason shown.
+* The converted file is written to the temporary directory and *that* is what
+  is shared; the original is never touched.
+* Progress is ffmpeg's own `-progress pipe:1`, divided by the source's length.
+  The card shows it, and the link appears when the conversion is over.
+* A client without ffmpeg, or an ffmpeg that cannot encode AV1, is never asked:
+  `video::available()` is the gate, and a share it does not offer is a share
+  with no extra step.
+
+In a headless run the answer to the card can be given up front with
+`BITMULE_QT_CONVERT=as-is|fast|balanced|quality`, which is what the client test
+suite uses.
+
 ## Linearizing
 
 The linearizer writes the file so that page 1, the objects page 1 reads and a
